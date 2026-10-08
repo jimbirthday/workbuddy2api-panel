@@ -33,7 +33,7 @@ type Config struct {
 	Pool      *pool.Pool
 	Upstream  *upstream.Client
 	APIKey    string // 空 = 不鉴权（静态值；与 Live 同时给出时 Live 优先）
-	MaxRotate int    // 单请求最多换号次数，默认 3
+	MaxRotate int // 单请求最多换号次数，默认 3。限流换号不受此上限约束：池里还有未限流的号就继续打。
 	// Session 会话粘性路由器（可选；nil = 关闭粘性，纯 Pick 轮换）。
 	Session *session.Router
 	// StickyCount 返回当前粘性会话绑定数（供 /status）；nil 时报告 0。
@@ -546,6 +546,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	tried := map[string]bool{}
 	var lastErr error
+	// lastRateLimited 为 true 时，下一跳不再捞冷却中的号（见选号处注释）。
+	lastRateLimited := false
 	// modelBlock 记录本次是否因「模型级冷却」而选不到号（下方 acct==nil 分支填充）。
 	// 默认零值 Blocked=false = 按既有的"没有可用账号"口径报错。
 	var modelBlock pool.ModelBlockStatus
@@ -723,7 +725,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	chatMeta.TraceID = r.Header.Get("X-Trace-ID")
 
-	for i := 0; i < h.cfg.MaxRotate; i++ {
+	// rotates 是已换号次数。限流（ErrSoftRate）且池里还有未冷却的号时不计入上限：
+	// 账号很多时，一次正常请求不该在试完默认 3 个号后被 429 打断，让用户手动重试。
+	// 其他失败仍受 MaxRotate 约束，避免传输错误把一次请求放大到全池。
+	rotates := 0
+	for rotates < h.cfg.MaxRotate {
 		// 选号：粘性号优先（PickByUIDForModel 已校验该模型可用性 + 在途未满），否则普通轮换。
 		var acct *auth.Auth
 		if stickyUID != "" {
@@ -736,6 +742,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if acct == nil {
+			// 限流之后只打还没冷却的号。Pick 在全冷却时会捞最早到期的冷却号，
+			// 那一跳对用户就是一次必然的 429，这里直接停。
+			if lastRateLimited && !h.poolHasRotatable(tried, bareModel, realm) {
+				modelBlock = h.cfg.Pool.ModelBlocked(bareModel)
+				break
+			}
 			// 模型感知 + realm 感知选号：模型非空时启用 6004 模型级冷却豁免
 			// （healthyForModel），realm 谓词过滤跨域账号。
 			acct = h.cfg.Pool.PickExcludingForRealm(tried, bareModel, realm)
@@ -762,10 +774,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			if stickyUID != "" && acct.UID == stickyUID {
 				unbindSticky()
 			}
-			if !rotateBackoff(i, r.Context()) {
+			if !rotateBackoff(rotates, r.Context()) {
 				// 客户端已断连：换号重试无意义，终止轮转走末端错误透传。
 				break
 			}
+			rotates++
 			continue // 最后一个名额被并发抢走 → 换号
 		}
 		heldUID = acct.UID
@@ -781,9 +794,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 					h.cfg.Pool.NoteError(acct.UID)
 				}
 				fail(acct.UID)
-				if !rotateBackoff(i, r.Context()) {
+				if !rotateBackoff(rotates, r.Context()) {
 					break // ctx 取消：终止轮转（refresh 失败换号退避）
 				}
+				rotates++
 				continue
 			}
 			if err := acct.SaveAtomic(); err != nil {
@@ -831,9 +845,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			lastErr = terr
 			h.cfg.Pool.NoteFailures(acct.UID)
 			fail(acct.UID)
-			if !rotateBackoff(i, r.Context()) {
+			if !rotateBackoff(rotates, r.Context()) {
 				break // ctx 取消：终止轮转（传输层错误换号退避）
 			}
+			rotates++
 			continue
 		}
 		if status >= 400 {
@@ -938,9 +953,17 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			if kind == upstream.ErrWafBlock && h.wafIP.noteWaf(acct.UID) {
 				break
 			}
-			if !rotateBackoff(i, r.Context()) {
+			if !rotateBackoff(rotates, r.Context()) {
 				break // ctx 取消：终止轮转（分类错误换号退避）
 			}
+			// 限流且还有未冷却的号：不消耗 MaxRotate。其余失败照常计数。
+			if kind == upstream.ErrSoftRate {
+				lastRateLimited = true
+				if h.poolHasRotatable(tried, bareModel, realm) {
+					continue
+				}
+			}
+			rotates++
 			continue
 		}
 		// 成功判定与粘性绑定一律**延后到这一跳真正成功之后**（见下方流式/非流式分支）：
@@ -958,7 +981,35 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			var errFrame string
 			sErr := upstream.StreamHint(w, stats, upstream.FrameHintFunc(func() upstream.HintContext {
 				return h.hintContext(bareModel, reqHasImage)
-			}), upstream.WithErrorFrameObserver(func(payload string) { errFrame = payload }))
+			}), upstream.WithErrorFrameObserver(func(payload string) { errFrame = payload }), upstream.HoldErrorUntilContent())
+			// 正文写出前的 error 帧：客户端还没看到失败。可换号的限流在此换号，
+			// 不把 429 帧交给用户。不可换号（池子没有别的号，或错误与账号无关）
+			// 则把扣住的帧补写出去，语义与「直接透传」一致。
+			if held, ok := sErr.(*upstream.ErrStreamHeld); ok {
+				rc.Close()
+				kind := upstream.FrameKind(held.Payload)
+				h.applyErrorPolicy(acct.UID, kind, held.Payload, bareModel, nil)
+				recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
+				fail(acct.UID)
+				if kind == upstream.ErrSoftRate && h.poolHasRotatable(tried, bareModel, realm) {
+					lastRateLimited = true
+					log.Printf("WARN: [server] stream acct=%s model=%s: rate-limit frame before content, rotating",
+						logfmt.Label(acct.UID, acct.Nickname), bareModel)
+					if !rotateBackoff(rotates, r.Context()) {
+						lastErr = &upstream.Error{Kind: kind, Status: http.StatusTooManyRequests, Msg: held.Payload}
+						break
+					}
+					continue
+				}
+				log.Printf("WARN: [server] stream acct=%s model=%s: error frame before content kind=%s (no rotate) payload=%s",
+					logfmt.Label(acct.UID, acct.Nickname), bareModel, kind, logfmt.Truncate(held.Payload, 200))
+				st.status = http.StatusOK
+				st.outcome = reqlog.OutcomeStreamError
+				if werr := writeHeldStreamError(w, held.Payload); werr != nil {
+					st.outcome = reqlog.OutcomeInterrupted
+				}
+				return
+			}
 			switch {
 			case upstream.IsEmptyStreamError(sErr):
 				// 上游 200 但空流（0 有效帧）：StreamHint 已写 error 帧 + [DONE]
@@ -1214,6 +1265,36 @@ func usageCreditTotal(resp map[string]any) (credit float64, total int, ok bool) 
 		return 0, 0, false
 	}
 	return c, int(t), true
+}
+
+// poolHasRotatable 报告本 realm、本模型上是否还有未试过且未冷却的号。
+// 限流换号用它决定要不要继续：有就继续，没有才把 429 交回客户端。
+// 不能用 Pick 的返回值：全冷却时 Pick 会捞「最早到期」的冷却号再试一次，
+// 那一跳几乎必然再 429，等于把限流错误交回用户。
+func (h *Handler) poolHasRotatable(tried map[string]bool, model, realm string) bool {
+	for _, uid := range h.cfg.Pool.AvailableUIDsForModelRealm(model, realm) {
+		if !tried[uid] {
+			return true
+		}
+	}
+	return false
+}
+
+// writeHeldStreamError 把扣住的上游 error 帧补写给客户端（后面没有可换的号时）。
+// 与 StreamHint 的 error 透传同形：一帧 data + [DONE]，客户端能正常收尾。
+func writeHeldStreamError(w http.ResponseWriter, payload string) error {
+	h := w.Header()
+	h.Set("Content-Type", "text/event-stream")
+	h.Set("Cache-Control", "no-cache")
+	h.Set("Connection", "keep-alive")
+	h.Set("X-Accel-Buffering", "no")
+	if _, err := io.WriteString(w, "data: "+payload+"\n\ndata: [DONE]\n\n"); err != nil {
+		return err
+	}
+	if fl, ok := w.(http.Flusher); ok {
+		fl.Flush()
+	}
+	return nil
 }
 
 // rotateBackoff 轮转间指数退避 + 抖动（WAF 403 修复 P0-2）：第 i 次轮转失败

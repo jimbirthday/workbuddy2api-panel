@@ -873,6 +873,36 @@ func TestStreamHintErrorFrameObserver(t *testing.T) {
 	}
 }
 
+func TestStreamHintHoldsErrorBeforeContent(t *testing.T) {
+	const errPayload = `{"error":{"code":6004,"message":"模型限流"}}`
+	raw := "data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\n" +
+		"data: " + errPayload + "\n\n"
+
+	rec := httptest.NewRecorder()
+	err := StreamHint(rec, strings.NewReader(raw), nil, HoldErrorUntilContent())
+	held, ok := err.(*ErrStreamHeld)
+	if !ok || held.Payload != errPayload {
+		t.Fatalf("held=%v err=%v", held, err)
+	}
+	if rec.Body.Len() != 0 {
+		t.Fatalf("client saw bytes before content: %q", rec.Body.String())
+	}
+}
+
+func TestStreamHintDoesNotHoldErrorAfterContent(t *testing.T) {
+	const errPayload = `{"error":{"code":6004,"message":"模型限流"}}`
+	raw := "data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"你好\"}}]}\n\n" +
+		"data: " + errPayload + "\n\ndata: [DONE]\n\n"
+
+	rec := httptest.NewRecorder()
+	if err := StreamHint(rec, strings.NewReader(raw), nil, HoldErrorUntilContent()); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(rec.Body.String(), "你好") || !strings.Contains(rec.Body.String(), "6004") {
+		t.Fatalf("content and later error must both pass through: %s", rec.Body.String())
+	}
+}
+
 func TestUserResourceDetailedWithExpirySnapshot(t *testing.T) {
 	now := time.Now().In(softRateResetLoc)
 	soon := now.Add(24 * time.Hour).Truncate(time.Second)

@@ -652,6 +652,86 @@ func TestChat429Code14018UsesHardCreditCooldown(t *testing.T) {
 	}
 }
 
+// TestChatRateLimitRotatesPastMaxRotate 账号很多时，一次请求不该在默认 3 次换号后
+// 把 429 交回客户端。前 4 个号都限流，第 5 个号成功，客户端只看到 200。
+func TestChatRateLimitRotatesPastMaxRotate(t *testing.T) {
+	var mu sync.Mutex
+	calls := map[string]int{}
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		mu.Lock()
+		calls[authz]++
+		mu.Unlock()
+		if authz == "Bearer at-good" {
+			return 200, sseOK, true
+		}
+		return 429, `{"code":1,"msg":"rate limit"}`, false
+	})
+	auths := []*auth.Auth{
+		{UID: "a", AccessToken: "at-a", ExpiresAt: 9999999999},
+		{UID: "b", AccessToken: "at-b", ExpiresAt: 9999999999},
+		{UID: "c", AccessToken: "at-c", ExpiresAt: 9999999999},
+		{UID: "d", AccessToken: "at-d", ExpiresAt: 9999999999},
+		{UID: "good", AccessToken: "at-good", ExpiresAt: 9999999999},
+	}
+	p := testPoolWith(auths...)
+	// 积分从高到低，确定性随机源每次选剩余里积分最高的，顺序 a→b→c→d→good。
+	for i, a := range auths {
+		p.SetCredits(a.UID, int64(5000-i*100), 0)
+	}
+	h := NewHandler(Config{Pool: p, Upstream: up, MaxRotate: 3, SoftCooldown: time.Minute})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if calls["Bearer at-good"] != 1 {
+		t.Fatalf("good account was not reached: calls=%v", calls)
+	}
+	for _, a := range []string{"at-a", "at-b", "at-c", "at-d"} {
+		if calls["Bearer "+a] != 1 {
+			t.Errorf("limited account %s calls=%d want 1", a, calls["Bearer "+a])
+		}
+	}
+}
+
+// TestChatStreamRateLimitBeforeContentRotates 流式 200 + 首帧即限流：客户端还没看到
+// 正文，应换号继续，而不是把 error 帧写进已经开始的 SSE。
+func TestChatStreamRateLimitBeforeContentRotates(t *testing.T) {
+	const rateFrame = "data: {\"error\":{\"code\":6004,\"message\":\"模型限流，将在 2099-01-01 00:00:00 重置\"}}\n\ndata: [DONE]\n\n"
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		if authz == "Bearer at-bad" {
+			return 200, rateFrame, true
+		}
+		return 200, sseOK, true
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "bad", AccessToken: "at-bad", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "good", AccessToken: "at-good", ExpiresAt: 9999999999},
+	)
+	p.SetCredits("bad", 2000, 0)
+	p.SetCredits("good", 1000, 0)
+	h := NewHandler(Config{Pool: p, Upstream: up, MaxRotate: 3})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[{"role":"user","content":"hi"}]}`)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "6004") || strings.Contains(rec.Body.String(), "限流") {
+		t.Fatalf("rate-limit frame leaked to client: %s", rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "你好") {
+		t.Fatalf("success content missing: %s", rec.Body.String())
+	}
+	st, _ := p.Status("bad")
+	if len(st.RateLimitedModels) != 1 {
+		t.Fatalf("bad should carry a model rate-limit row: %+v", st.RateLimitedModels)
+	}
+}
+
 // TestChat6004ModelResetCoolsToParsedTime 端到端回归 issue #31：上游 429 + code 6004
 // +「将在 … 重置」→ 冷却 until 精确等于解析时间（而非 600s 固定基数/指数退避），
 // 且记录触发模型 → 同模型请求仍被冷却、切模型请求按豁免可选。

@@ -482,7 +482,23 @@ type StreamOption func(*streamOptions)
 
 type streamOptions struct {
 	onErrorFrame func(payload string)
+	// holdErrorUntilContent 为 true 时，在写出任何正文之前把上游 error 帧留在
+	// 缓冲里，不写给客户端。调用方据此换号重试（客户端还没看到失败）。
+	// 已经写出过正文后再遇到 error 帧，仍立即透传——半截回答不能换成另一个号接着写。
+	holdErrorUntilContent bool
 }
+
+// HoldErrorUntilContent 让 StreamHint 在首个正文帧之前扣住上游 error 帧。
+// 返回的 ErrStreamHeld 携带该帧原文；响应头与 body 都还没写。
+func HoldErrorUntilContent() StreamOption {
+	return func(o *streamOptions) { o.holdErrorUntilContent = true }
+}
+
+// ErrStreamHeld 表示上游 error 帧出现在任何正文之前，且调用方要求先扣住。
+// Payload 是 data 行原文（不含 "data: " 前缀）。
+type ErrStreamHeld struct{ Payload string }
+
+func (e *ErrStreamHeld) Error() string { return "upstream error frame held before content" }
 
 // WithErrorFrameObserver 注册"上游以 error 帧报错"的观察者：透传该帧之前先用
 // payload（原始 data 内容）回调一次。给调用方一个**账号处置**的挂载点——
@@ -514,6 +530,12 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 	// toolCallSeen 跨帧记录 delta.tool_calls 里已发过首片的 index，
 	// 供逐 chunk 透传时收敛 name 为「每 index 一次」（对齐 OpenAI 官方流）。
 	toolCallSeen := map[int]bool{}
+	// clientSawContent 一旦为 true，后续 error 帧必须透传：客户端已经在读回答，
+	// 换号会把两个账号的输出拼进同一条流。
+	clientSawContent := false
+	// pending 扣住正文之前的帧（role-only 首帧、注释）。限流 error 帧若出现在
+	// 正文之前，这些字节也不能写出去——一写就提交了 200，换号会拼进同一条流。
+	var pending []string
 
 	// firstID 透传流的消息级 id 基准：缓存首个非空上游 id，后续帧缺失/空串时复用
 	// （issue #35：同一条 SSE 消息所有帧共用一个真实 id，后台按 id 归并；此前中间帧
@@ -525,17 +547,41 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 	// gateway_hint：上游 error 帧透出前按 hintFn 附加 error.gateway_hint 字段
 	// （error 对象上加一个键，message/code/requestId 等原文不动；hintFn 为
 	// nil / 空串 / 非 JSON 帧 → 原样写出，零改写）。
-	writeRaw := func(payload string) error {
-		if hint := frameGatewayHint(hintFn, payload); hint != "" {
-			payload = attachHintToErrorFrame(payload, hint)
-		}
-		if _, werr := io.WriteString(w, "data: "+payload+"\n\n"); werr != nil {
+	writeDirect := func(line string) error {
+		if _, werr := io.WriteString(w, line); werr != nil {
 			return werr
 		}
 		if fl != nil {
 			fl.Flush()
 		}
 		return nil
+	}
+	// emit 在「正文未写出且要求扣住 error」时只缓冲。否则立即写给客户端。
+	emit := func(line string) error {
+		if o.holdErrorUntilContent && !clientSawContent {
+			pending = append(pending, line)
+			return nil
+		}
+		return writeDirect(line)
+	}
+	flushPending := func() error {
+		if len(pending) == 0 {
+			return nil
+		}
+		buf := pending
+		pending = nil
+		for _, line := range buf {
+			if werr := writeDirect(line); werr != nil {
+				return werr
+			}
+		}
+		return nil
+	}
+	writeRaw := func(payload string) error {
+		if hint := frameGatewayHint(hintFn, payload); hint != "" {
+			payload = attachHintToErrorFrame(payload, hint)
+		}
+		return writeDirect("data: " + payload + "\n\n")
 	}
 
 	// writeFrame 把 payload 按规范白名单重建后以 data: 帧写出并 flush。
@@ -549,6 +595,12 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 			// code/msg/requestId。error.message 即上游原文（如 6004 限流、审核拦截），
 			// 计入有效帧（避免误判空流补写 "empty upstream stream"）。
 			if _, hasErr := obj["error"]; hasErr {
+				// 正文还没写出：扣住这一帧，让调用方换号。不写响应头、不通知观察者
+				// （观察者挂在「已经透传」之后；换号成功时客户端不该看到这次失败）。
+				// 顶层 error 与 OpenAI 形态的 error 帧都算；choices 里夹带的 error 不在此列。
+				if o.holdErrorUntilContent && !clientSawContent {
+					return 0, &ErrStreamHeld{Payload: payload}
+				}
 				// 旁路通知（账号处置用）：原始 payload 交给观察者，透传字节不变。
 				if o.onErrorFrame != nil {
 					o.onErrorFrame(payload)
@@ -557,6 +609,12 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 					return 0, werr
 				}
 				return 1, nil
+			}
+			if frameHasClientContent(obj) {
+				clientSawContent = true
+				if werr := flushPending(); werr != nil {
+					return 0, werr
+				}
 			}
 			// 先按 index 收敛 tool_calls name（每 index 仅首片保留，后续分片删 name 键），再规范化透传。
 			stripToolCallNames(obj, toolCallSeen)
@@ -576,11 +634,8 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 			}
 			valid = 1
 		}
-		if _, werr := io.WriteString(w, "data: "+payload+"\n\n"); werr != nil {
+		if werr := emit("data: " + payload + "\n\n"); werr != nil {
 			return 0, werr
-		}
-		if fl != nil {
-			fl.Flush()
 		}
 		return valid, nil
 	}
@@ -603,12 +658,9 @@ readLoop:
 				return werr
 			}
 		case trimmed != "":
-			// 注释/其他行：原样透传
-			if _, werr := io.WriteString(w, line); werr != nil {
+			// 注释/其他行：正文前与 role 帧一起缓冲，避免限流帧出现前已提交响应。
+			if werr := emit(line); werr != nil {
 				return werr
-			}
-			if fl != nil {
-				fl.Flush()
 			}
 		}
 		// 空行（帧分隔）吞掉：本函数自产 "\n\n"
@@ -618,6 +670,9 @@ readLoop:
 			}
 			return err
 		}
+	}
+	if werr := flushPending(); werr != nil {
+		return werr
 	}
 	// 空流（0 有效帧）：先写一帧 error（绕过 normalizeFrame 原样保留 error 字段），
 	// 再补 [DONE] 保证客户端能正常收尾，并返回非 nil error 供调用方记录。
@@ -637,6 +692,42 @@ readLoop:
 		return errEmptyStream
 	}
 	return nil
+}
+
+// frameHasClientContent 报告这一帧是否已经是客户端可见的回答。
+// role-only 首帧（delta 只有 role，或 content 为空串）不算：上游常在限流 error
+// 帧之前先发一帧空 role，此时客户端还没有正文，换号不会拼出半截回答。
+func frameHasClientContent(obj map[string]any) bool {
+	if _, hasErr := obj["error"]; hasErr {
+		return false
+	}
+	choices, _ := obj["choices"].([]any)
+	for _, ci := range choices {
+		c, _ := ci.(map[string]any)
+		if c == nil {
+			continue
+		}
+		if delta, ok := c["delta"].(map[string]any); ok && deltaHasClientContent(delta) {
+			return true
+		}
+		if msg, ok := c["message"].(map[string]any); ok && deltaHasClientContent(msg) {
+			return true
+		}
+	}
+	return false
+}
+
+func deltaHasClientContent(delta map[string]any) bool {
+	if txt, ok := delta["content"].(string); ok && txt != "" {
+		return true
+	}
+	if txt, ok := delta["reasoning_content"].(string); ok && txt != "" {
+		return true
+	}
+	if tcs, ok := delta["tool_calls"].([]any); ok && len(tcs) > 0 {
+		return true
+	}
+	return false
 }
 
 // frameGatewayHint 取 error 帧的 gateway_hint（hintFn 缺失/异常返回空串 → 不附加）。

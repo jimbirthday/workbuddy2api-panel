@@ -772,3 +772,237 @@ process.stdout.write(JSON.stringify([
 		t.Fatalf("collectConfig=%s want %s", strings.TrimSpace(string(out)), want)
 	}
 }
+
+// TestAppJSExpirySortedByExpiry 到期提醒按「最近到期」升序，且不分域（issue #125）。
+//
+// 后端 /panel/api/packages 是按**余额降序**返回的，恰好把 CN 账号都排在前面、
+// global 排在末尾，看上去像"按域分组"，实际只是余额顺序。本用例刻意按这个形态构造
+// 输入（余额高的到期最晚、global 余额最低），若前端不重排就会保持该顺序而失败。
+//
+// 日期按「今天 +N 天」生成而不是写死：写死的话过了那天用例就会自己失效。
+func TestAppJSExpirySortedByExpiry(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; expiry sort test skipped")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('function expBatches');
+const end = src.indexOf('async function loadExpiry');
+if (start < 0 || end < 0 || end < start) throw new Error('expiry region not found');
+const sink = { innerHTML: '', textContent: '', hidden: true };
+const ctx = {
+  esc: s => String(s == null ? '' : s),
+  fmtTok: v => String(v == null ? 0 : v),
+  $: () => sink,
+  Date, Math, Number, String, Map, Array, Object, isNaN,
+  lastPackages: null, lastPackagesAt: 0,
+};
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, end) + '\nthis.renderExpiry = renderExpiry;', ctx);
+const iso = n => {
+  const d = new Date(); d.setHours(0, 0, 0, 0); d.setDate(d.getDate() + n);
+  const p = x => String(x).padStart(2, '0');
+  return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate());
+};
+const pack = (days, amount) => ({ end_time: iso(days) + ' 00:00:00', remain: amount });
+// 模拟后端顺序：余额降序 → CN 高余额在前且到期最晚，global 最少且最快到期。
+const d = { accounts: [
+  { uid: 'a', nickname: 'cn-late',  realm: 'cn',     packages: [pack(16, 900)] },
+  { uid: 'b', nickname: 'cn-mid',   realm: 'cn',     packages: [pack(12, 700)] },
+  { uid: 'c', nickname: 'gl-soon',  realm: 'global', packages: [pack(2, 500)] },
+  { uid: 'd', nickname: 'no-expiry', realm: 'cn',    packages: [pack(-3, 100)] },
+  { uid: 'e', nickname: 'broken',   realm: 'cn',     error: 'offline' },
+] };
+ctx.renderExpiry(d);
+const names = [...sink.innerHTML.matchAll(/<span class="exp-nm">([^<]*)<\/span>/g)].map(m => m[1]);
+process.stdout.write(JSON.stringify(names));`
+	f, err := os.CreateTemp(t.TempDir(), "expsort-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("expiry sort node test failed: %v\n%s", err, out)
+	}
+	// 最快到期的排最前（跨域）；无 7 天内到期的与查询失败的排最后。
+	const want = `["gl-soon","cn-mid","cn-late","no-expiry","broken"]`
+	if strings.TrimSpace(string(out)) != want {
+		t.Fatalf("expiry order=%s\nwant %s", strings.TrimSpace(string(out)), want)
+	}
+}
+
+// TestAppJSExpirySnapshotRenders 到期卡片用 overview 快照即可渲染（issue #137）。
+//
+// 此前的死锁：卡片在 index.html 上写死 hidden，而唯一解除隐藏的语句在
+// renderExpiry() 末尾——该函数只有点「检查」才被调用。按钮本身就在隐藏卡片里，
+// 用户看不见也点不到，于是"积分到期提醒"这个功能等于不存在。
+//
+// 修复引入 renderExpirySnapshot()：吃 /overview 响应里的 credits_earliest_expiry /
+// credits_earliest_remaining（state.json 现成数据，零上游请求），并显式设
+// expBox.hidden = false。本用例钉住两件事：
+//  1. 只给 overview 形态的输入（没有 packages 字段）也能出内容；
+//  2. 渲染后 expBox.hidden 必须为 false——把这句删掉（还原 bug）测试就必须 FAIL。
+func TestAppJSExpirySnapshotRenders(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; expiry snapshot test skipped")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('function renderExpirySnapshot');
+const end = src.indexOf('async function loadExpiry');
+if (start < 0 || end < 0 || end < start) throw new Error('expiry snapshot region not found');
+const sinks = {};
+const mk = id => (sinks[id] = { innerHTML: '', textContent: '', hidden: true });
+const ctx = {
+  esc: s => String(s == null ? '' : s),
+  fmtTok: v => String(v == null ? 0 : v),
+  $: id => (sinks[id] || mk(id)),
+  Date, Math, Number, String, Map, Array, Object, isNaN,
+};
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, end) + '\nthis.renderExpirySnapshot = renderExpirySnapshot;', ctx);
+const day = n => {
+  const d = new Date(); d.setHours(0, 0, 0, 0); d.setDate(d.getDate() + n);
+  return d.toISOString();
+};
+// overview 形态：没有 packages 数组，只有到期快照字段。
+const d = { accounts: [
+  { uid: 'aaaaaaaa-1', nickname: '秋',     credits: 4099,
+    credits_earliest_expiry: day(2),  credits_earliest_remaining: 499 },
+  { uid: 'bbbbbbbb-2', nickname: '秋千易', credits: 3243,
+    credits_earliest_expiry: day(30), credits_earliest_remaining: 43 },
+  { uid: 'cccccccc-3', nickname: '长期包', credits: 900,
+    credits_earliest_expiry: null,    credits_earliest_remaining: 0 },
+] };
+ctx.renderExpirySnapshot(d);
+const html = sinks['expList'] ? sinks['expList'].innerHTML : '';
+const names = [...html.matchAll(/<span class="exp-nm">([^<]*)<\/span>/g)].map(m => m[1]);
+// 2 天到期的应排最前（红），30 天其次，无到期信息的排最后。
+const wantNames = JSON.stringify(['秋', '秋千易', '长期包']);
+const gotNames = JSON.stringify(names);
+process.stdout.write(JSON.stringify({
+  visible: sinks['expBox'] ? sinks['expBox'].hidden === false : false,
+  rows: names.length,
+  order: gotNames === wantNames,
+  got: gotNames,
+  want: wantNames,
+}));`
+	f, err := os.CreateTemp(t.TempDir(), "expsnap-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("expiry snapshot node test failed: %v\n%s", err, out)
+	}
+	const want = `{"visible":true,"rows":3,"order":true,"got":"[\"秋\",\"秋千易\",\"长期包\"]","want":"[\"秋\",\"秋千易\",\"长期包\"]"}`
+	if strings.TrimSpace(string(out)) != want {
+		t.Fatalf("expiry snapshot=%s\nwant %s（visible 必须为 true，否则卡片仍隐藏）",
+			strings.TrimSpace(string(out)), want)
+	}
+}
+
+// TestPanelIndexExpiryBoxNotHidden 到期卡片在 HTML 骨架里不得带 hidden 属性（issue #137）。
+//
+// 与上一个用例互补：app.js 侧有 renderExpirySnapshot 兜底，HTML 侧若仍写死 hidden，
+// 用户在首次 overview 返回前（以及 JS 加载失败时）看到的依然是空白。这个断言就是
+// 那个曾经卡住整个功能的属性——把它加回去测试必须 FAIL。
+func TestPanelIndexExpiryBoxNotHidden(t *testing.T) {
+	b, err := os.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 定位到期卡片那一行，只检查它自己，避免误伤其他合法的 hidden 元素。
+	idx := strings.Index(string(b), `id="expBox"`)
+	if idx < 0 {
+		t.Fatal(`index.html missing id="expBox"`)
+	}
+	lineStart := strings.LastIndex(string(b[:idx]), "\n") + 1
+	lineEnd := strings.Index(string(b[idx:]), "\n")
+	if lineEnd < 0 {
+		lineEnd = len(b) - idx
+	}
+	line := string(b[lineStart : idx+lineEnd])
+	if strings.Contains(line, "hidden") {
+		t.Fatalf(`expBox 元素不得带 hidden（issue #137 死锁根因），实际行：%s`, strings.TrimSpace(line))
+	}
+}
+
+// TestAppJSChartTooltipInsideBar 图表 tooltip 必须挂在每根柱子内部（issue #128）。
+//
+// <title> 在 SVG 里描述的是**父元素**。此前它被平铺在 <svg> 根下（<rect> 是自闭合的，
+// 无法包含子节点），于是整张图共用一个 tooltip —— 浏览器取第一个 —— 悬停任何柱子都
+// 显示同一份数据。这类问题不报错、不影响渲染，只靠肉眼看很容易漏。
+//
+// 断言结构：<g> 数量 == 数据点数，且每个 <g> 紧跟一个 <title>；同时确认没有
+// 游离在 <g> 之外的 <title>。
+func TestAppJSChartTooltipInsideBar(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; chart tooltip test skipped")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('function parsePointTime');
+const chartStart = src.indexOf('function renderUsageChart');
+if (start < 0 || chartStart < 0) throw new Error('chart functions not found');
+let end = src.indexOf('\nfunction ', chartStart + 10);
+if (end < 0) end = src.length;
+const sinks = {};
+const mk = id => (sinks[id] = { innerHTML: '', textContent: '' });
+const ctx = {
+  esc: s => String(s == null ? '' : s),
+  fmtTok: v => String(v == null ? 0 : v),
+  $: id => (sinks[id] || mk(id)),
+  Date, Math, Number, String, Map, Array, Object, isNaN, Infinity, isFinite, Set,
+};
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, end) + '\nthis.renderUsageChart = renderUsageChart;', ctx);
+const series = [];
+for (let h = 0; h < 5; h++) {
+  const d = new Date(); d.setHours(d.getHours() - (4 - h), 0, 0, 0);
+  const iso = d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' +
+              String(d.getDate()).padStart(2, '0') + 'T' + String(d.getHours()).padStart(2, '0');
+  series.push({ t: iso, scope: 'hour', prompt_tokens: (h + 1) * 100,
+                completion_tokens: (h + 1) * 10, total_tokens: (h + 1) * 110, requests: h + 1 });
+}
+ctx.renderUsageChart(series);
+const svg = sinks['usChart'] ? sinks['usChart'].innerHTML : '';
+const groups = svg.match(/<g><title>/g) || [];
+const titles = svg.match(/<title>[^<]*<\/title>/g) || [];
+// 游离的 <title>：前面不是 <g>（即仍平铺在根下）
+const loose = (svg.match(/(?:<rect[^>]*\/>|<\/g>)<title>/g) || []).length;
+process.stdout.write(JSON.stringify({
+  points: series.length, groups: groups.length, titles: titles.length, loose: loose,
+}));`
+	f, err := os.CreateTemp(t.TempDir(), "charttip-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("chart tooltip node test failed: %v\n%s", err, out)
+	}
+	const want = `{"points":5,"groups":5,"titles":5,"loose":0}`
+	if strings.TrimSpace(string(out)) != want {
+		t.Fatalf("chart tooltip structure=%s\nwant %s（groups 应等于数据点数，loose 应为 0）",
+			strings.TrimSpace(string(out)), want)
+	}
+}

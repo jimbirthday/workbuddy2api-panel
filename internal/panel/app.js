@@ -349,7 +349,9 @@ function go(v) {
   if (v === 'logs') loadLogs();
   if (v === 'usage') loadUsage();
   if (v === 'packages') loadPackages();
-  if (v === 'accounts') loadExpiry();
+  // 到期提醒卡片：默认可见，进页面即用 overview 快照渲染（零上游请求，随首页统计
+  // 每轮刷新）。不再「打开账号池就打上游」——逐账号实时查在账号多时会卡死面板。
+  // 完整逐包明细由卡片上的「检查」按钮显式触发（loadPackages/loadExpiry）。
   if (v === 'taskscenter') reattachQueueView();
 }
 document.querySelectorAll('.nav a').forEach(a => a.onclick = e => { e.preventDefault(); go(a.dataset.view); history.replaceState(null, '', '#' + a.dataset.view); });
@@ -389,13 +391,23 @@ function renderAccounts(list) {
     const note = s.reason ? '<div class="hint" style="font-size:11.5px;color:var(--ink-3);margin-top:3px">' + esc(s.reason) + '</div>' : '';
     const rateLimits = rateLimitRowsHtml(s.rate_limited_models, Date.now());
     const short = s.uid.length > 16 ? s.uid.slice(0, 16) + '…' : s.uid;
-    const cred = s.credits == null ? '—' : (s.credits_total > 0 ? s.credits + '<span class="of">/' + s.credits_total + '</span>' : String(s.credits));
-    const pct = s.credits_total > 0
-      ? Math.min(100, Math.round((s.credits || 0) / s.credits_total * 100))
-      : Math.round((s.credits || 0) / maxCred * 100);
+    // 企业版不限量：上游 limitNum == -1，网关以 credits_total=-1 透出（见 upstream
+    // enterpriseUnlimitedTotal）。此时剩余额度不参与展示，直接标「不限」。
+    const unlimited = s.credits_total === -1;
+    const cred = unlimited ? '不限'
+      : (s.credits == null ? '—' : (s.credits_total > 0 ? s.credits + '<span class="of">/' + s.credits_total + '</span>' : String(s.credits)));
+    const pct = unlimited ? 100
+      : (s.credits_total > 0
+        ? Math.min(100, Math.round((s.credits || 0) / s.credits_total * 100))
+        : Math.round((s.credits || 0) / maxCred * 100));
     // 成本台账 tooltip（model_costs）：每模型实测单价（≤0 = 实测免费），运维据此
     // 看「为什么总选它」——免费号垄断 / 单价排序一眼可见。
-    let credTip = s.credits_total > 0 ? '剩余 ' + s.credits + ' / 总额 ' + s.credits_total + '（' + pct + '%）' : '积分（相对池内最高）';
+    let credTip;
+    if (unlimited) credTip = '企业版不限量（上游 limitNum=-1）';
+    else if (s.credits_total > 0) {
+      credTip = (s.enterprise ? '企业版剩余额度 ' : '剩余 ')
+        + s.credits + ' / ' + (s.enterprise ? '分配 ' : '总额 ') + s.credits_total + '（' + pct + '%）';
+    } else credTip = '积分（相对池内最高）';
     const costs = (s.model_costs || []).filter(c => c.model);
     if (costs.length) {
       credTip += '\n实测单价（credits/1K）：\n' + costs.map(c =>
@@ -411,7 +423,7 @@ function renderAccounts(list) {
     const usageTitle = '最近一次：' + req + ' 次 / ' + totalTok + ' / 延迟 ' + latency + ' / ' + rate;
     return '<tr class="' + cls + '" title="uid: ' + esc(s.uid) + '">' +
       '<td class="mark" aria-hidden="true"><i></i></td>' +
-      '<td class="who"><div class="nm">' + (s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + '</div><div class="id">' + esc(short) + '</div></td>' +
+      '<td class="who"><div class="nm">' + (s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + (s.enterprise ? ' <span class="realm-tag">企业版</span>' : '') + '</div><div class="id">' + esc(short) + '</div></td>' +
       '<td>' + tag + note + rateLimits + '</td>' +
       '<td class="cred" title="' + esc(credTip) + '"><div class="n">' + cred + '</div><div class="bar"><i style="width:' + pct + '%"></i></div></td>' +
       '<td class="num">' + (s.success_count || 0) + ' <span style="color:var(--ink-3)">/</span> <span style="color:var(--bad)">' + (s.err_total || 0) + '</span></td>' +
@@ -424,12 +436,17 @@ function renderAccounts(list) {
       '</span></td>' +
       '<td class="num" style="color:var(--ink-3)">' + ago(s.last_success) + '</td>' +
       '<td class="acts">' +
-        '<button class="xs ghost" data-a="checkin" data-u="' + esc(s.uid) + '"' + (s.checkin_done ? ' title="今日已签到；点击可重新签到并刷新余额"' : '') + '>' + (s.checkin_done ? '已签' : '签到') + '</button>' +
-        '<button class="xs ghost" data-a="balance" data-u="' + esc(s.uid) + '">余额</button>' +
-        '<button class="xs ghost" data-a="tasks" data-u="' + esc(s.uid) + '">任务</button>' +
+        // 企业版无个人成长体系（签到 400「企业账号不支持该操作」/ 成长任务 403）：
+        // 不渲染「签到」「任务」按钮，只留「额度」——点它走 /balance，企业额度由
+        // upstream 的 get-enterprise-user-usage 口径填充。
+        (s.enterprise ? '' :
+          '<button class="xs ghost" data-a="checkin" data-u="' + esc(s.uid) + '"' + (s.checkin_done ? ' title="今日已签到；点击可重新签到并刷新余额"' : '') + '>' + (s.checkin_done ? '已签' : '签到') + '</button>') +
+        '<button class="xs ghost" data-a="balance" data-u="' + esc(s.uid) + '"' + (s.enterprise ? ' title="刷新企业版已分配额度（上游 get-enterprise-user-usage）"' : '') + '>' + (s.enterprise ? '额度' : '余额') + '</button>' +
+        (s.enterprise ? '' :
+          '<button class="xs ghost" data-a="tasks" data-u="' + esc(s.uid) + '">任务</button>') +
         (frozen ? '<button class="xs primary" data-a="revive" data-u="' + esc(s.uid) + '">解冻</button>'
                 : (s.paused ? '<button class="xs primary" data-a="resume" data-u="' + esc(s.uid) + '">恢复选号</button>'
-                            : '<button class="xs ghost" data-a="pause" data-u="' + esc(s.uid) + '" title="退出选号，但照常签到 / 活跃上报 / 保活 / 刷新余额">暂停选号</button>')) +
+                            : '<button class="xs ghost" data-a="pause" data-u="' + esc(s.uid) + '" title="' + (s.enterprise ? '退出选号，但照常保活 / 刷新额度' : '退出选号，但照常签到 / 活跃上报 / 保活 / 刷新余额') + '">暂停选号</button>')) +
         (s.disabled ? '' : '<button class="xs ghost" data-a="disable" data-u="' + esc(s.uid) + '">禁用</button>') +
         '<button class="xs ghost danger" data-a="remove" data-u="' + esc(s.uid) + '">移除</button>' +
       '</td></tr>';
@@ -480,6 +497,8 @@ async function loadOverview(quiet) {
     $('sHealthy').textContent = d.healthy;
     $('sCooling').textContent = d.cooling;
     $('sDisabled').textContent = d.disabled;
+    // 暂停选号单列（issue #125）：它只关选号、照常签到保活，与禁用是两种状态。
+    if ($('sPaused')) $('sPaused').textContent = d.paused == null ? '-' : d.paused;
     const remSum = (d.accounts || []).reduce((a, s) => a + (s.credits || 0), 0);
   const totSum = (d.accounts || []).reduce((a, s) => a + (s.credits_total || 0), 0);
   $('sCredits').textContent = totSum > 0 ? remSum + ' / ' + totSum : remSum;
@@ -495,6 +514,9 @@ async function loadOverview(quiet) {
     $('subMeta').textContent = '运行 ' + (up >= 86400 ? Math.floor(up / 86400) + ' 天 ' : '') + Math.floor(up % 86400 / 3600) + ' 时 ' + Math.floor(up % 3600 / 60) + ' 分';
     renderAccounts(d.accounts || []);
     renderModelLocks(d.model_locks);
+    // 到期卡片跟随首页统计同步刷新（用同一份响应里的到期快照，不额外发请求）。
+    // 已有逐包明细缓存时不再覆盖——明细信息量更大，别把它降级成快照。
+    if ($('expBox') && !lastPackages) renderExpirySnapshot(d);
   } catch (e) { if (!quiet) toast(e.message, 'err'); }
 }
 
@@ -2182,6 +2204,15 @@ function renderUsageChart(series) {
     const hTot = ih * (p.tt / max);
     const hP = p.tt ? hTot * (p.pt / p.tt) : 0;
     const hC = Math.max(p.tt && p.ct ? 1 : 0, hTot - hP);
+    // 每根柱子包一个 <g>，把 <title> 放进去。
+    //
+    // 为什么必须包裹：SVG 里 <title> 描述的是它的**父元素**。此前 <title> 是
+    // <rect> 的兄弟节点（rect 自闭合，无法包含子节点），于是全部平铺在 <svg>
+    // 根下 —— 整张图只有一个 tooltip（浏览器取第一个），悬停任何柱子都显示同一
+    // 份数据（issue #128）。包进 <g> 后 tooltip 跟随该柱，且堆叠的两段
+    //（prompt + completion）共用同一个提示。
+    out += '<g><title>' + esc(p.raw) + '  ' + fmtTok(p.pt) + ' prompt / ' +
+           fmtTok(p.ct) + ' completion / ' + p.req + ' 次</title>';
     // 圆角只给堆叠顶端（贴轴的底边保持方角，柱子才像"立"在基线上）。
     // 类名用 usbar 而不是 bar：账号池的积分条是 .bar{height:3px}，而 SVG2 里
     // height 是 rect 的 CSS 几何属性，同名类会把每根柱子压成 3px 高（踩过）。
@@ -2191,8 +2222,7 @@ function renderUsageChart(series) {
     if (hC > 0) out += '<rect class="usbar" x="' + x.toFixed(2) + '" y="' + (yBase - hP - hC).toFixed(2) +
       '" width="' + bw.toFixed(2) + '" height="' + hC.toFixed(2) +
       '" fill="url(#usGradC)" rx="1.5"/>';
-    out += '<title>' + esc(p.raw) + '  ' + fmtTok(p.pt) + ' prompt / ' +
-           fmtTok(p.ct) + ' completion / ' + p.req + ' 次</title>';
+    out += '</g>';
   }
 
   // 峰值标注：柱子够窄时文字压在柱顶，够宽时贴右侧避免和柱体重叠。
@@ -2705,7 +2735,16 @@ if ($('pkSort')) {
   };
 }
 
-async function loadPackages() {
+// loadPackages 按需拉取：有缓存（上次任意入口拉到的 packages 数据）先直接渲染，
+// 不再「切进积分构成页就打一次上游」——逐账号实时查询在账号多时既慢又压上游。
+// 无缓存（首次进入）才自动查一次；显式刷新（force=true，点「刷新」按钮）始终实时查。
+async function loadPackages(force) {
+  if (!force && lastPackages) {
+    renderPackages(lastPackages, lastDetailLimit);
+    const ageMin = Math.floor((Date.now() - lastPackagesAt) / 60000);
+    if (ageMin > 0) $('pkNote').textContent = lastPackages.accounts.length + ' 个账号 · ' + ageMin + ' 分钟前的数据，点「刷新」更新';
+    return;
+  }
   $('pkSummary').innerHTML = '<div class="empty">查询中…（逐账号向上游实时查询）</div>';
   $('pkDetail').innerHTML = '';
   $('pkExpiry').innerHTML = '<div class="pk-expiry-empty">查询中…</div>';
@@ -2752,7 +2791,30 @@ function expDaysLeft(dateStr, today) {
 function renderExpiry(d) {
   const list = (d.accounts || []);
   const today = new Date(); today.setHours(0, 0, 0, 0);
-  const rows = list.map(a => {
+  // 按「最近到期」升序排（issue #125）。
+  //
+  // 后端 /panel/api/packages 是按**余额降序**返回的，恰好把 CN 账号都排在前面、
+  // global 排在末尾，看起来像"按域分组"，其实只是余额顺序。这里再排一次，让
+  // "最快过期的排最前"这个唯一重要的顺序成立，且不分域。
+  //
+  // 排序键用最早到期批次的日期（expBatches 已按日期升序，故 [0] 即最早）。
+  // 查询失败的账号、以及 7 天内无到期的账号没有可比较的到期时间，统一排在最后，
+  // 保持它们原本的相对顺序（稳定排序）。
+  const keyed = list.map(a => {
+    let key = null;
+    if (!a.error) {
+      const bs = expBatches(a.packages).filter(b => expDaysLeft(b.date, today) >= 0);
+      if (bs.length) key = bs[0].date;
+    }
+    return { a, key };
+  });
+  keyed.sort((x, y) => {
+    if (x.key === y.key) return 0;
+    if (x.key === null) return 1;
+    if (y.key === null) return -1;
+    return x.key < y.key ? -1 : 1;
+  });
+  const rows = keyed.map(({ a }) => {
     if (a.error) {
       return '<div class="exp-row"><span class="exp-dot" style="background:var(--ink-3)"></span>' +
         '<span class="exp-nm">' + esc(a.nickname || a.uid.slice(0, 8)) + '</span>' +
@@ -2795,6 +2857,57 @@ function renderExpiry(d) {
   $('expBox').hidden = false;
 }
 
+/* 快照版到期提醒：不查上游，直接用 /overview 已有的 credits_earliest_expiry /
+   credits_earliest_remaining（由签到与余额后台刷新写入 state.json，默认每 5 分钟
+   更新一次）。打开面板即可看到「最近哪批要过期」，成本与首页统计条相同为零。
+
+   与 renderExpiry（逐包明细版）的差异：这里只有**最早一批**的日期与数量，没有
+   后续批次、也没法算「7 天内合计」——那是 packages 接口才有的信息。因此卡片上
+   保留「检查」按钮作为增强入口，用户想要完整明细再显式触发一次上游查询。 */
+function renderExpirySnapshot(d) {
+  const list = (d && d.accounts) || [];
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  const keyed = list.map(a => {
+    // 后端给的是 RFC3339 带时区；无到期信息（长期包/未刷新）的账号排在最后。
+    let key = null, ms = 0;
+    if (a.credits_earliest_expiry) {
+      const t = new Date(a.credits_earliest_expiry);
+      if (!isNaN(t.getTime())) { ms = t.getTime(); key = ms; }
+    }
+    return { a, key, ms };
+  });
+  keyed.sort((x, y) => {
+    if (x.key === null && y.key === null) return 0;
+    if (x.key === null) return 1;
+    if (y.key === null) return -1;
+    return x.key - y.key;
+  });
+  const rows = keyed.map(({ a, ms }) => {
+    const nm = esc(a.nickname || String(a.uid || '').slice(0, 8));
+    if (!ms || !a.credits_earliest_remaining) {
+      return '<div class="exp-row"><span class="exp-dot" style="background:var(--ok)"></span>' +
+        '<span class="exp-nm">' + nm + '</span>' +
+        '<span class="exp-main">无近期到期批次</span></div>';
+    }
+    const days = Math.max(0, Math.ceil((ms - today.getTime()) / 86400000));
+    const remain = Number(a.credits_earliest_remaining || 0);
+    const daily = Math.ceil(remain / Math.max(1, days));
+    const cls = days <= 3 ? 'var(--bad)' : days <= 7 ? 'var(--warn)' : 'var(--ok)';
+    const dayWord = days === 0 ? '今天到期' : days === 1 ? '明天到期' : days + ' 天后到期';
+    const when = new Date(ms).toISOString().slice(0, 10);
+    return '<div class="exp-row"><span class="exp-dot" style="background:' + cls + '"></span>' +
+      '<span class="exp-nm">' + nm + '</span>' +
+      '<span class="exp-main">最近到期 <b>' + esc(when) + '</b>（' + dayWord +
+      '）· 该批 <b>' + fmtTok(remain) + '</b> 积分 · 到期前日均需耗 ≥<b>' +
+      fmtTok(daily) + '</b>' +
+      '<div class="note">仅最早一批，点「检查」看全部到期批次</div>' +
+      '</span></div>';
+  }).join('');
+  $('expList').innerHTML = rows || '<div class="empty">没有账号</div>';
+  $('expNote').textContent = list.length + ' 个账号 · 快照（来自本地状态，点「检查」拉实时明细）';
+  $('expBox').hidden = false;
+}
+
 async function loadExpiry(force) {
   if (!$('expBox')) return;
   if (expFetching) return;
@@ -2817,4 +2930,5 @@ async function loadExpiry(force) {
 
 if ($('btnExp')) $('btnExp').onclick = () => loadExpiry(true);
 
-if ($('btnPk')) $('btnPk').onclick = loadPackages;
+// 「刷新」始终实时查（显式 force，不依赖事件对象真值）
+if ($('btnPk')) $('btnPk').onclick = () => loadPackages(true);

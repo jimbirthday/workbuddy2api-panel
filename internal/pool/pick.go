@@ -2,6 +2,7 @@
 package pool
 
 import (
+	"fmt"
 	"log"
 	"math/rand/v2"
 	"sort"
@@ -43,6 +44,18 @@ func (p *Pool) PickExcludingForRealm(tried map[string]bool, reqModel, realm stri
 // reqModel 非空时把健康口径换成 healthyForModel（6004 模型豁免生效）。
 // realm 非空时候选过滤叠加 Realm()==realm 谓词（分池选号域）。
 func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
+	a, eventLog := p.pickLocked(tried, reqModel, realm)
+	// 事件日志在**释放锁之后**打：log.Printf 会写 stderr（可能是慢终端/管道），
+	// 持写锁打日志会把整池的选号/状态查询一起堵在这一行上。
+	if eventLog != "" {
+		log.Print(eventLog)
+	}
+	return a
+}
+
+// pickLocked 是 pick 的持锁主体，返回选中账号与一条待打的事件日志（空串 = 无）。
+// 调用方必须**在锁外**打这条日志（见 pick）。
+func (p *Pool) pickLocked(tried map[string]bool, reqModel, realm string) (*auth.Auth, string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	now := time.Now()
@@ -54,6 +67,7 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 	// floorBlocked 积分保底拦截判定（实现在 floorBlockedForRealmModel，与粘性路径共用）：
 	// 触底 + 收费（本地实测台账 或 上游目录倍率）即拦；免费/未知倍率不受限。
 	floorBlocked := func(e *entry) bool { return p.floorBlockedForRealmModel(e, reqModel, realm, now) }
+	var eventLog string
 	var cands []*entry
 	for uid, e := range p.byUID {
 		if tried != nil && tried[uid] {
@@ -222,20 +236,20 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 		e = p.pickWeighted(eligible) // eligible 保序 = top5 降序子集
 	}
 	if explored {
-		// 探索事件日志（可观测性）：选中号此时才确定，故在选中点打出。
-		// 毕业结果由相邻的既有日志闭环（免费号无日志、收费号走 NoteModelCost
-		// 常规路径）。
-		log.Printf("[pool] cost explore model=%s realm=%q acct=%s window=%s",
+		// 探索事件日志（可观测性）：选中号此时才确定，故在选中点组装文案，
+		// 由 pick 在锁外打印。毕业结果由相邻的既有日志闭环（免费号无日志、
+		// 收费号走 NoteModelCost 常规路径）。
+		eventLog = fmt.Sprintf("[pool] cost explore model=%s realm=%q acct=%s window=%s",
 			reqModel, realm, logfmt.Label(e.a.UID, e.a.Nickname), p.costExploreInterval)
 	}
 	e.lastUsed = now // 锁内即时标记：下一个进入 pick 的 goroutine 立即看到本号已用
 	p.pickSeq++
 	e.usedSeq = p.pickSeq // 单调序号：保证 usedSeq 严格全序（防惊群/LRU 的权威依据）
-	return e.a
+	return e.a, eventLog
 }
 
-// floorBlockedForModel 积分保底拦截判定（pick 普通轮换与 PickByUIDForModel 粘性
-// 路径的单一事实来源）：floor>0 且账号触底（credits < floor）且该模型**收费**
+// floorBlockedForRealmModel 积分保底拦截判定（pick 普通轮换与 PickByUIDForModel
+// 粘性路径的单一事实来源）：floor>0 且账号触底（credits < floor）且该模型**收费**
 // 时为真。
 //
 // 收费判据两级（任一成立即判收费 → 拦）：
@@ -257,10 +271,6 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 // 余额用本地插值口径（签到权威值 - 每笔 usage.credit 实扣，见 NoteModelCost）：
 // 只会偏低不会偏高（官方对账延迟方向安全），正是保底需要的安全方向。
 // 调用方必须已持有 p.mu（读 e.credits / e.modelCost / p.modelRateOf）。
-func (p *Pool) floorBlockedForModel(e *entry, model string, now time.Time) bool {
-	return p.floorBlockedForRealmModel(e, model, "", now)
-}
-
 // floorBlockedForRealmModel 同上，但带 realm 上下文（倍率按 (realm, 模型) 分桶，
 // 同名模型在 CN / global 两域倍率可不同）。realm 为空时按倍率表的空域键查。
 func (p *Pool) floorBlockedForRealmModel(e *entry, model, realm string, now time.Time) bool {
@@ -295,7 +305,7 @@ func (p *Pool) floorBlockedForRealmModel(e *entry, model, realm string, now time
 // 这里，若兜底不看保底，触底号会被「捞回来」继续接收费模型——表现为同一条
 // floor WARN 反复刷同一个号（实测：credits=1 < floor=150 仍持续中选）。
 // 兜底是**最后一道**选号路径，保底在它之前挡不住就等于没挡。
-func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, realm, model string) *auth.Auth {
+func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, realm, model string) (*auth.Auth, string) {
 	var best *entry
 	for uid, e := range p.byUID {
 		if tried != nil && tried[uid] {
@@ -325,9 +335,11 @@ func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, re
 		}
 	}
 	if best == nil {
-		return nil
+		return nil, ""
 	}
-	log.Printf("WARN: [pool] fallback_earliest_expiry acct=%s until=%s kind=%s", logfmt.Label(best.a.UID, best.a.Nickname), best.expiry(now).Format(time.RFC3339), best.fallbackKind(now))
+	// 文案在锁内组装、由调用方在锁外打印（同 pick 的 eventLog：持写锁打日志会
+	// 把整池选号堵在 stderr 上）。
+	eventLog := fmt.Sprintf("WARN: [pool] fallback_earliest_expiry acct=%s until=%s kind=%s", logfmt.Label(best.a.UID, best.a.Nickname), best.expiry(now).Format(time.RFC3339), best.fallbackKind(now))
 	best.lastUsed = time.Now()
 	// 兜底同样是「选中」，必须与 pick() 正常路径、粘性命中路径（PickByUIDForModel）
 	// 一样推进 usedSeq/pickSeq：否则被兜底反复选中的账号 usedSeq 恒为 0，在 pick 的
@@ -335,7 +347,7 @@ func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, re
 	// 防集中/防惊群失效（entry.usedSeq 契约：每次被选中时取 p.pickSeq 自增值）。
 	p.pickSeq++
 	best.usedSeq = p.pickSeq
-	return best.a
+	return best.a, eventLog
 }
 
 // inFlightFull 报告账号是否已占满在途名额（上限按 realm 分档，见 inFlightLimit；

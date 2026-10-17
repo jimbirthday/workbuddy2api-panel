@@ -113,6 +113,10 @@ func main() {
 			trunc(r.uid, 36), trunc(r.nick, 11), r.status, remain, r.detail)
 	}
 	fmt.Printf("\ntotal=%d ok=%d already=%d fail=%d\n", len(rows), okN, alreadyN, failN)
+	// 存在失败账号时以非零退出码结束（供 cron/巡检判定失败，此前恒 0）。
+	if failN > 0 {
+		os.Exit(1)
+	}
 }
 
 // 已签判定：code 非 0 且含 "已签到"/"already"/"checkin" 等字样

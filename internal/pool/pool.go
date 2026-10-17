@@ -16,6 +16,13 @@ type Pool struct {
 	byUID   map[string]*entry
 	stateFp string
 	dirty   atomic.Bool // 内存有变更待落盘
+	// saveMu 串行化本地 state.json 落盘（tmp 写入 + rename + fsync 全在锁外做）。
+	// 不得与 p.mu 形成固定嵌套顺序获取：saveMu 只包住写盘本身，绝不跨 p.mu 持有。
+	saveMu sync.Mutex
+	// persistSeq 快照采集序号（持 p.mu 自增）；persistWritten 已落盘的最高序号
+	// （持 saveMu 读写）。用于丢弃「更晚采集、更早落盘」的乱序覆盖。
+	persistSeq     uint64
+	persistWritten uint64
 	// store 池状态快照镜像（redisstore.Store）；nil = 无需镜像（未配置 Redis / Noop 之外也可能 nil）。
 	// SaveState/LoadState 经它接线，与本地 state.json 并存作启动恢复备份。
 	store StoreSnapshotter
@@ -68,7 +75,7 @@ type Pool struct {
 	// randInt64N 仅供测试注入确定性随机源；nil 时用 math/rand/v2 全局源。
 	// 生产代码不应设置此字段。
 	randInt64N func(n int64) int64
-	// persistFails 本地 state.json 连续落盘失败计数（仅 saveLocked 在持锁下读写，无需 atomic）。
+	// persistFails 本地 state.json 连续落盘失败计数（仅持 p.mu 读写，无需 atomic）。
 	// 用于落盘失败的日志节流：首败/每 N 次提醒/恢复各打一条，避免磁盘满时刷屏。
 	persistFails int
 	// pickSeq 单调递增的选号序号：每次 pick 选中账号时自增并记到 entry.usedSeq，
@@ -343,7 +350,6 @@ func (p *Pool) Add(a *auth.Auth) {
 // 剔除结果持久化回 state.json，避免已删账号在下次启动时被 load() 复活。
 func (p *Pool) SyncToDir(auths []*auth.Auth) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	seen := make(map[string]bool, len(auths))
 	for _, a := range auths {
 		seen[a.UID] = true
@@ -356,8 +362,16 @@ func (p *Pool) SyncToDir(auths []*auth.Auth) {
 			changed = true
 		}
 	}
+	var sf stateFile
+	var seq uint64
 	if changed {
-		p.saveLocked()
+		p.dirty.Store(true)
+		sf, seq = p.snapshotLocked()
+	}
+	p.mu.Unlock()
+	if changed {
+		// 落盘在锁外做（MarshalIndent + fsync 耗时可观，不得持全池写锁）。
+		p.saveSnapshot(sf, seq)
 	}
 }
 
@@ -366,14 +380,17 @@ func (p *Pool) SyncToDir(auths []*auth.Auth) {
 // 在途请求的 Release 对已删条目是 no-op，无需等待。
 func (p *Pool) Remove(uid string) *auth.Auth {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	e, ok := p.byUID[uid]
 	if !ok {
+		p.mu.Unlock()
 		return nil
 	}
 	delete(p.byUID, uid)
 	p.dirty.Store(true)
-	p.saveLocked()
+	sf, seq := p.snapshotLocked()
+	p.mu.Unlock()
+	// 删除必须立即落盘（否则已删账号会在下次启动被 load() 复活）；写盘在锁外做。
+	p.saveSnapshot(sf, seq)
 	return e.a
 }
 

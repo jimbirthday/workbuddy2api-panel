@@ -19,6 +19,8 @@ config.json
 # Build artifacts
 *.tmp
 __pycache__/
+outputs/
+*.tar.gz
 
 # Backups (contains auth tokens)
 backups/

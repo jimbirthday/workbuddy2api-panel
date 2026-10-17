@@ -62,6 +62,29 @@ func TestIndexHTMLNoInlineScript(t *testing.T) {
 	}
 }
 
+// TestIndexHTMLNoInlineEventHandlers index.html 不得含内联事件处理器属性
+// （onsubmit / onclick / onchange / onload …）：
+//
+// 面板 CSP 是 script-src 'self' 且无 'unsafe-inline'（见 index.go），浏览器会
+// 直接拒绝编译内联处理器——属性形同不存在，且是静默失败（无 toast、无回退）。
+// 已发生的真实故障：密钥输入框的 onsubmit="return false" 未生效，单输入框表单
+// 按 Enter 触发隐式提交、整页刷新，刚输入的密钥与页面状态全丢。
+// 这里用与 CSP 同口径的属性形态判定：只认「空白 + on<name> + = + 引号」，
+// 先剥掉 HTML 注释（注释里说明该模式时不该误报），CSS/JS 文本中的字样不误伤。
+func TestIndexHTMLNoInlineEventHandlers(t *testing.T) {
+	p := newTestPanel()
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, httptest.NewRequest("GET", "/panel/", nil))
+	body := rec.Body.String()
+
+	// 去掉 HTML 注释后扫描：注释里出现 "on...=" 只是文档说明，不构成可被 CSP 拦截的属性。
+	noComment := regexp.MustCompile(`(?s)<!--.*?-->`).ReplaceAllString(body, "")
+	re := regexp.MustCompile(`(?i)\son[a-z]+\s*=\s*["']`)
+	if m := re.FindString(noComment); m != "" {
+		t.Fatalf("index.html contains inline event handler attribute (blocked by CSP): %q", m)
+	}
+}
+
 // TestAppJSTopLevelSmoke app.js 顶层求值冒烟（v1.11.3/1.11.4 两连炸后补的运行时闸门）：
 // node + DOM 桩执行 app.js（含按 hash 落到各视图的 go() 顶层调用），抓 TDZ/
 // ReferenceError 类运行时错误——Go 侧 frontend_test 不执行 JS，语法层检查对此全盲。
@@ -137,7 +160,7 @@ func TestAppJSCreditDimensionFormatting(t *testing.T) {
 const vm = require('vm');
 const src = fs.readFileSync(process.argv[2], 'utf8');
 	const start = src.indexOf('function trimFixed');
-const end = src.indexOf('function usStat');
+const end = src.indexOf('function usKpi');
 if (start < 0 || end < 0) throw new Error('credit helpers not found');
 const ctx = { Number, String, RegExp };
 vm.createContext(ctx);
@@ -230,7 +253,7 @@ const src = fs.readFileSync(process.argv[2], 'utf8');
 const escStart = src.indexOf('function esc(');
 const escEnd = src.indexOf('function ago(');
 const fmtStart = src.indexOf('function fmtTok(');
-const fmtEnd = src.indexOf('function usStat(');
+const fmtEnd = src.indexOf('function usKpi(');
 const reqStart = src.indexOf('function requestLogText');
 const reqEnd = src.indexOf('function fmtBytes');
 if ([escStart, escEnd, fmtStart, fmtEnd, reqStart, reqEnd].some(v => v < 0)) throw new Error('request log helpers not found');
@@ -262,9 +285,9 @@ process.stdout.write(JSON.stringify({
 	if err != nil {
 		t.Fatalf("request log formatting node test failed: %v\n%s", err, out)
 	}
-	text := "14:05:06 | 200 成功 | glm-5.3 | 账号(uid8) | 203.0.113.7 | python-requests/2.31.0 | 1.25s | 2.3k tok | 0.12 credit | req-1"
-	noSource := "14:05:06 | 200 成功 | glm-5.3 | 账号(uid8) | — | — | 1.25s | 2.3k tok | 0.12 credit | req-3"
-	cached := "14:05:06 | 200 成功 | glm-5.3 | 账号(uid8) | 203.0.113.7 | python-requests/2.31.0 | 1.25s | 2.3k tok | 0.12 credit | 命中 98.1% | req-2"
+	text := "09-28 14:05:06 | 200 成功 | glm-5.3 | 账号(uid8) | 203.0.113.7 | python-requests/2.31.0 | 1.25s | 2.3k tok | 0.12 credit | req-1"
+	noSource := "09-28 14:05:06 | 200 成功 | glm-5.3 | 账号(uid8) | — | — | 1.25s | 2.3k tok | 0.12 credit | req-3"
+	cached := "09-28 14:05:06 | 200 成功 | glm-5.3 | 账号(uid8) | 203.0.113.7 | python-requests/2.31.0 | 1.25s | 2.3k tok | 0.12 credit | 命中 98.1% | req-2"
 	want := `{"good":` + strconv.Quote(text) + `,"noSource":` + strconv.Quote(noSource) + `,"cached":` + strconv.Quote(cached) + `}`
 	if strings.TrimSpace(string(out)) != want {
 		t.Fatalf("request log formatting=%s want %s", out, want)
@@ -410,11 +433,11 @@ func TestAppJSUsageChartBarClass(t *testing.T) {
 const vm = require('vm');
 const src = fs.readFileSync(process.argv[2], 'utf8');
 const start = src.indexOf('function parsePointTime');
-const end = src.indexOf('function fmtTokTip');
+const end = src.indexOf('let usageRateWarmAt');
 const escStart = src.indexOf('function esc(');
 const escEnd = src.indexOf('function ago(');
 const fmtStart = src.indexOf('function fmtTok(');
-const fmtEnd = src.indexOf('function usStat(');
+const fmtEnd = src.indexOf('function usKpi(');
 if ([start, end, escStart, escEnd, fmtStart, fmtEnd].some(v => v < 0)) throw new Error('usage chart helpers not found');
 const host = { innerHTML: '', textContent: '' };
 const ctx = {
@@ -859,6 +882,11 @@ const src = fs.readFileSync(process.argv[2], 'utf8');
 const start = src.indexOf('function renderExpirySnapshot');
 const end = src.indexOf('async function loadExpiry');
 if (start < 0 || end < 0 || end < start) throw new Error('expiry snapshot region not found');
+// renderExpirySnapshot 依赖 parseAPITime（零值时间过滤），它在切片区间之外，
+// 单独切真实实现进来。
+const ptStart = src.indexOf('function parseAPITime');
+const ptEnd = src.indexOf('function fmtLocalDateTime');
+if (ptStart < 0 || ptEnd < 0 || ptEnd < ptStart) throw new Error('parseAPITime not found');
 const sinks = {};
 const mk = id => (sinks[id] = { innerHTML: '', textContent: '', hidden: true });
 const ctx = {
@@ -868,7 +896,8 @@ const ctx = {
   Date, Math, Number, String, Map, Array, Object, isNaN,
 };
 vm.createContext(ctx);
-vm.runInContext(src.slice(start, end) + '\nthis.renderExpirySnapshot = renderExpirySnapshot;', ctx);
+vm.runInContext(src.slice(ptStart, ptEnd) + src.slice(start, end) +
+  '\nthis.renderExpirySnapshot = renderExpirySnapshot;', ctx);
 const day = n => {
   const d = new Date(); d.setHours(0, 0, 0, 0); d.setDate(d.getDate() + n);
   return d.toISOString();
@@ -910,6 +939,94 @@ process.stdout.write(JSON.stringify({
 	const want = `{"visible":true,"rows":3,"order":true,"got":"[\"秋\",\"秋千易\",\"长期包\"]","want":"[\"秋\",\"秋千易\",\"长期包\"]"}`
 	if strings.TrimSpace(string(out)) != want {
 		t.Fatalf("expiry snapshot=%s\nwant %s（visible 必须为 true，否则卡片仍隐藏）",
+			strings.TrimSpace(string(out)), want)
+	}
+}
+
+// TestAppJSExpirySnapshotZeroTimeSort 到期快照必须扛住 Go 的 time.Time **零值**序列化。
+//
+// 背景（P1，功能被反转）：pool 的 CreditsEarliestExpiry 是 time.Time，json tag 上的
+// `omitempty` 对 time.Time **无效**——没有到期批次的账号（长期包 / 未刷新）序列化出来
+// 是 "0001-01-01T00:00:00Z"，而不是缺字段。裸 `new Date("0001-01-01T00:00:00Z")`
+// 解析成 -62135596800000（**不是** NaN），于是：
+//   - 判空 `if (!isNaN(t.getTime()))` 通过 → key 被设成极小值；
+//   - 排序把「无到期批次」的账号排到最前，真正快过期的红条被挤到最下。
+//
+// 上一个用例（TestAppJSExpirySnapshotRenders）用 `null` 造长期包，恰好绕过了这条路径，
+// 所以没抓到 bug——本用例**必须用真实零值形态**造数据，否则等于没测。
+//
+// 断言的是渲染顺序（对用户可见的结果），而不是内部的 key：修复后 parseAPITime 对
+// "0001-" 前缀返回 0，只有 ms > 0 才参与排序，无到期者稳定排在最后。
+func TestAppJSExpirySnapshotZeroTimeSort(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; expiry zero-time test skipped")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('function renderExpirySnapshot');
+const end = src.indexOf('async function loadExpiry');
+if (start < 0 || end < 0 || end < start) throw new Error('expiry snapshot region not found');
+// parseAPITime 不在 renderExpirySnapshot 的切片范围内，单独切**真实实现**进来——
+// 换成桩函数这个用例就没有意义了（被测的正是它对 "0001-" 零值时间的处理）。
+const ptStart = src.indexOf('function parseAPITime');
+const ptEnd = src.indexOf('function fmtLocalDateTime');
+if (ptStart < 0 || ptEnd < 0 || ptEnd < ptStart) throw new Error('parseAPITime not found');
+const sinks = {};
+const mk = id => (sinks[id] = { innerHTML: '', textContent: '', hidden: true });
+const ctx = {
+  esc: s => String(s == null ? '' : s),
+  fmtTok: v => String(v == null ? 0 : v),
+  $: id => (sinks[id] || mk(id)),
+  Date, Math, Number, String, Map, Array, Object, isNaN,
+};
+vm.createContext(ctx);
+vm.runInContext(src.slice(ptStart, ptEnd) + src.slice(start, end) +
+  '\nthis.renderExpirySnapshot = renderExpirySnapshot;', ctx);
+const day = n => {
+  const d = new Date(); d.setHours(0, 0, 0, 0); d.setDate(d.getDate() + n);
+  return d.toISOString();
+};
+// overview 形态：没有 packages 数组，只有到期快照字段。
+// 「长期包」用 Go 零值时间形态（不是 null），这才是线上真实数据。
+const d = { accounts: [
+  { uid: 'aaaaaaaa-1', nickname: '秋',     credits: 4099,
+    credits_earliest_expiry: day(2),  credits_earliest_remaining: 499 },
+  { uid: 'bbbbbbbb-2', nickname: '秋千易', credits: 3243,
+    credits_earliest_expiry: day(30), credits_earliest_remaining: 43 },
+  { uid: 'cccccccc-3', nickname: '长期包', credits: 900,
+    credits_earliest_expiry: '0001-01-01T00:00:00Z', credits_earliest_remaining: 0 },
+] };
+ctx.renderExpirySnapshot(d);
+const html = sinks['expList'] ? sinks['expList'].innerHTML : '';
+const names = [...html.matchAll(/<span class="exp-nm">([^<]*)<\/span>/g)].map(m => m[1]);
+// 2 天到期排最前（红），30 天其次；零值时间的「长期包」必须排**最后**。
+const wantNames = JSON.stringify(['秋', '秋千易', '长期包']);
+const gotNames = JSON.stringify(names);
+// 零值时间不得被渲染成到期日；该账号那一行必须是「无近期到期批次」。
+const longRow = /<span class="exp-nm">长期包<\/span><span class="exp-main">([^<]*)/.exec(html);
+process.stdout.write(JSON.stringify({
+  order: gotNames === wantNames,
+  got: gotNames,
+  want: wantNames,
+  longRow: longRow ? longRow[1] : 'MISSING',
+}));`
+	f, err := os.CreateTemp(t.TempDir(), "expsnap-zero-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("expiry zero-time node test failed: %v\n%s", err, out)
+	}
+	const want = `{"order":true,"got":"[\"秋\",\"秋千易\",\"长期包\"]","want":"[\"秋\",\"秋千易\",\"长期包\"]","longRow":"无近期到期批次"}`
+	if strings.TrimSpace(string(out)) != want {
+		t.Fatalf("expiry zero-time=%s\nwant %s（零值时间必须排最后且按无到期渲染，不能排最前）",
 			strings.TrimSpace(string(out)), want)
 	}
 }
@@ -959,7 +1076,12 @@ const src = fs.readFileSync(process.argv[2], 'utf8');
 const start = src.indexOf('function parsePointTime');
 const chartStart = src.indexOf('function renderUsageChart');
 if (start < 0 || chartStart < 0) throw new Error('chart functions not found');
-let end = src.indexOf('\nfunction ', chartStart + 10);
+// 切片终点：原来用「renderUsageChart 之后的第一个顶层 function」当锚点（当时紧邻的
+// 是 fmtTokTip，已作为死代码删除）。fmtTokTip 一没，锚点就滑到很后面的 pkColor，
+// 中间那些顶层语句（如 if ($('usRange')) trangeBind(...)）会被一起切进来并在沙箱里
+// 求值报 ReferenceError。改成紧随 renderUsageChart 之后、不依赖函数声明的稳定锚点。
+let end = src.indexOf('let usageRateWarmAt', chartStart);
+if (end < 0) end = src.indexOf('\nfunction ', chartStart + 10);
 if (end < 0) end = src.length;
 const sinks = {};
 const mk = id => (sinks[id] = { innerHTML: '', textContent: '' });
@@ -1004,5 +1126,70 @@ process.stdout.write(JSON.stringify({
 	if strings.TrimSpace(string(out)) != want {
 		t.Fatalf("chart tooltip structure=%s\nwant %s（groups 应等于数据点数，loose 应为 0）",
 			strings.TrimSpace(string(out)), want)
+	}
+}
+
+// TestAppJSRenderAccountsNoReferenceError 账号表渲染不得抛 ReferenceError。
+//
+// 背景：actButtons 从 renderAccounts 内联抽成独立函数时漏把局部 frozen 传进去，
+// 只要池里有 ≥1 个账号，renderAccounts 每次抛 ReferenceError；loadOverview 静默
+// 吞异常 → 账号表永久空白且无提示（P0）。现有 TestAppJSTopLevelSmoke 抓不到：它
+// 的 DOM 桩用 has() 恒真的 Proxy，ReferenceError 被掩盖，且 fetch 挂起从不渲染。
+// 本测试用**普通对象**沙盒（未定义标识符照常抛错）+ inert DOM，直接调 renderAccounts
+// 覆盖普通/企业不限量/冷却 三种分支。
+func TestAppJSRenderAccountsNoReferenceError(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; renderAccounts test skipped")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const inert = new Proxy(function () {}, {
+  get(t, k) { if (k === Symbol.toPrimitive) return () => ''; return inert; },
+  set() { return true; }, apply() { return inert; }, construct() { return inert; },
+});
+const sandbox = {
+  location: { hash: '#accounts' },
+  history: { replaceState() {} },
+  localStorage: { getItem: () => null, setItem() {} },
+  navigator: { clipboard: { writeText: () => Promise.resolve() } },
+  document: { querySelectorAll: () => [], querySelector: () => inert, getElementById: () => inert, addEventListener() {}, documentElement: inert, head: inert, body: inert, createElement: () => inert, cookie: '' },
+  fetch: () => new Promise(() => {}),
+  addEventListener() {}, removeEventListener() {},
+  matchMedia: () => ({ matches: false, addEventListener() {} }),
+  setInterval: () => 0, clearInterval() {}, setTimeout: () => 0, clearTimeout() {},
+  console, JSON, Math, Date, Number, String, Boolean, Object, Array, Promise, Map, Set, RegExp, Error, TypeError, isNaN, parseInt, parseFloat, encodeURIComponent, decodeURIComponent, URL, Symbol, Proxy, Reflect,
+};
+sandbox.window = sandbox; sandbox.globalThis = sandbox;
+vm.createContext(sandbox);
+vm.runInContext(src, sandbox, { filename: 'app.js' });
+const accts = [
+  { uid: 'u1', nickname: '普通', credits: 500, credits_total: 1000, disabled: false, paused: false, cool_remaining_sec: 0, checkin_done: false },
+  { uid: 'u2', nickname: '企业', credits: 1099511627776, credits_total: -1, enterprise: true, disabled: false, paused: false, cool_remaining_sec: 0 },
+  { uid: 'u3', nickname: '冷却', credits: 10, credits_total: 100, disabled: false, paused: false, cool_remaining_sec: 300, cool_kind: 'soft_rate', reason: '429 rate limit' },
+  { uid: 'u4', nickname: '禁用', disabled: true, paused: false, cool_remaining_sec: 0 },
+];
+try {
+  sandbox.renderAccounts(accts);
+  process.stdout.write('RENDER OK');
+} catch (e) {
+  process.stdout.write('RENDER FAIL: ' + (e && e.stack ? e.stack : e).toString().split('\n').slice(0, 4).join(' | '));
+  process.exit(1);
+}`
+	f, err := os.CreateTemp(t.TempDir(), "render-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("renderAccounts 抛错（账号表将永久空白）：%v\n%s", err, out)
+	}
+	if !strings.Contains(string(out), "RENDER OK") {
+		t.Fatalf("renderAccounts 未成功：%s", out)
 	}
 }

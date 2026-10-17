@@ -58,7 +58,7 @@ func BenchmarkStateSerializeCompact46(b *testing.B) {
 	}
 }
 
-// BenchmarkSnapshotMarshal46 P2/P4 相关：saveLocked 落盘时额外镜像一次 snapshot（含 savedAt）的序列化成本。
+// BenchmarkSnapshotMarshal46 P2/P4 相关：落盘时额外镜像一次 snapshot（含 savedAt）的序列化成本。
 func BenchmarkSnapshotMarshal46(b *testing.B) {
 	p := benchPool(b)
 	p.mu.Lock()

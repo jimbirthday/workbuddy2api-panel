@@ -99,11 +99,11 @@ func FrameHintFunc(ctxFn func() HintContext) func(string) string {
 	}
 }
 
-// FrameKind 从 SSE error 帧 payload 判定 ErrKind：6004 模型级限流的流式形态
-// （IsModelRateLimit 对帧 JSON 直接命中）优先；其余取帧内 error.message 走
+// FrameKind 从 SSE error 帧 payload 判定 ErrKind：6004 模型级限流、6020/6021 模型队列忙
+// 的流式形态（对帧 JSON 直接命中）优先；其余取帧内 error.message 走
 // Classify（请求级 400 口径）。判不出 → ErrNone（无 hint）。
 func FrameKind(payload string) ErrKind {
-	if IsModelRateLimit(payload) {
+	if IsModelRateLimit(payload) || IsModelQueueFull(payload) {
 		return ErrSoftRate
 	}
 	var f struct {

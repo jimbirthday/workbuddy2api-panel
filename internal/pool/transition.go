@@ -14,7 +14,7 @@
 //	                     （reviveCoolingLocked 不清——余额恢复不构成限流解除证据）
 //	breakerUntil       ← recordBreakerFailureLocked（Cooldown/NoteError 喂入）；NoteSuccess 清
 //	softStreak         ← Cooldown(CoolSoft)/CooldownSoftForModel；NoteSuccess 清（revive 保留：与余额无关）
-//	sessionDeadFails   ← NoteSessionDead；ClearSessionDead/NoteSuccess/ReviveDisabled 清
+//	sessionDeadFails   ← NoteSessionDead；ClearSessionDead/NoteSuccess/Revive 清
 //
 // 关键正交性（疑点 4 修正）：
 //   - 冷却域（until/coolKind/softStreak/modelCooldowns）与熔断器（fails/retryCount/

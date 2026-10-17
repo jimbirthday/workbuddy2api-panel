@@ -1,5 +1,7 @@
 auths/
 data/
+backups/
+outputs/
 *.tmp
 .git/
 .gitignore

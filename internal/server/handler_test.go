@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -551,7 +552,7 @@ func TestChatStickyFullFallsBackToRotation(t *testing.T) {
 		&auth.Auth{UID: "bad", AccessToken: "at-bad", ExpiresAt: 9999999999},
 		&auth.Auth{UID: "good", AccessToken: "at-good", ExpiresAt: 9999999999},
 	)
-	// bad 占满唯一在途名额：PickByUID 将返回 nil（healthy 但 inFlight 满）→ 解绑 + 回落轮换。
+	// bad 占满唯一在途名额：PickByUIDForModel 将返回 nil（healthy 但 inFlight 满）→ 解绑 + 回落轮换。
 	p.SetMaxInFlight(1)
 	p.Acquire("bad")
 
@@ -786,8 +787,140 @@ func TestChat6004ModelResetCoolsToParsedTime(t *testing.T) {
 	}
 }
 
-// TestChat6004WithoutResetFallsBackToBackoff 6004 无时间文案 → 退回 600s 基数软冷却
-// （现状不变）。
+// TestChat6021QueueFullDoesNotFreezeAccount 429 + code 6021 只锁触发模型。
+// 同模型换到其他号；该号改用别的模型仍然可选，账号级冷却不置位。
+func TestChat6021QueueFullDoesNotFreezeAccount(t *testing.T) {
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		if authz == "Bearer at-bad" {
+			return 429, `{"code":6021,"msg":"queue.full.title","requestId":"600815c599a88d976ad23d47a953b22c"}`, false
+		}
+		return 200, sseOK, true
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "bad", AccessToken: "at-bad", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "good", AccessToken: "at-good", ExpiresAt: 9999999999},
+	)
+	p.SetCredits("bad", 2000, 0)
+	p.SetCredits("good", 1000, 0)
+	h := NewHandler(Config{Pool: p, Upstream: up, SoftCooldown: time.Minute})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"deepseek-v4.1-flash","messages":[]}`)))
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s (want 200 after rotate to good)", rec.Code, rec.Body)
+	}
+	st, _ := p.Status("bad")
+	if st.Cooling {
+		t.Fatalf("6021 must not set account-level cooling: %+v", st)
+	}
+	if st.SoftStreak != 0 {
+		t.Fatalf("6021 must not advance soft_streak: %+v", st)
+	}
+	if len(st.RateLimitedModels) != 1 || st.RateLimitedModels[0].Model != "deepseek-v4.1-flash" {
+		t.Fatalf("want model row deepseek-v4.1-flash: %+v", st.RateLimitedModels)
+	}
+	if st.RateLimitedModels[0].Until.IsZero() {
+		t.Fatal("model cooldown until is zero")
+	}
+	if rem := time.Until(st.RateLimitedModels[0].Until); rem <= 0 || rem > time.Minute+time.Second {
+		t.Errorf("model cooldown remaining=%v want ~1m", rem)
+	}
+	p.SetRandomSource(func(n int64) int64 { return 0 })
+	same := p.PickExcludingForModel(nil, "deepseek-v4.1-flash")
+	if same == nil || same.UID != "good" {
+		t.Fatalf("same-model pick should skip bad, got %+v", same)
+	}
+	diff := p.PickExcludingForModel(nil, "glm-5.3")
+	if diff == nil || diff.UID != "bad" {
+		t.Fatalf("different-model pick should still select bad, got %+v", diff)
+	}
+}
+
+// TestChat6020QueueWaitingDoesNotFreezeAccount 429 + code 6020 只锁触发模型。
+// 冷却时长取 body 的 retry_after（40s），不用 estimated_wait，也不写账号级 until。
+func TestChat6020QueueWaitingDoesNotFreezeAccount(t *testing.T) {
+	const body6020 = `{"code":6020,"msg":"queue.waiting.title","requestId":"e90f5c990715c3811c037a1a5cd42fb2","data":{"queue_position":4714,"queue_size":"999+","retry_after":40,"estimated_wait":23570,"client_user_type":"free"}}`
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		if authz == "Bearer at-bad" {
+			return 429, body6020, false
+		}
+		return 200, sseOK, true
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "bad", AccessToken: "at-bad", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "good", AccessToken: "at-good", ExpiresAt: 9999999999},
+	)
+	p.SetCredits("bad", 2000, 0)
+	p.SetCredits("good", 1000, 0)
+	h := NewHandler(Config{Pool: p, Upstream: up, SoftCooldown: 10 * time.Minute})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.3","messages":[]}`)))
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s (want 200 after rotate to good)", rec.Code, rec.Body)
+	}
+	st, _ := p.Status("bad")
+	if st.Cooling || st.SoftStreak != 0 {
+		t.Fatalf("6020 must not freeze the account: %+v", st)
+	}
+	if len(st.RateLimitedModels) != 1 || st.RateLimitedModels[0].Model != "glm-5.3" {
+		t.Fatalf("want model row glm-5.3: %+v", st.RateLimitedModels)
+	}
+	if st.RateLimitedModels[0].Reason != "6020 queue waiting" {
+		t.Fatalf("reason=%q", st.RateLimitedModels[0].Reason)
+	}
+	rem := time.Until(st.RateLimitedModels[0].Until)
+	if rem < 30*time.Second || rem > 40*time.Second+time.Second {
+		t.Errorf("model cooldown remaining=%v want ~40s (retry_after, not estimated_wait or soft_rate)", rem)
+	}
+	p.SetRandomSource(func(n int64) int64 { return 0 })
+	same := p.PickExcludingForModel(nil, "glm-5.3")
+	if same == nil || same.UID != "good" {
+		t.Fatalf("same-model pick should skip bad, got %+v", same)
+	}
+	diff := p.PickExcludingForModel(nil, "deepseek-v4.1-flash")
+	if diff == nil || diff.UID != "bad" {
+		t.Fatalf("different-model pick should still select bad, got %+v", diff)
+	}
+}
+
+// TestChat6021OnlyAccountReturnsModelUnavailable 池里只剩这个号时，6021 回模型不可用，
+// 而不是把号冻进账号级软冷却。
+func TestChat6021OnlyAccountReturnsModelUnavailable(t *testing.T) {
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 429, `{"code":6021,"msg":"queue.full.title"}`, false
+	})
+	p := testPoolWith(&auth.Auth{UID: "only", AccessToken: "at-only", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up, SoftCooldown: time.Minute})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"deepseek-v4.1-flash","messages":[]}`)))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	var env struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+		t.Fatal(err)
+	}
+	if env.Error.Code != "model_unavailable" {
+		t.Fatalf("error.code=%q want model_unavailable", env.Error.Code)
+	}
+	st, _ := p.Status("only")
+	if st.Cooling {
+		t.Fatalf("single-account 6021 froze the account: %+v", st)
+	}
+	other := p.PickExcludingForModel(nil, "glm-5.3")
+	if other == nil || other.UID != "only" {
+		t.Fatalf("other model should still pick the account, got %+v", other)
+	}
+}
+
+// TestChat6004WithoutResetFallsBackToBackoff 6004 无时间文案 → **模型级**有界退避：
+// 只锁该模型（有界），账号级 until 不冻结、其他模型仍可选——单模型限流绝不冻整号。
 func TestChat6004WithoutResetFallsBackToBackoff(t *testing.T) {
 	var calls int
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
@@ -811,15 +944,16 @@ func TestChat6004WithoutResetFallsBackToBackoff(t *testing.T) {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
 	}
 	st, _ := p.Status("bad")
-	if !st.Cooling || st.CoolKind != "soft_rate" {
-		t.Fatalf("bad should be soft cooling: %+v", st)
-	}
-	// 冷却时长 = 注入 soft 基数(60s)，非解析时间（无重置文案）。
-	if st.CoolRemaining <= 0 || st.CoolRemaining > 60 {
-		t.Errorf("cool_remaining_sec=%d want ~60 (soft base, not parsed)", st.CoolRemaining)
+	// 关键：6004 无重置时间也必须只锁模型，不得冻结账号级 until（否则其他模型也一起不可选）。
+	if st.Cooling {
+		t.Fatalf("6004 (no reset) must NOT freeze the whole account: %+v", st)
 	}
 	if len(st.RateLimitedModels) != 1 || st.RateLimitedModels[0].Model != "glm-5.3" || st.RateLimitedModels[0].Kind != "rate_limit" {
-		t.Fatalf("rate-limited models=%+v, want audit row for glm-5.3", st.RateLimitedModels)
+		t.Fatalf("rate-limited models=%+v, want one model-level row for glm-5.3", st.RateLimitedModels)
+	}
+	// 模型级退避时长 = 注入 soft 基数(60s)（非解析时间），落在模型条目的 until 上。
+	if rem := time.Until(st.RateLimitedModels[0].Until); rem <= 0 || rem > time.Minute+time.Second {
+		t.Errorf("model until remaining=%v want ~60s (soft base, not parsed)", rem)
 	}
 }
 
@@ -1910,5 +2044,210 @@ func TestChatMarkupRepairStrictModeRejectsUndeclaredTool(t *testing.T) {
 	msg := resp["choices"].([]any)[0].(map[string]any)["message"].(map[string]any)
 	if _, ok := msg["tool_calls"]; ok {
 		t.Fatalf("未声明的工具名不得转换: %#v", msg["tool_calls"])
+	}
+}
+
+// TestChatNonStreamModelRateLimitLocksModelOnly 非流式路径撞上游 6004 模型级限流帧：
+// 必须返回 429/503 类错误（绝不能是 200 空内容假成功），且账号只被**模型级**冷却
+// （modelCooldowns 命中该模型），账号级 until 不得被冻结——其他模型仍可选。
+func TestChatNonStreamModelRateLimitLocksModelOnly(t *testing.T) {
+	const errFrame = "data: {\"error\":{\"code\":6004,\"message\":\"model usage limit exceeded, will reset at 2026-09-11 18:33:27 UTC+8\"}}\n\ndata: [DONE]\n\n"
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 200, errFrame, true
+	})
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code == 200 {
+		t.Fatalf("model rate-limit frame must not be a 200 fake success: body=%s", rec.Body)
+	}
+	st, ok := p.Status("u1")
+	if !ok {
+		t.Fatal("account status missing")
+	}
+	if st.Cooling {
+		t.Errorf("model-level 6004 must not freeze the whole account (until=%v)", st.Until)
+	}
+	// 该模型在账号 UI 上应可见为限流模型（模型级冷却已记入）。
+	found := false
+	for _, m := range st.RateLimitedModels {
+		if m.Model == "glm-5.2" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("glm-5.2 should be recorded as model-rate-limited: %+v", st.RateLimitedModels)
+	}
+}
+
+// TestChat6004WithoutModelNameNoBogusAudit 无模型名的 6004（model==""）：
+// RecordModelRateLimitAudit 首行就 `model == "" { return }`，此前的调用恒为空操作、
+// 审计台账永远写不进。删掉该调用后：仍走账号级有界退避（未知请求不得立刻再打这号），
+// 且不得凭空多出一行「限流中」的模型台账（没有模型名就无从展示）。
+func TestChat6004WithoutModelNameNoBogusAudit(t *testing.T) {
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 429, `{"code":6004,"msg":"model usage limit exceeded"}`, false
+	})
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up, SoftCooldown: time.Minute})
+	// 请求不带 model 字段 → bareModel=="" → applyErrorPolicy 的 model 参数为空串。
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"messages":[{"role":"user","content":"hi"}]}`)))
+
+	st, ok := p.Status("u1")
+	if !ok {
+		t.Fatal("account status missing")
+	}
+	if !st.Cooling || st.Until.IsZero() {
+		t.Fatalf("无模型名的 6004 应退回账号级有界退避: %+v", st)
+	}
+	if len(st.RateLimitedModels) != 0 {
+		t.Fatalf("无模型名不得产生模型限额台账行: %+v", st.RateLimitedModels)
+	}
+}
+
+// TestChatClientGoneDoesNotPenalize 客户端断连（ctx 取消）落在传输层抖动分支时，
+// 不得喂连败计数——否则健康号 5 次后被临时踢出选号池。
+func TestChatClientGoneDoesNotPenalize(t *testing.T) {
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			return nil, errors.New("transport: client closed")
+		})},
+		ChatBaseCN:    "https://fake.example",
+		BillingBaseCN: "https://fake.example",
+	}
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // 模拟客户端已断连
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","messages":[]}`)).WithContext(ctx)
+	h.ServeHTTP(httptest.NewRecorder(), req)
+	st, _ := p.Status("u1")
+	if st.ConsecutiveFails != 0 {
+		t.Fatalf("client-gone must not accumulate failures: consecutive_fails=%d", st.ConsecutiveFails)
+	}
+}
+
+// TestChatStreamUpstreamReadErrorNotSuccess 流式读取上游失败（连接中断）时，
+// 账号不得被记成功（不清 11102、不绑粘性），避免坏号长期驻留被粘性钉死。
+func TestChatStreamUpstreamReadErrorNotSuccess(t *testing.T) {
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			// 首帧之后连接中断（body 读时返回错误）。
+			return &http.Response{
+				StatusCode: 200,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body: io.NopCloser(&errReader{
+					data: []byte("data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n"),
+				}),
+			}, nil
+		})},
+		ChatBaseCN: "https://fake.example",
+	}
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	h.ServeHTTP(httptest.NewRecorder(), req)
+	st, _ := p.Status("u1")
+	if st.SuccessCount != 0 {
+		t.Fatalf("upstream read error must not be recorded as success: success_count=%d", st.SuccessCount)
+	}
+}
+
+// errReader 先返回一段数据，随后返回读错误（模拟上游半途断流）。
+type errReader struct {
+	data []byte
+	done bool
+}
+
+func (e *errReader) Read(p []byte) (int, error) {
+	if !e.done {
+		e.done = true
+		n := copy(p, e.data)
+		return n, nil
+	}
+	return 0, errors.New("unexpected EOF")
+}
+
+// TestChatStreamContentBlockedFrameDegrades 流式首帧为内容拦截 error 帧时，
+// 与非流式一致地触发降级重试（passthrough 模式）。
+func TestChatStreamContentBlockedFrameDegrades(t *testing.T) {
+	var bodies [][]byte
+	const blocked = "data: {\"error\":{\"message\":\"blocked by security policy\"}}\n\n"
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			raw, _ := io.ReadAll(r.Body)
+			bodies = append(bodies, raw)
+			body := blocked
+			if len(bodies) > 1 {
+				body = sseOK
+			}
+			return &http.Response{
+				StatusCode: 200,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader(body)),
+			}, nil
+		})},
+		ChatBaseCN: "https://fake.example",
+	}
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up, PromptMode: "passthrough"})
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[{"role":"system","content":"原始指纹"},{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if len(bodies) != 2 {
+		t.Fatalf("want 2 upstream calls (blocked frame + degraded retry), got %d", len(bodies))
+	}
+	if !strings.Contains(string(bodies[1]), prompt.Degraded) {
+		t.Errorf("second body should contain Degraded prompt: %s", bodies[1])
+	}
+	if !strings.Contains(rec.Body.String(), "你好") {
+		t.Errorf("client should receive retried content: %s", rec.Body)
+	}
+}
+
+// TestChatNonStreamContentBlockedDegradedRetry 非流式 passthrough 首遇内容拦截 error 帧：
+// 与流式 / status>=400 路径同一套降级重试（换 Degraded 提示词同请求内重试），而非直接
+// 把 error 帧当失败返回。此前非流式 error 帧分支只特判 ErrSoftRate，内容拦截会落到
+// no_healthy_account(503) 并透传原始错误帧。
+func TestChatNonStreamContentBlockedDegradedRetry(t *testing.T) {
+	const blockedFrame = "data: {\"error\":{\"message\":\"blocked by security policy\",\"type\":\"content_blocked\"}}\n\ndata: [DONE]\n\n"
+	var bodies [][]byte
+	up := &upstream.Client{HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		raw, _ := io.ReadAll(r.Body)
+		bodies = append(bodies, raw)
+		body := blockedFrame
+		if len(bodies) > 1 {
+			body = sseOK
+		}
+		return &http.Response{
+			StatusCode: 200,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       io.NopCloser(strings.NewReader(body)),
+		}, nil
+	})},
+		ChatBaseCN: "https://fake.example",
+	}
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up, PromptMode: "passthrough"})
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"system","content":"原始指纹"},{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if len(bodies) != 2 {
+		t.Fatalf("want 2 upstream calls (blocked frame + degraded retry), got %d", len(bodies))
+	}
+	if !strings.Contains(string(bodies[1]), prompt.Degraded) {
+		t.Errorf("second body should contain Degraded prompt: %s", bodies[1])
+	}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("degraded retry should succeed, code=%d body=%s", rec.Code, rec.Body)
 	}
 }

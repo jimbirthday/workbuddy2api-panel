@@ -792,8 +792,20 @@ func TestCooldownHardDoesNotAdvanceSoftStreak(t *testing.T) {
 	if st, _ := p.Status("u1"); st.SoftStreak != 0 {
 		t.Fatalf("hard cooldown must not touch soft_streak, got %d", st.SoftStreak)
 	}
+	// 硬冷却生效期间撞一次无重置时间的 429：不得把到次日 04:00 的硬冷却截断成 600s，
+	// 也不得把 coolKind 改写成 soft_rate（否则失去「不参与兜底」的保护）。
+	// setAccountCooldownLocked 的「冷却不缩短 + kind 同源」保证硬冷却胜出。
 	p.CooldownSoftRate("u1", 600*time.Second, time.Time{}, "x")
-	wantCoolSec(t, p, "u1", 600, 3)
+	st, _ := p.Status("u1")
+	if !st.Cooling || st.CoolKind != "hard_credit" {
+		t.Fatalf("hard cooldown must be preserved (not shortened to soft_rate): %+v", st)
+	}
+	if st.SoftStreak != 0 {
+		t.Errorf("被保留的硬冷却不该推进 soft_streak, got %d", st.SoftStreak)
+	}
+	if st.CoolRemaining < 600 {
+		t.Errorf("cool_remaining=%d 应仍为到次日 04:00 的硬冷却（远大于 600s）", st.CoolRemaining)
+	}
 }
 
 func TestSoftStreakPersistsAcrossReload(t *testing.T) {
@@ -1640,6 +1652,80 @@ func TestRestoreNoRedisUsesLocal(t *testing.T) {
 	st, ok := p.Status("u1")
 	if !ok || st.Credits != 55 {
 		t.Fatalf("no redis → use local: %+v ok=%v", st, ok)
+	}
+}
+
+// TestRestoreCorruptLocalNewerAdoptsSnapshot 本地 state.json **存在但 JSON 损坏**
+// （半截写入/掉电中断），即使 mtime 比 Redis 快照新，也必须按「本地不可用」处理并
+// 采用快照：否则损坏文件会顶掉更新鲜的快照，全池冷却/熔断/成本台账被清零。
+func TestRestoreCorruptLocalNewerAdoptsSnapshot(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "state.json")
+	if err := os.WriteFile(fp, []byte(`{"accounts":{"u1":{"credits":`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// 本地 mtime 明显**新于**快照 saved_at：旧口径会据此判定「本地较新」而丢弃快照。
+	future := time.Now().Add(time.Hour)
+	if err := os.Chtimes(fp, future, future); err != nil {
+		t.Fatal(err)
+	}
+	ms := &memStore{loadOK: true}
+	snap := snapshot{stateFile: stateFile{Accounts: map[string]stateAccount{"u1": {Credits: 999}}}, SavedAt: time.Now()}
+	ms.loadData, _ = json.Marshal(snap)
+	p := New(fp)
+	p.SetStore(ms)
+	p.RestoreFromSnapshot()
+
+	st, ok := p.Status("u1")
+	if !ok || st.Credits != 999 {
+		t.Fatalf("本地损坏（哪怕更新）必须采用快照: %+v ok=%v", st, ok)
+	}
+	// 快照被采用后置 dirty，让下一次落盘把它物化回本地 state.json（否则只在内存生效）。
+	if !p.dirty.Load() {
+		t.Fatal("采用快照后必须置 dirty（否则损坏的本地文件下次崩溃恢复又被读回）")
+	}
+}
+
+// TestRestoreCorruptLocalOlderAlsoAdoptsSnapshot 对照组：本地损坏且 mtime 更旧时同样
+// 采用快照（覆盖「mtime 判据被绕过」的两种方向，确认损坏文件在任何 mtime 下都不算可用）。
+func TestRestoreCorruptLocalOlderAlsoAdoptsSnapshot(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "state.json")
+	if err := os.WriteFile(fp, []byte(`not json at all`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(fp, old, old); err != nil {
+		t.Fatal(err)
+	}
+	ms := &memStore{loadOK: true}
+	snap := snapshot{stateFile: stateFile{Accounts: map[string]stateAccount{"u2": {Credits: 123}}}, SavedAt: time.Now()}
+	ms.loadData, _ = json.Marshal(snap)
+	p := New(fp)
+	p.SetStore(ms)
+	p.RestoreFromSnapshot()
+	st, ok := p.Status("u2")
+	if !ok || st.Credits != 123 {
+		t.Fatalf("本地损坏（更旧）也必须采用快照: %+v ok=%v", st, ok)
+	}
+}
+
+// TestRestoreCorruptLocalNoSnapshotKeepsSafe 本地损坏且无可用快照：不得 panic、不得
+// 装载脏数据；此时池保持空（损坏文件不是可用的运行态来源）。
+func TestRestoreCorruptLocalNoSnapshotKeepsSafe(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "state.json")
+	if err := os.WriteFile(fp, []byte(`{"accounts":`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p := New(fp)
+	p.SetStore(&memStore{loadOK: false})
+	p.RestoreFromSnapshot()
+	if _, ok := p.Status("u1"); ok {
+		t.Fatal("损坏的本地文件不得被装载")
+	}
+	if len(p.List()) != 0 {
+		t.Fatalf("池应为空，得到 %+v", p.List())
 	}
 }
 

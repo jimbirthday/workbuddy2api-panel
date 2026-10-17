@@ -83,8 +83,8 @@ func TestNoteSuccessClearsSessionDeadCount(t *testing.T) {
 	}
 }
 
-// TestReviveDisabled 复活入口：清 disabled + reason + 误判计数，账号回到池子。
-func TestReviveDisabled(t *testing.T) {
+// TestRevive 复活入口：清 disabled + reason + 误判计数，账号回到池子。
+func TestRevive(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
 	p.NoteSessionDead("u1")
@@ -93,7 +93,9 @@ func TestReviveDisabled(t *testing.T) {
 	if st, _ := p.Status("u1"); !st.Disabled {
 		t.Fatal("precondition: 应已禁用")
 	}
-	p.ReviveDisabled("u1")
+	if !p.Revive("u1") {
+		t.Fatal("Revive 应返回 true（uid 存在）")
+	}
 	st, ok := p.Status("u1")
 	if !ok {
 		t.Fatal("no status")
@@ -117,14 +119,16 @@ func TestReviveDisabled(t *testing.T) {
 	}
 }
 
-// TestReviveDisabledPersists 复活清 disabled + reason 落盘持久化（重启后不回退）。
-func TestReviveDisabledPersists(t *testing.T) {
+// TestRevivePersists 复活清 disabled + reason 落盘持久化（重启后不回退）。
+func TestRevivePersists(t *testing.T) {
 	dir := t.TempDir()
 	fp := filepath.Join(dir, "state.json")
 	p := New(fp)
 	p.Add(&auth.Auth{UID: "u1"})
 	p.Disable("u1", "12153 session dead")
-	p.ReviveDisabled("u1")
+	if !p.Revive("u1") {
+		t.Fatal("Revive 应返回 true（uid 存在）")
+	}
 	p.Flush()
 
 	p2 := New(fp)
@@ -151,7 +155,9 @@ func TestStatusDisabledReasonClearedByRevive(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
 	p.Disable("u1", "12153 session dead")
-	p.ReviveDisabled("u1")
+	if !p.Revive("u1") {
+		t.Fatal("Revive 应返回 true（uid 存在）")
+	}
 	st, _ := p.Status("u1")
 	if st.DisabledReason != "" {
 		t.Errorf("revive 后 disabled_reason=%q want 空", st.DisabledReason)

@@ -24,7 +24,9 @@ COPY --from=build /out/signin_bin /app/signin_bin
 COPY --from=build /out/login /app/login
 COPY --from=build /out/credit /app/credit
 COPY login.sh signin.sh credit.sh /app/
-COPY scripts/probe_active.py /app/scripts/probe_active.py
+# 全部工具脚本（probe_active / probe_max_tokens / task_*.py，含共享库 task_common.py）
+# 整目录进镜像：README 的脚本表把它们列为可在容器内直接 `python3 /app/scripts/...` 运行。
+COPY scripts/ /app/scripts/
 RUN sed -i 's/\r$//' /app/login.sh /app/signin.sh /app/credit.sh && chmod 755 /app/login.sh /app/signin.sh /app/credit.sh
 # 镜像不带真实配置：落 example 作为默认（生产由挂载卷 /app/config.json 覆盖）
 COPY config.example.json /app/config.json

@@ -14,7 +14,7 @@
 // 多请求同时 miss 同一模型只写一次）；文件损坏/不可写均静默降级（种子表→1M）。
 //
 // 状态归属：包级 catalogState 单例（与 modelsDev fetcher 同模式，进程一份）。
-// 测试用 resetModelCatalog / loadModelCatalogAt 隔离。
+// 测试用 resetModelCatalog 隔离。
 package upstream
 
 import (
@@ -139,33 +139,56 @@ func (c *modelCatalog) put(model string, e ModelCapEntry) {
 	if model == "" || !validCapEntry(e) {
 		return
 	}
+	// 锁内只改内存快照，锁外序列化 + 落盘：json.MarshalIndent/写入/rename 都是
+	// 磁盘 I/O，持锁做会阻塞所有 get（热路径查找链第 3 级）。拷贝一份 map 供
+	// 锁外序列化，避免与后续 put 的 map 写入数据竞争。
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	c.initLocked()
 	c.entries[model] = e
-	c.saveLocked()
+	snapshot := make(map[string]ModelCapEntry, len(c.entries))
+	for id, entry := range c.entries {
+		snapshot[id] = entry
+	}
+	path := c.path
+	c.mu.Unlock()
+	saveModelCatalog(path, snapshot)
 }
 
-// saveLocked 原子落盘（tmp + rename，pool state.json 同模式）。持锁调用。
+// saveModelCatalog 原子落盘（tmp + rename，pool state.json 同模式）。锁外调用。
 // path 为空 / 目录不可写 / 序列化失败 → 静默（内存缓存仍生效，下次进程重拉）。
-func (c *modelCatalog) saveLocked() {
-	if c.path == "" {
+func saveModelCatalog(path string, entries map[string]ModelCapEntry) {
+	if path == "" {
 		return
 	}
-	raw, err := json.MarshalIndent(c.entries, "", "  ")
+	raw, err := json.MarshalIndent(entries, "", "  ")
 	if err != nil {
 		return
 	}
-	if dir := filepath.Dir(c.path); dir != "" {
+	if dir := filepath.Dir(path); dir != "" {
 		_ = os.MkdirAll(dir, 0o755)
 	}
-	tmp := c.path + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
-		log.Printf("WARN: [upstream] model.json 落盘失败（内存缓存仍生效）: path=%s err=%v", c.path, err)
+	// 唯一临时名：并发 put（不同模型同时 miss）可能各自落盘，固定 ".tmp" 会互相
+	// 截断/踩 rename 竞态。同目录同盘保证 rename 原子。
+	tmpFile, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".*.tmp")
+	if err != nil {
+		log.Printf("WARN: [upstream] model.json 临时文件创建失败（内存缓存仍生效）: path=%s err=%v", path, err)
 		return
 	}
-	if err := os.Rename(tmp, c.path); err != nil {
-		log.Printf("WARN: [upstream] model.json 落盘改名失败: path=%s err=%v", c.path, err)
+	tmp := tmpFile.Name()
+	if _, err := tmpFile.Write(raw); err != nil {
+		tmpFile.Close()
+		os.Remove(tmp)
+		log.Printf("WARN: [upstream] model.json 落盘失败（内存缓存仍生效）: path=%s err=%v", path, err)
+		return
+	}
+	if err := tmpFile.Close(); err != nil {
+		os.Remove(tmp)
+		log.Printf("WARN: [upstream] model.json 落盘失败（内存缓存仍生效）: path=%s err=%v", path, err)
+		return
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
+		log.Printf("WARN: [upstream] model.json 落盘改名失败: path=%s err=%v", path, err)
 	}
 }
 
@@ -209,15 +232,6 @@ func resetModelCatalog() {
 	c.entries = nil
 	c.path = ""
 	c.loaded = false
-}
-
-// loadModelCatalogAt 测试接线：指向指定路径后立即触发一次加载（同步，可断言文件
-// 解析行为）。生产路径用 SetModelCatalogPath（惰性首次 get 触发加载）。
-func loadModelCatalogAt(path string) {
-	SetModelCatalogPath(path)
-	catalogState.mu.Lock()
-	defer catalogState.mu.Unlock()
-	catalogState.initLocked()
 }
 
 // ResetLookupChainForTest 跨包测试钩子：清空 model.json 缓存与 models.dev fetcher

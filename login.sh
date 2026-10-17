@@ -2,7 +2,7 @@
 # login.sh — WorkBuddy CN OAuth 登录 → 落盘 auth 文件
 #
 # 用法:
-#   ./login.sh
+#   ./login.sh [--realm=cn|global]   # 缺省 cn；国际版账号用 --realm=global
 #
 # 流程:
 #   1. POST /v2/plugin/auth/state 拿授权 URL（无 PKCE，state 由服务端签发）
@@ -10,6 +10,11 @@
 #   3. 回到这里按 y → poll 拿 token+uid+nickname → 签到 → 落盘 auths/workbuddy-<uid>.json
 #   4. 重启 workbuddy2api 容器加载新账号
 set -euo pipefail
+
+# 凭据落盘权限：auths/*.json 含明文 token，共享主机上默认 0644 全局可读。
+# 收紧 umask 到 0700（新建文件 0600、目录 0700），与 Go 侧 auth.SaveAtomic
+# 的 0600 口径一致；Python 落盘处再显式 chmod 0600 双保险。
+umask 077
 
 cd "$(dirname "$0")"
 AUTH_DIR="./auths"
@@ -28,7 +33,37 @@ echo "  WorkBuddy OAuth 登录"
 echo "============================================================"
 echo ""
 
-AUTH_URL=$("$LOGIN_BIN" url)
+# 域选择（issue：国际版账号此前恒以 CN 端点登录，必然失败）：
+#   优先级 --realm= 参数 > WB2A_REALM 环境变量 > 交互式 tty 提示 > 缺省 cn。
+#   非交互（管道/CI）下绝不阻塞等待输入。
+REALM=""
+for arg in "$@"; do
+    case "$arg" in
+        --realm=*) REALM="${arg#--realm=}" ;;
+        --realm)   REALM="__NEXT__" ;;
+    esac
+done
+if [[ "${REALM:-}" == "__NEXT__" ]]; then
+    # 分离式 --realm <v>：取其后一个参数。
+    prev=""
+    for arg in "$@"; do
+        if [[ "$prev" == "--realm" ]]; then REALM="$arg"; fi
+        prev="$arg"
+    done
+fi
+if [[ -z "${REALM:-}" && -n "${WB2A_REALM:-}" ]]; then
+    REALM="$WB2A_REALM"
+fi
+if [[ -z "${REALM:-}" && -t 0 ]]; then
+    # 交互式：让 login 提示选域（stdout 只输出归一化 realm）。
+    REALM=$("$LOGIN_BIN" realm 2>/dev/null || echo cn)
+fi
+if [[ -z "${REALM:-}" ]]; then
+    REALM="cn"
+fi
+REALM_ARG="--realm=$REALM"
+
+AUTH_URL=$("$LOGIN_BIN" "$REALM_ARG" url)
 
 echo "请在浏览器中打开以下链接完成登录："
 echo ""
@@ -51,7 +86,7 @@ fi
 echo ""
 echo "正在获取 token..."
 
-RESULT=$("$LOGIN_BIN" poll) || {
+RESULT=$("$LOGIN_BIN" "$REALM_ARG" poll) || {
     echo ""
     echo "获取 token 失败。可能原因："
     echo "  - 登录还没完成就按了 y（重新运行 ./login.sh 再试）"
@@ -66,6 +101,12 @@ DOMAIN=$(echo "$RESULT" | python3 -c "import json,sys; print(json.load(sys.stdin
 USER_ID=$(echo "$RESULT" | python3 -c "import json,sys; print(json.load(sys.stdin).get('uid',''))")
 ENT_ID=$(echo "$RESULT" | python3 -c "import json,sys; print(json.load(sys.stdin).get('enterprise_id',''))")
 NICKNAME=$(echo "$RESULT" | python3 -c "import json,sys; print(json.load(sys.stdin).get('nickname',''))")
+# realm：poll 输出恒带（cmd/login buildLoginOutput 按显式 --realm/domain 归一化）；
+# 落盘进嵌套形 auth.realm（与 internal/auth 的解析/写回形状一致）。
+LOGIN_REALM=$(echo "$RESULT" | python3 -c "import json,sys; print(json.load(sys.stdin).get('realm',''))")
+# 归一化：poll 未返回 realm 时回落到命令行/环境变量选定的域，最终恒非空。
+if [[ -z "$LOGIN_REALM" ]]; then LOGIN_REALM="$REALM"; fi
+LOGIN_REALM=$(printf '%s' "$LOGIN_REALM" | tr '[:upper:]' '[:lower:]')
 
 if [[ -z "$USER_ID" ]]; then
     echo "无法获取 uid，请检查 token 是否有效"
@@ -135,11 +176,15 @@ WB2A_LOGIN_DOMAIN="$DOMAIN" \
 WB2A_LOGIN_USER_ID="$USER_ID" \
 WB2A_LOGIN_ENT_ID="$ENT_ID" \
 WB2A_LOGIN_NICKNAME="$NICKNAME" \
+WB2A_LOGIN_REALM="$LOGIN_REALM" \
 WB2A_LOGIN_AUTH_FILE="$AUTH_FILE" \
 WB2A_LOGIN_ACTION="$ACTION" \
 python3 - <<'PYEOF'
 import json, os
 
+# realm 写入嵌套形 auth.realm（internal/auth.Parse 嵌套分支读 a.Auth.realm；
+# 与 Go 侧 auth.SaveAtomic 输出形状一致）。顶层 realm 仅在扁平形才被读取，
+# 此处落盘为嵌套形，故必须放进 auth 对象内。
 auth = {
     "account": {
         "uid": os.environ["WB2A_LOGIN_USER_ID"],
@@ -151,10 +196,15 @@ auth = {
         "refreshToken": os.environ["WB2A_LOGIN_REFRESH"],
         "expiresAt": int(os.environ["WB2A_LOGIN_EXPIRES_AT"]),
         "domain": os.environ["WB2A_LOGIN_DOMAIN"],
+        "realm": os.environ["WB2A_LOGIN_REALM"],
     },
 }
-with open(os.environ["WB2A_LOGIN_AUTH_FILE"], "w") as f:
+path = os.environ["WB2A_LOGIN_AUTH_FILE"]
+# 显式 0600 落盘（防 umask 未生效/被覆盖）：先以 0600 建文件再写。
+fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "w") as f:
     json.dump(auth, f, indent=1)
+os.chmod(path, 0o600)
 print(f"已保存（{os.environ['WB2A_LOGIN_ACTION']}）: {os.environ['WB2A_LOGIN_AUTH_FILE']}")
 PYEOF
 
@@ -177,6 +227,6 @@ echo "============================================================"
 echo "  登录完成！"
 echo "  UID: $USER_ID"
 echo "  Nickname: ${NICKNAME:-（未获取到）}"
-echo "  Token: ${TOKEN:0:30}..."
+echo "  Token: 已获取（长度 ${#TOKEN}）"
 echo "  有效期: $(date -d "@$EXPIRES_AT" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "$EXPIRES_AT")"
 echo "============================================================"

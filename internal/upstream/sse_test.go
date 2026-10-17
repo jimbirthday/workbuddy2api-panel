@@ -1217,3 +1217,146 @@ func TestStreamWithoutMarkupRepairIsUnchanged(t *testing.T) {
 		t.Fatalf("未声明 tools 时输出被改动\nbase=%s\ngot =%s", base.Body.String(), disabled.Body.String())
 	}
 }
+
+// TestAggregateErrorFrameIsNotFakeSuccess 非流式聚合遇到上游 error 帧（HTTP 200 已开流 +
+// 首帧 error，6004 模型级限流形态）时必须报 ErrFrame 并带出原文，绝不合成 200 空内容假成功。
+func TestAggregateErrorFrameIsNotFakeSuccess(t *testing.T) {
+	const payload = `{"error":{"code":6004,"message":"model usage limit exceeded"}}`
+	// 首帧就是 error，之后还有正文（上游异常形态）：仍必须报错。
+	raw := "data: " + payload + "\n\n" +
+		"data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n" +
+		"data: [DONE]\n\n"
+	_, err := Aggregate(strings.NewReader(raw))
+	if err == nil {
+		t.Fatal("expected error frame, got nil (fake 200 success)")
+	}
+	got, ok := IsErrorFrameError(err)
+	if !ok {
+		t.Fatalf("err=%v not an ErrFrame", err)
+	}
+	if got != payload {
+		t.Errorf("payload=%q want %q", got, payload)
+	}
+}
+
+// TestAggregateTruncatedStreamNotStop 上游连接中断（EOF 但未发 data: [DONE]）时，
+// finish_reason 不得谎报 "stop"，需可区分（改为 length）。
+func TestAggregateTruncatedStreamNotStop(t *testing.T) {
+	raw := "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"半句\"}}]}\n\n"
+	resp, err := Aggregate(strings.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fr := resp["choices"].([]any)[0].(map[string]any)["finish_reason"]
+	if fr != "length" {
+		t.Errorf("truncated finish_reason=%v want length", fr)
+	}
+}
+
+// TestFrameIsErrorBusinessEnvelopeClassification 钉死 frameIsError 的分类边界：
+// 上游既有 OpenAI 形态 {"error":{...}}，也有业务信封形态 {"code":<非0>,"msg":...}，
+// 两者都算错误帧；"error":null / code==0 / 带 choices 的帧一律不算。
+func TestFrameIsErrorBusinessEnvelopeClassification(t *testing.T) {
+	cases := []struct {
+		name string
+		obj  map[string]any
+		want bool
+	}{
+		{"openai style error object", map[string]any{"error": map[string]any{"code": 6004.0, "message": "rate limited"}}, true},
+		{"business envelope numeric code", map[string]any{"code": 6004.0, "msg": "The model provider is rate-limiting requests."}, true},
+		{"business envelope string code", map[string]any{"code": "6004", "msg": "rate limited"}, true},
+		{"business envelope padded string code", map[string]any{"code": " 6004 ", "msg": "rate limited"}, true},
+		{"business envelope zero numeric code", map[string]any{"code": 0.0, "data": map[string]any{"x": 1}}, false},
+		{"business envelope zero string code", map[string]any{"code": "0", "data": map[string]any{"x": 1}}, false},
+		{"null code", map[string]any{"code": nil}, false},
+		{"missing code", map[string]any{"msg": "hi"}, false},
+		{"code with usable choices is answer body", map[string]any{"code": 6004.0, "choices": []any{map[string]any{"delta": map[string]any{"content": "hi"}}}}, false},
+		{"null error is not an error frame", map[string]any{"error": nil, "choices": []any{map[string]any{"delta": map[string]any{"content": "hi"}}}}, false},
+		{"empty error object", map[string]any{"error": map[string]any{}}, false},
+		{"plain content frame", map[string]any{"choices": []any{map[string]any{"delta": map[string]any{"content": "hi"}}}}, false},
+		{"empty frame", map[string]any{}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := frameIsError(tc.obj); got != tc.want {
+				t.Fatalf("frameIsError(%v)=%v want %v", tc.obj, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestAggregateBusinessEnvelopeFrameIsNotFakeSuccess 非流式聚合遇到业务信封错误帧
+// （顶层 code/msg，无 error 对象，6004 模型级限流形态）时必须报 ErrFrame 并带出原文，
+// 绝不合成 200 空内容假成功（否则限流号被记成健康、粘性钉死）。
+func TestAggregateBusinessEnvelopeFrameIsNotFakeSuccess(t *testing.T) {
+	const payload = `{"code":6004,"msg":"The model provider is rate-limiting requests."}`
+	raw := "data: " + payload + "\n\ndata: [DONE]\n\n"
+	resp, err := Aggregate(strings.NewReader(raw))
+	if err == nil {
+		t.Fatalf("expected ErrFrame, got nil (fake 200 success): %v", resp)
+	}
+	got, ok := IsErrorFrameError(err)
+	if !ok {
+		t.Fatalf("err=%v not an ErrFrame", err)
+	}
+	if got != payload {
+		t.Errorf("payload=%q want %q", got, payload)
+	}
+}
+
+// TestStreamHintHoldsBusinessEnvelopeBeforeContent 流式扣住态下，业务信封错误帧出现在
+// 任何正文之前时必须返回 *ErrStreamHeld，且一个字节都不能写给客户端（否则换号会拼流）。
+func TestStreamHintHoldsBusinessEnvelopeBeforeContent(t *testing.T) {
+	const payload = `{"code":6004,"msg":"The model provider is rate-limiting requests."}`
+	raw := "data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\n" +
+		"data: " + payload + "\n\n"
+
+	rec := httptest.NewRecorder()
+	err := StreamHint(rec, strings.NewReader(raw), nil, HoldErrorUntilContent())
+	held, ok := err.(*ErrStreamHeld)
+	if !ok || held.Payload != payload {
+		t.Fatalf("held=%v err=%v want ErrStreamHeld payload=%s", held, err, payload)
+	}
+	if rec.Body.Len() != 0 {
+		t.Fatalf("client saw bytes before content (fake success): %q", rec.Body.String())
+	}
+}
+
+// TestStreamHintPassesThroughNormalAndNullErrorFrames 反例守卫：正常正文帧、以及带
+// "error":null 的收尾帧都不得被误判为错误帧，必须照常透传。
+func TestStreamHintPassesThroughNormalAndNullErrorFrames(t *testing.T) {
+	raw := "data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n" +
+		"data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"error\":null}\n\n" +
+		"data: [DONE]\n\n"
+
+	rec := httptest.NewRecorder()
+	if err := StreamHint(rec, strings.NewReader(raw), nil, HoldErrorUntilContent()); err != nil {
+		t.Fatalf("normal stream must not error: %v", err)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "hi") {
+		t.Fatalf("content frame not passed through: %s", body)
+	}
+	if !strings.Contains(body, "stop") {
+		t.Fatalf("null-error finish frame not passed through: %s", body)
+	}
+	if _, held := StreamHint(httptest.NewRecorder(), strings.NewReader(raw), nil, HoldErrorUntilContent()).(*ErrStreamHeld); held {
+		t.Fatal("null error frame must not be held as an error frame")
+	}
+}
+
+// TestStreamHintZeroCodeEnvelopeIsNotError code == 0 的业务信封帧（心跳/元信息）不是错误帧，
+// 其后正文帧必须正常到达客户端，且不得被扣住。
+func TestStreamHintZeroCodeEnvelopeIsNotError(t *testing.T) {
+	raw := "data: {\"code\":0,\"data\":{\"trace\":\"t1\"}}\n\n" +
+		"data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n" +
+		"data: [DONE]\n\n"
+
+	rec := httptest.NewRecorder()
+	if err := StreamHint(rec, strings.NewReader(raw), nil, HoldErrorUntilContent()); err != nil {
+		t.Fatalf("zero-code envelope must not be treated as error: %v", err)
+	}
+	if !strings.Contains(rec.Body.String(), "hi") {
+		t.Fatalf("content after zero-code envelope missing: %s", rec.Body.String())
+	}
+}

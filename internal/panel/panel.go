@@ -87,6 +87,10 @@ type Panel struct {
 	taskMu    sync.Mutex
 	taskLocks map[string]*sync.Mutex
 
+	// 说明：四类「一键全部」批量任务的 per-kind 单飞闸门已下移到
+	// scheduler.TryRunBatch（手动与定时共用同一把锁）。此处不再持有副本，
+	// 避免两套闸门各自为政导致「手动 + 定时」仍可并发。
+
 	// 任务中心执行队列（taskcenter.go）。
 	queueOnce sync.Once
 	q         *queueState
@@ -604,8 +608,11 @@ func (p *Panel) checkinAll(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotImplemented, "scheduler not available")
 		return
 	}
-	go p.cfg.Scheduler.RunCheckinNow()
-	log.Printf("panel: 手动全量签到已触发（含猫猫旅行）")
+	if !p.cfg.Scheduler.TryRunBatch("checkin", p.cfg.Scheduler.RunCheckinNow) {
+		writeErr(w, http.StatusConflict, "already_running")
+		return
+	}
+	log.Printf("panel: 手动全量签到已触发")
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true})
 }
 
@@ -615,7 +622,10 @@ func (p *Panel) travelAll(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotImplemented, "scheduler not available")
 		return
 	}
-	go p.cfg.Scheduler.RunTravelNow()
+	if !p.cfg.Scheduler.TryRunBatch("travel", p.cfg.Scheduler.RunTravelNow) {
+		writeErr(w, http.StatusConflict, "already_running")
+		return
+	}
 	log.Printf("panel: 手动全量旅行巡检已触发")
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true})
 }
@@ -626,7 +636,10 @@ func (p *Panel) activityAll(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotImplemented, "scheduler not available")
 		return
 	}
-	go p.cfg.Scheduler.RunActivityNow()
+	if !p.cfg.Scheduler.TryRunBatch("activity", p.cfg.Scheduler.RunActivityNow) {
+		writeErr(w, http.StatusConflict, "already_running")
+		return
+	}
 	log.Printf("panel: 手动全量活跃上报已触发")
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true})
 }
@@ -637,7 +650,10 @@ func (p *Panel) keepaliveAll(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotImplemented, "scheduler not available")
 		return
 	}
-	go p.cfg.Scheduler.RunKeepaliveNow()
+	if !p.cfg.Scheduler.TryRunBatch("keepalive", p.cfg.Scheduler.RunKeepaliveNow) {
+		writeErr(w, http.StatusConflict, "already_running")
+		return
+	}
 	log.Printf("panel: 手动全量保活已触发")
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true})
 }
@@ -650,7 +666,12 @@ func (p *Panel) balanceAll(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotImplemented, "scheduler not available")
 		return
 	}
-	p.cfg.Scheduler.RunBalanceRefreshNow()
+	// 单飞：若定时余额刷新正在跑，本次手动刷新直接跳过（不并发扫同一批账号）。
+	// 如实告知面板"已跳过"，不要谎报"完成"。
+	if !p.cfg.Scheduler.RunBalanceRefreshNow() {
+		writeErr(w, http.StatusConflict, "already_running")
+		return
+	}
 	p.syncNicknames()
 	log.Printf("panel: 手动全量余额刷新完成")
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "accounts": p.cfg.Pool.List()})

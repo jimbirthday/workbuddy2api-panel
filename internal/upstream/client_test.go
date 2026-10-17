@@ -137,6 +137,56 @@ func TestIsModelRateLimit(t *testing.T) {
 	}
 }
 
+// TestIsModelQueueFull 判断 429 body 是否是模型队列满（code 6021 / queue.full.title）。
+func TestIsModelQueueFull(t *testing.T) {
+	cases := []struct {
+		body string
+		want bool
+	}{
+		{`{"code":6021,"msg":"queue.full.title","requestId":"600815c599a88d976ad23d47a953b22c"}`, true},
+		{`{"code": 6021, "msg": "queue.full.title"}`, true},
+		{`{"error":{"code":"6021","message":"queue.full.title"}}`, true},
+		{`{"msg":"queue.full.title"}`, true},
+		{`{"code":6020,"msg":"queue.waiting.title","data":{"queue_position":4714,"retry_after":40,"estimated_wait":23570}}`, true},
+		{`{"msg":"queue.waiting.title"}`, true},
+		{`{"code":6004,"msg":"将在 2026-09-11 18:33:27 UTC+8 重置"}`, false},
+		{`{"code":60210,"msg":"other"}`, false},
+		{`{"code":60200,"msg":"other"}`, false},
+		{`{"code":1,"msg":"ok","requestId":"6021"}`, false},
+		{``, false},
+	}
+	for _, c := range cases {
+		if got := IsModelQueueFull(c.body); got != c.want {
+			t.Errorf("IsModelQueueFull(%q)=%v want %v", c.body, got, c.want)
+		}
+	}
+}
+
+func TestFrameKindQueueFullIsSoftRate(t *testing.T) {
+	payload := `{"error":{"code":6021,"message":"queue.full.title"}}`
+	if got := FrameKind(payload); got != ErrSoftRate {
+		t.Fatalf("FrameKind=%v want soft_rate", got)
+	}
+}
+
+func TestModelQueueRetryAfterUsesRetryAfterNotEstimatedWait(t *testing.T) {
+	body := `{"code":6020,"msg":"queue.waiting.title","data":{"queue_position":4714,"queue_size":"999+","retry_after":40,"estimated_wait":23570}}`
+	d, ok := ModelQueueRetryAfter(body)
+	if !ok || d != 40*time.Second {
+		t.Fatalf("retry=%v ok=%v want 40s", d, ok)
+	}
+	if ModelQueueReason(body) != "6020 queue waiting" {
+		t.Fatalf("reason=%q", ModelQueueReason(body))
+	}
+	if _, ok := ModelQueueRetryAfter(`{"code":6021,"msg":"queue.full.title"}`); ok {
+		t.Fatal("6021 without retry_after should not invent a duration")
+	}
+	// 数小时的 retry_after 超过上限，丢弃，调用方回落 soft_rate。
+	if _, ok := ModelQueueRetryAfter(`{"data":{"retry_after":999999}}`); ok {
+		t.Fatal("absurd retry_after must be rejected")
+	}
+}
+
 // TestParseSoftRateReset 解析上游 429 6004 msg 里的「将在 … 重置」时间（## UTC+8）。
 func TestParseSoftRateReset(t *testing.T) {
 	future := time.Now().Add(35 * time.Minute)

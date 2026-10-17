@@ -237,6 +237,88 @@ func IsModelRateLimit(body string) bool {
 	return reModelRateLimit.MatchString(body)
 }
 
+// 模型队列信号：共享的是这个模型的上游队列，不是账号配额。同一秒里多个账号打
+// 同一个模型会一起返回。
+//   - 6021 / queue.full.title：队列已满，请求被拒。
+//   - 6020 / queue.waiting.title：还在排队（body 带 queue_position、retry_after）。
+const (
+	modelQueueFullCode = "6021"
+	modelQueueFullMsg  = "queue.full.title"
+	modelQueueWaitCode = "6020"
+	modelQueueWaitMsg  = "queue.waiting.title"
+)
+
+// IsModelQueueFull 报告 body 是否是模型队列忙（6021 队列满，或 6020 仍在排队）。
+// code 只认 JSON 的 code 字段精确相等，避免撞进 requestId；msg 是固定 i18n 键。
+func IsModelQueueFull(body string) bool {
+	if body == "" {
+		return false
+	}
+	if hasBusinessCode(body, modelQueueFullCode) || hasBusinessCode(body, modelQueueWaitCode) {
+		return true
+	}
+	lower := strings.ToLower(body)
+	return strings.Contains(lower, modelQueueFullMsg) || strings.Contains(lower, modelQueueWaitMsg)
+}
+
+// ModelQueueReason 给模型队列冷却写一条可区分的原因。6020 与 6021 走同一条
+// 模型级路径，原因不同是为了在台账里看出是「还在排队」还是「队列已满」。
+func ModelQueueReason(body string) string {
+	if hasBusinessCode(body, modelQueueWaitCode) || strings.Contains(strings.ToLower(body), modelQueueWaitMsg) {
+		return "6020 queue waiting"
+	}
+	return "6021 queue full"
+}
+
+// ModelQueueRetryAfter 从队列 body 的 data.retry_after（秒）取出建议重试间隔。
+// 只认 retry_after。estimated_wait 是当前排位的预计等待，队列很长时会到数小时，
+// 不能拿来当冷却时长。超过 retryAfterSanity 或非正数视为无效。
+func ModelQueueRetryAfter(body string) (time.Duration, bool) {
+	var root map[string]any
+	if json.Unmarshal([]byte(body), &root) != nil {
+		return 0, false
+	}
+	if d, ok := retryAfterSeconds(root["data"]); ok {
+		return d, true
+	}
+	if d, ok := retryAfterSeconds(root["retry_after"]); ok {
+		return d, true
+	}
+	if errObj, ok := root["error"].(map[string]any); ok {
+		if d, ok := retryAfterSeconds(errObj["data"]); ok {
+			return d, true
+		}
+		if d, ok := retryAfterSeconds(errObj["retry_after"]); ok {
+			return d, true
+		}
+	}
+	return 0, false
+}
+
+// retryAfterSeconds 把 retry_after 字段（或包着它的 data 对象）收成时长。
+func retryAfterSeconds(v any) (time.Duration, bool) {
+	if m, ok := v.(map[string]any); ok {
+		v = m["retry_after"]
+	}
+	var sec int64
+	switch n := v.(type) {
+	case float64:
+		if n <= 0 || n > float64(retryAfterSanity/time.Second) {
+			return 0, false
+		}
+		sec = int64(n)
+	case string:
+		parsed, err := strconv.ParseInt(strings.TrimSpace(n), 10, 64)
+		if err != nil || parsed <= 0 || parsed > int64(retryAfterSanity/time.Second) {
+			return 0, false
+		}
+		sec = parsed
+	default:
+		return 0, false
+	}
+	return time.Duration(sec) * time.Second, true
+}
+
 // modelBlockCode 明确指向「该后端无此模型」的业务 code。
 const modelBlockCode = "11102"
 
@@ -799,6 +881,27 @@ func (c *Client) prepareBody(body []byte, realm, uid, conversationID string) []b
 	return body
 }
 
+// supportedEfforts 返回该域该模型当前用于降级的档位表。
+// nil 表示目录里没有这个模型（CN 探测桶未就绪，或静态表也没有）；
+// 非 nil 即 prepareBody 实际拿来校验的那份（global 含静态兜底）。
+func (c *Client) supportedEfforts(realm, model string) []string {
+	if model == "" || model == "-" {
+		return nil
+	}
+	efforts := c.effortsSnapshot(realm)
+	if realmKey(realm) == "global" {
+		efforts, _ = globalEffortMap(efforts, nil)
+	}
+	if len(efforts) == 0 {
+		return nil
+	}
+	supported, ok := efforts[model]
+	if !ok || len(supported) == 0 {
+		return nil
+	}
+	return supported
+}
+
 // effortsSnapshot 返回 effort 能力缓存副本；nil 表示未知（透传不降级）。
 func (c *Client) effortsSnapshot(realm string) map[string][]string {
 	c.effortsMu.RLock()
@@ -1026,7 +1129,15 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 	// reqCtx 的 cancel 在每个出口显式调用（Do 失败 / ≥400 / 成功分支移交 monitorBody），
 	// 循环本身各分支必 return——无循环尾兜底代码（此前外层 var cancel 从未赋值 +
 	// 尾部不可达 cancel() 是潜伏 nil-panic，已删；chatPaths 恒非空由构造保证）。
-	for _, path := range c.chatPaths(a) {
+	//
+	// chatPaths 现为单路径：直接取首元素而非 for-range（range 恒一轮即 return，
+	// staticcheck SA4004 会判「循环无条件终止」）。将来若恢复多路径候选，改回循环即可。
+	paths := c.chatPaths(a)
+	if len(paths) == 0 {
+		panic("unreachable: chatPaths is never empty")
+	}
+	{
+		path := paths[0]
 		endpoint := c.chatBase(a) + path
 		req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(prepared))
 		if err != nil {
@@ -1058,8 +1169,14 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 				return nil, 0, nil, fmt.Errorf("read body: %w", rerr)
 			}
 			kind := Classify(resp.StatusCode, string(raw))
-			log.Printf("WARN: [upstream] chat_stream acct=%s: upstream %d %s body=%s",
-				logfmt.Label(a.UID, a.Nickname), resp.StatusCode, kind, truncate(string(raw), 200))
+			model, effort, thinking := chatOutboundFields(prepared)
+			catalog := "-"
+			if supported := c.supportedEfforts(a.Realm(), model); supported != nil {
+				catalog = fmt.Sprint(supported)
+			}
+			log.Printf("WARN: [upstream] chat_stream acct=%s model=%s reasoning_effort=%s thinking=%s catalog=%s: upstream %d %s body=%s",
+				logfmt.Label(a.UID, a.Nickname), model, effort, thinking, catalog,
+				resp.StatusCode, kind, truncate(string(raw), 200))
 			// ≥400 直接返回（#119 后 global 单路径 /v2，chat 层无 fallback 链）。
 			// 分类一次、随 Kind 信封返回（含 Retry-After 头解析）：
 			// ErrNone 是防御分支（≥400 不应产生 None），返回原文让 handler 兜底。
@@ -1077,7 +1194,6 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 		// 取消传播由 http.Transport 在 body Close / 父 ctx 取消时处理，连接正常清理。
 		return monitorBody(resp.Body, c.IdleTimeout, cancel), resp.StatusCode, nil, nil
 	}
-	panic("unreachable: chatPaths is never empty") // for range 空集时编译器仍要求兜底 return；chatPaths 恒非空（构造保证），永不触达
 }
 
 // ModelInfo 动态模型信息（含 maxInputTokens/maxOutputTokens + 上游模型对象全字段）。

@@ -258,10 +258,15 @@ func main() {
 	}
 	if pretty {
 		printPretty(accounts, totalRemain, totalUsed, totalSize, okCount)
-		return
+	} else {
+		raw, _ := json.Marshal(out)
+		fmt.Println(string(raw))
 	}
-	raw, _ := json.Marshal(out)
-	fmt.Println(string(raw))
+	// 存在失败账号时以非零退出码结束，供 cron/巡检判定（此前恒 0，全失败与全成功
+	// 对调用方不可区分，静默失去告警能力）。os.Exit 前无 defer 清理需求。
+	if failed := len(accounts) - okCount; failed > 0 {
+		os.Exit(1)
+	}
 }
 
 // printPretty 人类可读日报：四行汇总，无账号明细。

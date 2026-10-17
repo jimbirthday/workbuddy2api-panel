@@ -83,26 +83,26 @@ type Status struct {
 	RateLimitedModels []RateLimitedModel `json:"rate_limited_models,omitempty"`
 	// Realm 账号域（cn/global，auth.Realm() 计算值；含 global.enabled 开关闸）。
 	// 供面板/状态接口按域分组展示。
-	Realm           string     `json:"realm,omitempty"`
+	Realm string `json:"realm,omitempty"`
 	// Enterprise 企业版账号（auth.EnterpriseID 非空，计算值不落盘）。
 	// 企业版无个人成长体系（签到/成长任务/连登/旅行/夜猫子 上游均拒），
 	// 面板据此隐藏对应按钮；选号、保活、额度展示不受影响。
-	Enterprise      bool       `json:"enterprise,omitempty"`
-	Disabled        bool       `json:"disabled"`
-	DisabledReason  string     `json:"disabled_reason,omitempty"` // 仅 disabled 账号：禁用原因（运维可见）
+	Enterprise     bool   `json:"enterprise,omitempty"`
+	Disabled       bool   `json:"disabled"`
+	DisabledReason string `json:"disabled_reason,omitempty"` // 仅 disabled 账号：禁用原因（运维可见）
 	// Paused 暂停选号：退出选号候选（与 disabled 一样不参与选号），但**照常参与**
 	// 签到 / 活跃上报 / 保活 / 余额刷新四类保号任务。与 disabled 正交——disabled 是
 	// 「授权/session 终态，需人工 revive」，paused 是「运维临时让位」（多号轮换场景），
 	// 账号本身健康，只是暂不接流量。
-	Paused          bool       `json:"paused,omitempty"`
-	SuccessCount    int64      `json:"success_count,omitempty"`
-	ErrTotal        int64      `json:"err_total,omitempty"`
-	LastSuccessTime time.Time  `json:"last_success,omitempty"`
-	LastErrTime     time.Time  `json:"last_err,omitempty"`
+	Paused          bool      `json:"paused,omitempty"`
+	SuccessCount    int64     `json:"success_count,omitempty"`
+	ErrTotal        int64     `json:"err_total,omitempty"`
+	LastSuccessTime time.Time `json:"last_success,omitempty"`
+	LastErrTime     time.Time `json:"last_err,omitempty"`
 	// CheckinDone 本地今日已签到（签到成功或上游"今天已签到"幂等拒绝均算）。
 	// global 域账号无签到体系，恒为 false。面板签到按钮据此显示 签到/已签。
-	CheckinDone bool        `json:"checkin_done,omitempty"`
-	TokenUsage  TokenUsage  `json:"token_usage,omitempty"`
+	CheckinDone bool       `json:"checkin_done,omitempty"`
+	TokenUsage  TokenUsage `json:"token_usage,omitempty"`
 	// ModelCosts 每模型实测成本台账（P1-anti-monopoly 可观测性）：运维据此自查
 	//「为什么总选它」——tier 0（免费）垄断 / tier 2 单价排序一眼可见。
 	// 仅 modelCostTTL 内的有效观测，每模型一行（cost_per_1k + last_seen +
@@ -148,10 +148,12 @@ type RateLimitedModel struct {
 }
 
 // modelCooldown 单个 (账号, 模型) 的模型级独立冷却记录。
-// 承载两种「该模型在此账号上不可用」语义：
+// 承载三种「该模型在此账号上不可用」语义：
 //   - 6004 模型级限流：Until 对齐上游重置墙钟；ResetAt 记录权威恢复时刻。
+//   - 6020/6021 模型队列忙：Until 优先用 body.retry_after，否则 soft_rate 基数，
+//     封顶 soft_rate_max；不写账号 until。已在冷却中不延长。
 //   - 11102 该后端无此模型：Until 为指数退避 TTL（6h 起、封顶 24h）；Hits 记录
-//     累计命中次数驱动退避（6004 无 hits 概念，Hits 恒 0）。
+//     累计命中次数驱动退避（6004/6021 无 hits 概念，Hits 恒 0）。
 type modelCooldown struct {
 	// Until 该模型的冷却截止（6004：now+min(resetAt-now, soft_rate_max)；11102：now+退避 TTL）。
 	Until time.Time
@@ -204,9 +206,9 @@ type entry struct {
 	// paused 暂停选号：与 disabled 正交。置位后退出选号候选（healthy 判否），
 	// 但保号任务遍历只按 Disabled 过滤，故 paused 号天然继续参与签到 / 活跃上报 /
 	// 保活 / 余额刷新。持久化（state.json），跨重启不丢。
-	paused         bool
-	reason         string
-	lastUsed       time.Time // 最近被选中时刻（防并发撞号）
+	paused   bool
+	reason   string
+	lastUsed time.Time // 最近被选中时刻（防并发撞号）
 	// usedSeq 单调递增的选中序号：每次被 pick 选中时取 p.pickSeq 自增值。
 	// Windows 等平台 time.Now() 精度有限（~0.5ms），高并发/快速连续选号时多个
 	// 账号 lastUsed 完全相等，基于 wall-clock 的 LRU/防惊群判定失效。
@@ -223,10 +225,10 @@ type entry struct {
 	// 重置点只有两处（都是账号被证明恢复的时刻）：NoteSuccess、reviveCoolingLocked。
 	// 持久化（stateAccount.SoftStreak）：重启后软限流仍在退避，不因重启回到基数。
 	softStreak int
-	// modelCooldowns 6004 模型级 limit 的**独立**冷却表：model → 该模型的冷却截止/重置。
-	// 与 until（全账号级）正交：6004 只写本表、不写 until，因此多个模型同时 6004 时
-	// 各自独立计时，互不覆盖（A 触发后 B 再触发，A 的冷却截止不被 B 覆盖——这是
-	// 单 until 字段做不到的）。仅 6004 触发时记录；空 map = 无模型级限流（不豁免）。
+	// modelCooldowns 模型级独立冷却表：model → 该模型的冷却截止/重置。
+	// 与 until（全账号级）正交：6004 / 6020 / 6021 只写本表、不写 until，因此多个模型同时
+	// 被限额时各自独立计时，互不覆盖（A 触发后 B 再触发，A 的冷却截止不被 B 覆盖——
+	// 这是单 until 字段做不到的）。空 map = 无模型级限流（不豁免）。
 	// 运行态语义（不持久化）：重启清零，退化为仅账号级 until 冷却的现状。
 	modelCooldowns map[string]modelCooldown
 	// sessionDeadFails 连续 12153（ErrSessionDead）计数。12153 在真实环境会被临时性触发
@@ -428,10 +430,10 @@ type stateAccount struct {
 	SuccessCount int64     `json:"success_count,omitempty"`
 	// err_total 累计错误计数。旧版 err_count（连续错误）仍可读：加载时映射到 err_total，
 	// 仅作一次性迁移，不再回写 err_count。
-	ErrTotal    int64      `json:"err_total,omitempty"`
-	ErrCount       int        `json:"err_count,omitempty"` // 兼容旧文件的迁移源，仅读取
-	LastSuccess    time.Time  `json:"last_success,omitempty"`
-	LastErr        time.Time  `json:"last_err,omitempty"`
+	ErrTotal    int64     `json:"err_total,omitempty"`
+	ErrCount    int       `json:"err_count,omitempty"` // 兼容旧文件的迁移源，仅读取
+	LastSuccess time.Time `json:"last_success,omitempty"`
+	LastErr     time.Time `json:"last_err,omitempty"`
 	// LastCheckinDay 最近一次签到成功的本地日期（entry.lastCheckinDay 同源）。
 	// 持久化以保留「当日已签」状态：签到后重启，面板按钮不回退成「签到」。
 	LastCheckinDay string     `json:"last_checkin_day,omitempty"`

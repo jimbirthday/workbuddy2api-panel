@@ -30,13 +30,22 @@ func (p *Pool) NoteFailures(uid string) {
 		return
 	}
 	e.consecutiveFails = 0
-	if !e.degradeUntil.IsZero() && time.Now().Before(e.degradeUntil) {
+	now := time.Now()
+	if !e.degradeUntil.IsZero() && now.Before(e.degradeUntil) {
 		// 降权期内的连败达阈：不延长（取更长者语义由 healthy 或门保证）。计数
 		// 已清零——到期放行后需重新连败满阈值才再降。
 		p.dirty.Store(true)
 		return
 	}
-	e.degradeUntil = time.Now().Add(p.degradeDurationLocked())
+	degradeUntil := now.Add(p.degradeDurationLocked())
+	e.degradeUntil = degradeUntil
+	// 与冷却域共用同一个 e.reason 字段（不新增台账字段）：运维在 /status 的
+	// 账号 reason 能看到「为什么被降权/冷却」。但 reason 与生效截止同源：既有账号级
+	// 冷却（until）仍生效且不早于本次降权截止时，本次降权不是最远的生效截止，不得
+	// 用降权原因掩盖真实冷却原因（statusOf 的 reason 必须描述仍在生效的那个惩罚）。
+	if !now.Before(e.until) || !degradeUntil.Before(e.until) {
+		e.reason = degradeReason
+	}
 	p.dirty.Store(true)
 }
 

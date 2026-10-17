@@ -149,13 +149,13 @@ type Delta struct {
 	HasCredit        bool
 	ModelRate        string
 	// CacheHitTokens / CacheMissTokens 前缀缓存命中/未命中观测（issue #92）。
-	HasCacheTokens   bool
-	CacheHitTokens   int64
-	CacheMissTokens  int64
-	LatencyMs        int64
-	HasLatency       bool
-	TokensPerSecond  float64
-	HasTPS           bool
+	HasCacheTokens  bool
+	CacheHitTokens  int64
+	CacheMissTokens int64
+	LatencyMs       int64
+	HasLatency      bool
+	TokensPerSecond float64
+	HasTPS          bool
 }
 
 // Add 记录一次请求尝试。
@@ -331,12 +331,34 @@ func (r *Recorder) flush(force bool) {
 		log.Printf("[usage] 建目录失败: %v", err)
 		return
 	}
-	tmp := r.path + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+	// 唯一临时名（同目录同盘，保证 rename 原子）：面板触发的 Save 与 30s 定时
+	// flusher 可能并发进来，固定 ".tmp" 会让两者互相截断/踩 rename 竞态。
+	// CreateTemp 默认 0600，与原 os.WriteFile 权限一致。
+	f, err := os.CreateTemp(filepath.Dir(r.path), filepath.Base(r.path)+".*.tmp")
+	if err != nil {
 		log.Printf("[usage] 写临时文件失败: %v", err)
 		return
 	}
+	tmp := f.Name()
+	if _, err := f.Write(raw); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		log.Printf("[usage] 写临时文件失败: %v", err)
+		return
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		log.Printf("[usage] 临时文件落盘失败: %v", err)
+		return
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
+		log.Printf("[usage] 关闭临时文件失败: %v", err)
+		return
+	}
 	if err := os.Rename(tmp, r.path); err != nil {
+		os.Remove(tmp)
 		log.Printf("[usage] 原子替换失败: %v", err)
 	}
 }

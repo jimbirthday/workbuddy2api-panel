@@ -12,6 +12,7 @@ package panel
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"sort"
@@ -32,6 +33,10 @@ type scanAccountItem struct {
 	Nickname  string          `json:"nickname"`
 	Growth    []upstream.Task `json:"growth,omitempty"`
 	GrowthErr string          `json:"growth_error,omitempty"`
+
+	// hasErr 仅供汇总 error_count 使用（未导出，不参与 JSON 序列化）：
+	// 该账号本扫描内成长任务列表拉取失败或 mp 列表拉取失败。
+	hasErr bool
 }
 
 // growthPending 任务是否"未完成且可自动化"。
@@ -60,6 +65,9 @@ func (p *Panel) tasksScanAll(w http.ResponseWriter, r *http.Request) {
 	states := p.cfg.Pool.List()
 	items := make([]scanAccountItem, len(states))
 	var wg sync.WaitGroup
+	// sem 限制扫描并发（口径与面板其它读接口一致，concurrency=3）：账号多时
+	// 若每账号无上限地开 goroutine，会瞬间打满上游触发风控。
+	sem := make(chan struct{}, 3)
 	for i, st := range states {
 		if st.Disabled {
 			continue
@@ -67,6 +75,8 @@ func (p *Panel) tasksScanAll(w http.ResponseWriter, r *http.Request) {
 		wg.Add(1)
 		go func(i int, uid string) {
 			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
 			a := p.cfg.Pool.AuthByUID(uid)
 			if a == nil {
 				return
@@ -84,6 +94,7 @@ func (p *Panel) tasksScanAll(w http.ResponseWriter, r *http.Request) {
 			}
 			if tasks, err := p.cfg.Upstream.ListTasks(a); err != nil {
 				it.GrowthErr = err.Error()
+				it.hasErr = true
 			} else {
 				for _, t := range tasks {
 					if growthPending(t) {
@@ -104,16 +115,26 @@ func (p *Panel) tasksScanAll(w http.ResponseWriter, r *http.Request) {
 						it.Growth = append(it.Growth, t)
 					}
 				}
+			} else {
+				// mp 列表失败此前静默；这里只标记该账号本次扫描有查询失败，
+				// 计入 error_count，不改变既有字段与前端可见的待办结构。
+				it.hasErr = true
 			}
 		}(i, st.UID)
 	}
 	wg.Wait()
 	pending := 0
+	errorCount := 0
 	for _, it := range items {
 		pending += len(it.Growth)
+		if it.hasErr {
+			errorCount++
+		}
 	}
-	log.Printf("panel: 队列扫描完成：全部账号待办 %d 项", pending)
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "accounts": items, "pending_count": pending})
+	log.Printf("panel: 队列扫描完成：全部账号待办 %d 项，查询失败 %d 个", pending, errorCount)
+	// error_count 仅新增键：让前端能区分"已全部完成"（pending_count==0 且
+	// error_count==0）与"查询失败"（error_count>0），旧字段名与类型不变。
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "accounts": items, "pending_count": pending, "error_count": errorCount})
 }
 
 // ---------------------------------------------------------------------------
@@ -156,7 +177,8 @@ func (p *Panel) tasksRunQueue(w http.ResponseWriter, r *http.Request) {
 		Concurrency int  `json:"concurrency"`
 		Growth      bool `json:"growth"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&body)
+	// 限读 1 MiB（同 config.go 口径）：请求体是小结构体，加闸防超大 JSON 内存放大。
+	_ = json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body)
 	if !body.Growth {
 		body.Growth = true
 	}
@@ -206,6 +228,9 @@ func (p *Panel) startGrowthQueue(concurrency int, growth bool) (started bool, to
 	var accts []queueAccount
 	var wg sync.WaitGroup
 	var mu sync.Mutex
+	// sem 限制预扫并发（口径同上，concurrency=3）：与 tasksScanAll 一致，
+	// 避免账号多时无界并发打满上游触发风控。
+	sem := make(chan struct{}, 3)
 	for _, st := range states {
 		if st.Disabled {
 			continue
@@ -217,6 +242,8 @@ func (p *Panel) startGrowthQueue(concurrency int, growth bool) (started bool, to
 		wg.Add(1)
 		go func(a *auth.Auth) {
 			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
 			one := queueAccount{a: a}
 			// D4 门控：global 账号无 CN 成长任务体系，不发起任何上游调用。
 			if a.IsGlobal() {

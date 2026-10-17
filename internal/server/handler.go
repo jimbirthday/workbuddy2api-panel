@@ -786,7 +786,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		// 占用在途名额：Pick 已跳过满额账号，此处 CAS 兜底并发抢名额的竞态。
 		if !h.cfg.Pool.Acquire(acct.UID) {
 			// 若被抢的正是粘性号，立即解绑并回落普通轮换，避免下一轮仍撞同一个
-			// 满载粘性号再浪费一次 PickByUID 往返（语义与 fail()/PickByUID-nil 的解绑一致）。
+			// 满载粘性号再浪费一次 PickByUIDForModel 往返（语义与 fail()/PickByUIDForModel-nil 的解绑一致）。
 			if stickyUID != "" && acct.UID == stickyUID {
 				unbindSticky()
 			}
@@ -859,6 +859,14 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
 			st.status = http.StatusServiceUnavailable
 			lastErr = terr
+			// 客户端已断连（用户点了「停止生成」/客户端网络抖动）：这是客户端侧的问题，
+			// 不是账号的问题——喂连败计数会让健康号 5 次后被临时踢出选号池 10 分钟，
+			// 多号池表现成「可用号越来越少」。跳过 NoteFailures 与粘性解绑，直接止损。
+			if r.Context().Err() != nil {
+				log.Printf("INFO: [server] client gone acct=%s: %v (account not penalized)",
+					logfmt.Label(acct.UID, acct.Nickname), terr)
+				break
+			}
 			h.cfg.Pool.NoteFailures(acct.UID)
 			fail(acct.UID)
 			if !rotateBackoff(rotates, r.Context()) {
@@ -1013,6 +1021,23 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				h.applyErrorPolicy(acct.UID, kind, held.Payload, bareModel, nil)
 				recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
 				fail(acct.UID)
+				// 内容拦截误报（passthrough/append 首遇）：与非流式分支（见 status>=400
+				// 处）同一套降级重试——换 Degraded 中性提示词同请求内重试，避免流式
+				// 客户端（多数 agent CLI 默认 stream:true）直接拿到 error 帧失败而非流式
+				// 客户端却被自动救回的不对称。degradedApplied 守卫防重复降级。
+				if kind == upstream.ErrContentBlocked && !degradedApplied &&
+					(h.cfg.PromptMode == "passthrough" || h.cfg.PromptMode == "append") {
+					h.degrade.Trigger()
+					body = prompt.Rewrite(body, prompt.Degraded)
+					degradedApplied = true
+					delete(tried, acct.UID) // 单账号池也能拿到重试机会（降级重试占一次名额）
+					log.Printf("WARN: [server] stream content-blocked before content -> degraded prompt retry")
+					if !rotateBackoff(rotates, r.Context()) {
+						break
+					}
+					rotates++
+					continue
+				}
 				if kind == upstream.ErrSoftRate && h.poolHasRotatable(tried, bareModel, realm) {
 					lastRateLimited = true
 					log.Printf("WARN: [server] stream acct=%s model=%s: rate-limit frame before content, rotating",
@@ -1021,6 +1046,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 						lastErr = &upstream.Error{Kind: kind, Status: http.StatusTooManyRequests, Msg: held.Payload}
 						break
 					}
+					rotates++
 					continue
 				}
 				log.Printf("WARN: [server] stream acct=%s model=%s: error frame before content kind=%s (no rotate) payload=%s",
@@ -1054,6 +1080,27 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				st.outcome = reqlog.OutcomeStreamError
 				log.Printf("WARN: [server] stream acct=%s model=%s: upstream error frame kind=%s payload=%s",
 					logfmt.Label(acct.UID, acct.Nickname), bareModel, kind, logfmt.Truncate(errFrame, 200))
+			case upstream.IsStreamReadError(sErr):
+				// 读上游失败（连接中断 / 空闲看门狗掐流 / 读超时）：**不是**客户端写失败。
+				// 此前两类错误共用本分支，上游半途断流时账号被记成功、清 11102 负缓存、
+				// 绑粘性，坏号长期留在池内且会话被钉在它身上。读侧失败按失败观测处理：
+				// 不记成功、不清负缓存、不绑粘性；传输层已由上游 client 记日志。
+				//
+				// 但客户端已断连（用户点了「停止生成」/客户端网络抖动）时读上游会随之
+				// 以 StreamReadError 收场——那是客户端侧的问题，不是账号的问题。与传输层
+				// 抖动分支（见 r.Context().Err() 守卫）同口径：客户端在场才罚号，否则喂
+				// 连败计数会让健康号 5 次后被临时踢出选号池，多号池表现成「可用号越来越少」。
+				st.status = http.StatusBadGateway
+				st.outcome = reqlog.OutcomeStreamError
+				if r.Context().Err() != nil {
+					st.outcome = reqlog.OutcomeInterrupted
+					log.Printf("INFO: [server] client gone during stream acct=%s: %v (account not penalized)",
+						logfmt.Label(acct.UID, acct.Nickname), sErr)
+				} else {
+					h.cfg.Pool.NoteFailures(acct.UID)
+					log.Printf("WARN: [server] stream acct=%s model=%s: upstream read error: %v",
+						logfmt.Label(acct.UID, acct.Nickname), bareModel, sErr)
+				}
 			case sErr != nil:
 				// 客户端写失败（断连）：上游帧无恙，账号健康——账号侧照常记成功
 				// （与 default 同语义），请求日志归为 Interrupted（人已走，未完成）。
@@ -1117,6 +1164,53 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		resp, err := upstream.Aggregate(rc)
 		rc.Close()
+		// 上游以 error 帧报错（HTTP 200 已开流 + 首帧 error，真实形态）：
+		// 复用**流式**同一套分类（FrameKind 优先命中 6004 模型级限流 / 6020·6021
+		// 模型队列忙）与冷却分支——模型级信号只锁该模型（CooldownSoftForModel /
+		// CooldownModelQueue），账号对其他模型仍可选，**绝不**停整号调度；池里还有
+		// 可换号则同样换号重试，与流式的 ErrStreamHeld 分支语义严格对齐。
+		// 此前非流式把 error 帧当有效事件，返回 200 空内容假成功且不处置账号。
+		if payload, isFrame := upstream.IsErrorFrameError(err); isFrame {
+			recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
+			kind := upstream.FrameKind(payload)
+			h.applyErrorPolicy(acct.UID, kind, payload, bareModel, nil)
+			releaseHeld()
+			fail(acct.UID)
+			// 内容拦截误报（passthrough/append 首遇）：与 status>=400 分支、流式
+			// ErrStreamHeld 分支同一套降级重试——换 Degraded 中性提示词同请求内重试，
+			// 避免非流式客户端拿到 error 帧直接失败、而流式客户端却被自动救回的不对称。
+			// degradedApplied 守卫防重复降级。
+			if kind == upstream.ErrContentBlocked && !degradedApplied &&
+				(h.cfg.PromptMode == "passthrough" || h.cfg.PromptMode == "append") {
+				h.degrade.Trigger()
+				body = prompt.Rewrite(body, prompt.Degraded)
+				degradedApplied = true
+				delete(tried, acct.UID) // 单账号池也能拿到重试机会（降级重试占一次名额）
+				log.Printf("WARN: [server] non-stream content-blocked -> degraded prompt retry")
+				if !rotateBackoff(rotates, r.Context()) {
+					break
+				}
+				rotates++
+				continue
+			}
+			if kind == upstream.ErrSoftRate && h.poolHasRotatable(tried, bareModel, realm) {
+				lastRateLimited = true
+				log.Printf("WARN: [server] non-stream acct=%s model=%s: error frame kind=%s before content, rotating",
+					logfmt.Label(acct.UID, acct.Nickname), bareModel, kind)
+				if !rotateBackoff(rotates, r.Context()) {
+					lastErr = &upstream.Error{Kind: kind, Status: http.StatusTooManyRequests, Msg: payload}
+					break
+				}
+				rotates++
+				continue
+			}
+			st.status = http.StatusServiceUnavailable
+			st.outcome = reqlog.OutcomeHTTPError
+			lastErr = &upstream.Error{Kind: kind, Status: http.StatusServiceUnavailable, Msg: payload}
+			log.Printf("WARN: [server] non-stream acct=%s model=%s: error frame kind=%s (no rotate) payload=%s",
+				logfmt.Label(acct.UID, acct.Nickname), bareModel, kind, logfmt.Truncate(payload, 200))
+			break
+		}
 		if err != nil {
 			recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
 			// 上游流解析失败：客户端还没看到任何输出，回 502 并告知原因。
@@ -1208,6 +1302,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 客户端据此会不断重试（#81 里就是 503 → 客户端自动重试 5 次），而真正
 			// 该做的是换个模型。用 400 + 明确的 code 把不可重试的性质讲清楚。
 			code = "model_unavailable"
+			status = http.StatusBadRequest
+		case upstream.ErrContentBlocked:
+			// 内容策略拦截（非流式降级重试后仍被拦，或 custom 模式直透）：内容问题非
+			// 账号问题，轮转无意义、不该报 no_healthy_account（那是"号全挂了"的语义，
+			// 客户端会不断重试）。与 status>=400 分支同口径回 400 content_blocked。
+			code = "content_blocked"
 			status = http.StatusBadRequest
 		}
 		if s := strings.TrimSpace(ue.Msg); s != "" {
@@ -1385,9 +1485,10 @@ func isUpstreamTimeout(err error, clientGone bool) bool {
 //
 // 十条路径，各司其职：
 //   - ErrHardCredit → CooldownUntilTomorrow4AM：即时硬冷却到次日 04:00（等签到恢复）。
-//   - ErrSoftRate → 优先对齐上游重置墙钟（带「将在 … 重置」时 6004 走模型级豁免、
-//     非 6004 走账号级，均不指数堆加）；无重置时间才走有界退避。冷却时长优先采信
-//     Retry-After 头（uerr.RetryAfter，body 文案墙钟之外的头形态来源）。
+//   - ErrSoftRate → 6020（queue.waiting）/ 6021（queue.full）只锁触发模型，不冻整号。
+//     其余优先对齐上游重置墙钟（带「将在 … 重置」时 6004 走模型级豁免、非 6004 走
+//     账号级，均不指数堆加）；无重置时间才走有界退避。冷却时长优先采信 Retry-After 头
+//     （uerr.RetryAfter，body 文案墙钟之外的头形态来源）。
 //   - ErrWafBlock → 账号级软冷却：**不 Disable**——WAF 403 是 IP/指纹维频控信号，
 //     罚过即走、到期自愈。时长优先 Retry-After 头；缺失按 wafCooldownBase(60s)
 //     起 · softStreak 指数、封顶 soft_rate_max 的既有 CooldownSoftRate 有界退避。
@@ -1418,35 +1519,57 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// 不需要异步核查（冗余）。立即换号。
 		h.cfg.Pool.CooldownUntilTomorrow4AM(uid, "余额不足")
 	case upstream.ErrSoftRate:
-		// 统一对齐上游重置时间：只要 body 带「将在 … 重置」，无论业务 code 是
-		// 6004 还是 11140 rate-limiting 等形态，都精确冷却到该墙钟、绝不指数堆加。
-		//   - 模型级（6004）→ CooldownSoftForModel：写 modelCooldowns[model]，切模型豁免。
-		//   - 账号级（非 6004）→ CooldownSoftRate：写账号级 until，不产生模型豁免。
+		// 6020 queue.waiting / 6021 queue.full 都是这个模型的上游队列，不是账号配额。
+		// 多个号会在同一秒一起撞上。只写 modelCooldowns[model]，不写 until、不推进
+		// softStreak。时长优先用 body 里的 data.retry_after（秒）；没有再用 soft_rate
+		// 基数。不采用 estimated_wait——那是排位预计等待，队列很长时会到数小时。
+		// 冷却中不延长，封顶 soft_rate_max。切模型仍可选。
+		// 没有模型名时退回下面的账号级路径，避免同一个未知请求立刻再打这号。
+		if upstream.IsModelQueueFull(body) && model != "" {
+			d := h.softCooldown()
+			if ra, ok := upstream.ModelQueueRetryAfter(body); ok {
+				d = ra
+			}
+			h.cfg.Pool.CooldownModelQueue(uid, model, d, upstream.ModelQueueReason(body))
+			return
+		}
+		// 6004 = 模型级限流：账号健康，只是这个模型此刻被限。**只锁该模型、绝不冻整号**。
+		// 用户硬约束：单模型限流绝不能停整个账号的调度。此前只有「带可解析重置时间」时
+		// 才走模型级路径；无重置时间/仅有 Retry-After 头的 6004 会退回账号级
+		// CooldownSoftRate，把整号冻住（其他模型也一起不可选），与约束相悖。
 		modelRateLimited := upstream.IsModelRateLimit(body)
-		if resetAt, ok := upstream.ParseRateReset(body); ok {
-			if modelRateLimited {
+		if modelRateLimited && model != "" {
+			// 6004 一律模型级：
+			//   - 有「将在 … 重置」→ 对齐该墙钟（CooldownSoftForModel，切模型豁免）；
+			//   - 另有 Retry-After 头 → 冷却到该时刻（模型级）；
+			//   - 都没有 → 模型级有界退避（base 起、封顶 soft_rate_max）。
+			// 三条路径都只写 modelCooldowns[model]，不写账号级 until、不推进账号 softStreak。
+			if resetAt, ok := upstream.ParseRateReset(body); ok {
 				h.cfg.Pool.CooldownSoftForModel(uid, h.softCooldown(), resetAt, model, "6004 model rate limit")
 				return
 			}
+			if uerr != nil && uerr.RetryAfter > 0 {
+				h.cfg.Pool.CooldownSoftForModel(uid, h.softCooldown(), time.Now().Add(uerr.RetryAfter), model, "6004 model rate limit (retry-after)")
+				return
+			}
+			h.cfg.Pool.CooldownSoftForModelNoReset(uid, model, h.softCooldown(), "6004 model rate limit (reset unknown)")
+			return
+		}
+		// 非 6004（账号级限流，如 11140 rate-limiting）：对齐上游重置墙钟或 Retry-After
+		// 头，绝不指数堆加；无时间的走账号级有界退避（soft_rate 基数起、softStreak 翻倍、
+		// 封顶 soft_rate_max；已在冷却中的兜底探测不翻倍）。
+		if resetAt, ok := upstream.ParseRateReset(body); ok {
 			h.cfg.Pool.CooldownSoftRate(uid, h.softCooldown(), resetAt, "429 rate limit")
 			return
 		}
-		// body 无重置文案但带 Retry-After 头 → 冷却到该时刻（不做指数堆加）。
-		// 头优先于「有界退避」，但低于 body 重置文案（文案是上游更权威的口径）。
 		if uerr != nil && uerr.RetryAfter > 0 {
 			h.cfg.Pool.CooldownSoftRate(uid, h.softCooldown(), time.Now().Add(uerr.RetryAfter), "429 rate limit (retry-after)")
-			if modelRateLimited {
-				h.cfg.Pool.RecordModelRateLimitAudit(uid, model, "6004 model rate limit (reset unknown)")
-			}
 			return
 		}
-		// 无重置时间 → 账号级有界退避（soft_rate 基数起、softStreak 翻倍、封顶
-		// soft_rate_max；已在冷却中的兜底探测不翻倍）。基数取 h.softCooldown()
-		// （热改优先），管理面板改 soft_rate 后立即生效。
+		// 无模型名（model==""）的 6004：无法做模型级路由（RecordModelRateLimitAudit
+		// 要求 model 非空，此处调用必然是空操作，故不再记审计台账），退回账号级有界
+		// 退避避免同一未知请求立刻再打这号。
 		h.cfg.Pool.CooldownSoftRate(uid, h.softCooldown(), time.Time{}, "429 rate limit")
-		if modelRateLimited {
-			h.cfg.Pool.RecordModelRateLimitAudit(uid, model, "6004 model rate limit (reset unknown)")
-		}
 	case upstream.ErrWafBlock:
 		// WAF 403（无业务信封拦截形态）。软冷却复用 CooldownSoftRate 家族：基数
 		// wafCooldownBase（60s，抖动后落 [45s,75s]）、softStreak 指数升级、封顶

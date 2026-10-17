@@ -123,6 +123,10 @@ func main() {
 	}
 	fmt.Printf("\ntotal=%d ok=%d already=%d na=%d fail=%d\n",
 		len(rows), okN, alreadyN, notAppN, failN)
+	// 有失败账号则以非零码退出，便于脚本/CI 判成败（与 cmd/credit、cmd/signin 一致）。
+	if failN > 0 {
+		os.Exit(1)
+	}
 }
 
 func trunc(s string, n int) string {

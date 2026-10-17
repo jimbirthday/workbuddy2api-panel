@@ -160,10 +160,13 @@ func clampGPTMinMaxTokens(obj map[string]any) {
 var effortRank = map[string]int{"off": 0, "minimal": 1, "low": 2, "medium": 3, "high": 4, "xhigh": 5, "max": 6}
 
 // normalizeReasoningEffort 按模型 supportedEfforts 降级 reasoning_effort（snake/camel 双字段兼容）。
-//   - 请求档位模型支持 → 原样透传
+//   - 请求档位模型支持 → 原样透传（不打日志）
 //   - 请求档位不支持 → 改为 ≤请求档位的最高支持档（降级）
 //   - 支持档全部高于请求档 → 取最低支持档（偏离最小）
-//   - 未知模型/未知档位/未携带字段/模型未缓存 → 一律透传
+//   - 未知模型/未知档位/未携带字段/模型未缓存 → 一律透传。
+//     目录缺失不在热路径打日志（每个带档位的请求都会命中）；出站 4xx 那一行
+//     会带上实际发出的 reasoning_effort 和当时的 catalog。
+//     只有档位值本身无法识别时打一行：这种值降级表对不上，会原样打到上游。
 func normalizeReasoningEffort(obj map[string]any, efforts map[string][]string) {
 	if len(efforts) == 0 {
 		return
@@ -176,21 +179,19 @@ func normalizeReasoningEffort(obj map[string]any, efforts map[string][]string) {
 	if !ok || len(supported) == 0 {
 		return
 	}
-	key := ""
-	if _, present := obj["reasoning_effort"]; present {
-		key = "reasoning_effort"
-	} else if _, present := obj["reasoningEffort"]; present {
-		key = "reasoningEffort"
-	} else {
+	key := effortFieldKey(obj)
+	if key == "" {
 		return
 	}
 	reqStr, ok := obj[key].(string)
 	if !ok {
+		log.Printf("reasoning_effort passthrough model=%s effort=%v supported=%v reason=non_string", model, obj[key], supported)
 		return
 	}
 	reqStr = strings.TrimSpace(strings.ToLower(reqStr))
 	reqIdx, known := effortRank[reqStr]
 	if !known {
+		log.Printf("reasoning_effort passthrough model=%s effort=%s supported=%v reason=unknown_value", model, reqStr, supported)
 		return
 	}
 	// 在 ≤请求档位的支持档里选最高档；命中且与请求不同才改写。
@@ -204,7 +205,7 @@ func normalizeReasoningEffort(obj map[string]any, efforts map[string][]string) {
 	if best != "" {
 		if !strings.EqualFold(best, reqStr) {
 			obj[key] = best
-			log.Printf("reasoning_effort downgraded model=%s %s -> %s", model, reqStr, best)
+			log.Printf("reasoning_effort downgraded model=%s %s -> %s supported=%v", model, reqStr, best, supported)
 		}
 		return
 	}
@@ -218,8 +219,44 @@ func normalizeReasoningEffort(obj map[string]any, efforts map[string][]string) {
 	}
 	if lowest != "" {
 		obj[key] = lowest
-		log.Printf("reasoning_effort floored model=%s %s -> %s", model, reqStr, lowest)
+		log.Printf("reasoning_effort floored model=%s %s -> %s supported=%v", model, reqStr, lowest, supported)
+		return
 	}
+	log.Printf("reasoning_effort passthrough model=%s effort=%s supported=%v reason=no_ranked_support", model, reqStr, supported)
+}
+
+// effortFieldKey 返回请求体里的档位字段名（snake 优先，camel 兜底）；都没有则空串。
+func effortFieldKey(obj map[string]any) string {
+	if _, present := obj["reasoning_effort"]; present {
+		return "reasoning_effort"
+	}
+	if _, present := obj["reasoningEffort"]; present {
+		return "reasoningEffort"
+	}
+	return ""
+}
+
+// chatOutboundFields 从已改写出站 body 取出排障字段。解析失败时各字段为 "-".
+func chatOutboundFields(body []byte) (model, effort, thinking string) {
+	model, effort, thinking = "-", "-", "-"
+	var obj map[string]any
+	if err := json.Unmarshal(body, &obj); err != nil {
+		return
+	}
+	if m, ok := obj["model"].(string); ok && strings.TrimSpace(m) != "" {
+		model = m
+	}
+	if key := effortFieldKey(obj); key != "" {
+		if e, ok := obj[key].(string); ok && strings.TrimSpace(e) != "" {
+			effort = e
+		}
+	}
+	if th, ok := obj["thinking"].(map[string]any); ok {
+		if typ, ok := th["type"].(string); ok && strings.TrimSpace(typ) != "" {
+			thinking = typ
+		}
+	}
+	return
 }
 
 // normalizeRoles 把 messages 里的 developer 角色归一为 system。
@@ -249,7 +286,8 @@ func normalizeRoles(obj map[string]any) {
 		}
 		if strings.EqualFold(strings.TrimSpace(role), "developer") {
 			msg["role"] = "system"
-			log.Printf("role normalized developer->system idx=%d", i)
+			model, _ := obj["model"].(string)
+			log.Printf("role normalized developer->system model=%s idx=%d", model, i)
 		}
 	}
 }

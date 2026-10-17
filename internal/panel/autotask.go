@@ -24,6 +24,7 @@ package panel
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -615,6 +616,10 @@ func runMiniExpert(p *Panel, a *auth.Auth) (string, error) {
 	return fmt.Sprintf("任务点亮并领取奖励（+%dc +%de）", credit, energy), nil
 }
 
+// errAccountNoTask 哨兵错误：让异步流水线把"任务不存在"与其它上游/执行错误区分开，
+// 以便 handler 侧保留原有的 404 分类（其余错误回 502）。
+var errAccountNoTask = errors.New("该账号没有此任务")
+
 // accountTaskAuto 一键完成单个任务：执行对应动作 → 回读进度 → 汇报结果。
 func (p *Panel) accountTaskAuto(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
@@ -625,7 +630,8 @@ func (p *Panel) accountTaskAuto(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		TaskCode string `json:"task_code"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.TaskCode == "" {
+	// 限读 1 MiB（同 config.go 口径）：请求体是小结构体，加闸防超大 JSON 内存放大。
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body); err != nil || body.TaskCode == "" {
 		writeErr(w, http.StatusBadRequest, "task_code required")
 		return
 	}
@@ -641,78 +647,109 @@ func (p *Panel) accountTaskAuto(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusConflict, "该账号有任务动作正在执行中，请等本轮结束后再试")
 		return
 	}
-	defer p.unlockAccount(uid)
-	// 前置读取：已完成的任务直接跳过（幂等，不浪费上游调用）。
-	// taskByCode 已双口径（mp 专属码自动回落 mp 列表）。
-	before, err := p.taskByCode(a, act.TaskCode)
-	if err != nil {
-		writeErr(w, http.StatusBadGateway, "list tasks: "+err.Error())
-		return
+	// 用 context 兜底超时（对齐 auto_all 的 5 分钟口径）：单个动作虽比全量短，
+	// 但 expert/skill 系含真实对话 + 回读轮询；代理/浏览器侧超时后用户会以为
+	// 失败，而此处仍会在后台继续跑。加整段处理上限，超时统一映射成 504。
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
+	defer cancel()
+	type autoResult struct {
+		resp map[string]any
+		err  error
 	}
-	if before == nil {
-		writeErr(w, http.StatusNotFound, "该账号没有此任务")
-		return
-	}
-	isMP := isMPTaskCode(act.TaskCode)
-	if before.Claimed {
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "skipped": true, "message": "该任务已领取过奖励"})
-		return
-	}
-	msg, err := act.run(p, a)
-	if err != nil {
-		writeErr(w, http.StatusBadGateway, "执行失败: "+err.Error())
-		return
-	}
-	// 回读验证：上报 200 ≠ 计分（上游可能静默丢弃 + 计分异步），
-	// 用有界轮询等异步计时落定，再决定是否自动领奖（mp 任务同口径回读）。
-	var after *upstream.Task
-	var aerr error
-	if isMP {
-		after, aerr = p.taskByCodeMP(a, act.TaskCode)
-	} else {
-		after, aerr = p.taskByCodeWaiting(a, act.TaskCode)
-	}
-	progressBefore, progressAfter := taskProgressText(before), ""
-	claimable := false
-	if aerr == nil && after != nil {
-		progressAfter = taskProgressText(after)
-		claimable = after.Claimable
-	}
-	resp := map[string]any{
-		"ok":               true,
-		"message":          msg,
-		"progress_before":  progressBefore,
-		"progress_after":   progressAfter,
-		"claimable":        claimable,
-		"attempt":          act.Attempt,
-		"verify_supported": true,
-	}
-	// 达标即自动领奖（Web 端 claim）：把"完成→领奖"收敛成一步，无需用户再点一次。
-	if claimable {
-		var credit, energy int64
-		var cerr error
+	done := make(chan autoResult, 1)
+	go func() {
+		// 锁在流水线真正结束（而非 HTTP 超时返回）时才释放——超时返回后重复点击
+		// 会被 409 挡住，不会出现两轮并发。
+		defer p.unlockAccount(uid)
+		// 前置读取：已完成的任务直接跳过（幂等，不浪费上游调用）。
+		// taskByCode 已双口径（mp 专属码自动回落 mp 列表）。
+		before, err := p.taskByCode(a, act.TaskCode)
+		if err != nil {
+			done <- autoResult{err: fmt.Errorf("list tasks: %w", err)}
+			return
+		}
+		if before == nil {
+			done <- autoResult{err: errAccountNoTask}
+			return
+		}
+		isMP := isMPTaskCode(act.TaskCode)
+		if before.Claimed {
+			done <- autoResult{resp: map[string]any{"ok": true, "skipped": true, "message": "该任务已领取过奖励"}}
+			return
+		}
+		msg, err := act.run(p, a)
+		if err != nil {
+			done <- autoResult{err: fmt.Errorf("执行失败: %w", err)}
+			return
+		}
+		// 回读验证：上报 200 ≠ 计分（上游可能静默丢弃 + 计分异步），
+		// 用有界轮询等异步计时落定，再决定是否自动领奖（mp 任务同口径回读）。
+		var after *upstream.Task
+		var aerr error
 		if isMP {
-			credit, energy, cerr = p.cfg.Upstream.ClaimRewardMP(a, act.TaskCode)
+			after, aerr = p.taskByCodeMP(a, act.TaskCode)
 		} else {
-			credit, energy, cerr = p.cfg.Upstream.ClaimReward(a, act.TaskCode)
+			after, aerr = p.taskByCodeWaiting(a, act.TaskCode)
 		}
-		if cerr == nil {
-			resp["claimed"] = true
-			resp["credit"] = credit
-			resp["energy"] = energy
-			if credit > 0 || energy > 0 {
-				resp["message"] = msg + fmt.Sprintf("；已自动领奖 +%d 分 +%d 能", credit, energy)
+		progressBefore, progressAfter := taskProgressText(before), ""
+		claimable := false
+		if aerr == nil && after != nil {
+			progressAfter = taskProgressText(after)
+			claimable = after.Claimable
+		}
+		resp := map[string]any{
+			"ok":               true,
+			"message":          msg,
+			"progress_before":  progressBefore,
+			"progress_after":   progressAfter,
+			"claimable":        claimable,
+			"attempt":          act.Attempt,
+			"verify_supported": true,
+		}
+		// 达标即自动领奖（Web 端 claim）：把"完成→领奖"收敛成一步，无需用户再点一次。
+		if claimable {
+			var credit, energy int64
+			var cerr error
+			if isMP {
+				credit, energy, cerr = p.cfg.Upstream.ClaimRewardMP(a, act.TaskCode)
 			} else {
-				resp["message"] = msg + "；奖励此前已领取"
+				credit, energy, cerr = p.cfg.Upstream.ClaimReward(a, act.TaskCode)
 			}
-		} else {
-			resp["claim_error"] = cerr.Error()
-			resp["message"] = msg + "；达标但领奖失败，可在任务列表手动点「领取」重试"
+			if cerr == nil {
+				resp["claimed"] = true
+				resp["credit"] = credit
+				resp["energy"] = energy
+				if credit > 0 || energy > 0 {
+					resp["message"] = msg + fmt.Sprintf("；已自动领奖 +%d 分 +%d 能", credit, energy)
+				} else {
+					resp["message"] = msg + "；奖励此前已领取"
+				}
+			} else {
+				resp["claim_error"] = cerr.Error()
+				resp["message"] = msg + "；达标但领奖失败，可在任务列表手动点「领取」重试"
+			}
 		}
+		log.Printf("panel: 任务动作 uid=%s code=%s progress %s -> %s claimable=%v claimed=%v",
+			uid, act.TaskCode, progressBefore, progressAfter, claimable, resp["claimed"])
+		done <- autoResult{resp: resp}
+	}()
+	select {
+	case res := <-done:
+		if res.err != nil {
+			// 保留既有错误分类：任务不存在回 404，其余上游/执行错误回 502。
+			if errors.Is(res.err, errAccountNoTask) {
+				writeErr(w, http.StatusNotFound, errAccountNoTask.Error())
+			} else {
+				writeErr(w, http.StatusBadGateway, res.err.Error())
+			}
+			return
+		}
+		writeJSON(w, http.StatusOK, res.resp)
+	case <-ctx.Done():
+		// HTTP 侧超时返回，但后台流水线仍在跑——锁在流水线 goroutine 内释放，
+		// 期间重复点击会被 409 挡住，不会出现两轮并发。
+		writeErr(w, http.StatusGatewayTimeout, "执行超时（任务仍在后台继续）")
 	}
-	log.Printf("panel: 任务动作 uid=%s code=%s progress %s -> %s claimable=%v claimed=%v",
-		uid, act.TaskCode, progressBefore, progressAfter, claimable, resp["claimed"])
-	writeJSON(w, http.StatusOK, resp)
 }
 
 // taskProgressText 任务进度的可读表示（回读对比用）。

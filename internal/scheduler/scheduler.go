@@ -82,6 +82,13 @@ type Scheduler struct {
 	// balanceInterval 余额刷新间隔（纳秒，0=暂停）。atomic 读写：执行循环每轮读当前值，
 	// SetBalanceInterval 可任意时刻热改（面板保存配置）。
 	balanceInterval atomic.Int64
+
+	// batchMu/batchRunning 批量任务 per-kind 单飞闸门（唯一权威）：手动（面板
+	// 「一键全部」）与定时（runBatch）共用同一把锁。到点时若同类批已在跑则跳过，
+	// 否则两路会并发遍历同一批账号——本意是防风控，双跑既浪费上游请求也可能触发风控。
+	// 键为稳定的 kind 字符串（checkin/travel/activity/keepalive/blackcat）。
+	batchMu      sync.Mutex
+	batchRunning map[string]bool
 }
 
 // New 构建。
@@ -402,15 +409,15 @@ func (s *Scheduler) runBatch(ctx context.Context, kinds []taskKind) {
 			defer wg.Done()
 			switch k {
 			case taskCheckin:
-				s.RunCheckinNow()
+				s.tryRunBatchKind("checkin", s.RunCheckinNow)
 			case taskTravel:
-				s.RunTravelNow()
+				s.tryRunBatchKind("travel", s.RunTravelNow)
 			case taskActivity:
-				s.runActivity(ctx)
+				s.tryRunBatchKind("activity", func() { s.runActivity(ctx) })
 			case taskKeepalive:
-				s.RunKeepaliveNow()
+				s.tryRunBatchKind("keepalive", s.RunKeepaliveNow)
 			case taskBlackcat:
-				s.RunBlackcatNow()
+				s.tryRunBatchKind("blackcat", s.RunBlackcatNow)
 			case taskGrowth:
 				// 成长任务队列：回调在 panel 侧异步启动（返回不等执行完），nil 未挂载则跳过。
 				s.schedMu.Lock()
@@ -423,6 +430,52 @@ func (s *Scheduler) runBatch(ctx context.Context, kinds []taskKind) {
 		}(k)
 	}
 	wg.Wait()
+}
+
+// TryRunBatch 申请执行一次 per-kind 批量任务（面板「一键全部」入口）：
+// 同一 kind 已在跑（手动或定时）时返回 false，调用方据此回 409；否则置位、
+// 后台 goroutine 执行 fn，结束清位。闸门在 Scheduler 侧统一持有，确保手动与
+// 定时两路不会并发遍历同一批账号。
+func (s *Scheduler) TryRunBatch(kind string, fn func()) bool {
+	if !s.beginBatchKind(kind) {
+		return false
+	}
+	go func() {
+		defer s.endBatchKind(kind)
+		fn()
+	}()
+	return true
+}
+
+// tryRunBatchKind 定时路径的同步变体：在**当前 goroutine** 内申请并执行，
+// 已在跑则跳过（runBatch 需等待本批收尾，不能像 TryRunBatch 那样另起 goroutine）。
+func (s *Scheduler) tryRunBatchKind(kind string, fn func()) {
+	if !s.beginBatchKind(kind) {
+		return
+	}
+	defer s.endBatchKind(kind)
+	fn()
+}
+
+// beginBatchKind 尝试置位某类批量任务的运行标记；已在跑返回 false。
+func (s *Scheduler) beginBatchKind(kind string) bool {
+	s.batchMu.Lock()
+	defer s.batchMu.Unlock()
+	if s.batchRunning == nil {
+		s.batchRunning = make(map[string]bool)
+	}
+	if s.batchRunning[kind] {
+		return false
+	}
+	s.batchRunning[kind] = true
+	return true
+}
+
+// endBatchKind 清除某类批量任务的运行标记。
+func (s *Scheduler) endBatchKind(kind string) {
+	s.batchMu.Lock()
+	delete(s.batchRunning, kind)
+	s.batchMu.Unlock()
 }
 
 // sleepCtx 可取消的等待：ctx 取消立即返回 false（优雅停机不必等限速睡醒），
@@ -611,10 +664,22 @@ func (s *Scheduler) RunKeepaliveNow() {
 // 解冻语义与签到一致（ReenableIfCredits：余额 > 0 的冷却账号自动解冻），
 // 但不做签到、不刷新 token——只让"积分"这个观测量保持新鲜。
 // 供两类入口复用：后台周期任务（StartBalanceRefresh）与面板手动全量刷新。
-func (s *Scheduler) RunBalanceRefreshNow() {
+//
+// 单飞：手动（面板「刷新余额」）与定时（balance ticker）两路共用同一把 kind="balance"
+// 闸门，互斥执行——否则同一批账号会被两路并发扫一遍上游（余额是分钟级观测量，重复
+// 扫描纯浪费并放大风控面）。已在跑时后到者直接返回 false（本次跳过），不报错——
+// 余额刷新是幂等观测，错过一轮下一轮自然补上。返回 true 表示本次确实执行了刷新。
+func (s *Scheduler) RunBalanceRefreshNow() bool {
+	if !s.beginBatchKind("balance") {
+		return false
+	}
+	defer s.endBatchKind("balance")
 	var wg sync.WaitGroup
 	expiringSoon := s.ExpiringSoonWindow()
 	includeDisabled := s.includeDisabledInTasks()
+	// 并发上限 3（与 panel 任务中心各批量扫描口径一致）：账号量可能到几十个，
+	// 无界并发会瞬时打出一大波余额 RPC，与压低并发防风控的意图相悖。
+	sem := make(chan struct{}, 3)
 	for _, st := range s.cfg.Pool.List() {
 		if st.Disabled && !includeDisabled {
 			continue
@@ -626,6 +691,8 @@ func (s *Scheduler) RunBalanceRefreshNow() {
 		wg.Add(1)
 		go func(a *auth.Auth, uid string) {
 			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
 			remain, total, expiring, earliestAt, earliestRemaining, err := s.cfg.Upstream.UserResourceDetailedWithExpiry(a, expiringSoon)
 			if err != nil {
 				log.Printf("balance %s: %v", logfmt.Label(uid, a.Nickname), err)
@@ -636,6 +703,7 @@ func (s *Scheduler) RunBalanceRefreshNow() {
 		}(a, st.UID)
 	}
 	wg.Wait()
+	return true
 }
 
 // StartBalanceRefresh 后台周期性余额刷新（独立 ticker goroutine，ctx 取消即停）。
@@ -672,7 +740,7 @@ func (s *Scheduler) StartBalanceRefresh(ctx context.Context, interval time.Durat
 			case <-s.rearmBalance:
 				timer.Stop() // 间隔已变：立刻按新值重算
 			case <-timer.C:
-				s.RunBalanceRefreshNow()
+				s.RunBalanceRefreshNow() // 返回值忽略：定时路径本身就期望"跳过即跳过"
 			}
 		}
 	}()

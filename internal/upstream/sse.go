@@ -24,6 +24,42 @@ var errEmptyStream = errors.New("upstream stream contained no valid data events"
 // upstream_parse 同语义），与客户端断连类错误区分。
 func IsEmptyStreamError(err error) bool { return errors.Is(err, errEmptyStream) }
 
+// ErrFrame 承载「上游以 SSE error 帧报错」的原始 payload（非 HTTP >=400 形态）。
+// 上游真实形态：HTTP 200 已开流，但第一帧就是 error（6004 模型级限流 / 内容拦截 /
+// 审核）。此前非流式 Aggregate 只看 id/model/created/usage/choices，把 error 帧当成
+// 有效事件计入 validEvents，最终合成 content:"" + finish_reason:"stop" 的 200 假成功，
+// 且账号不被处置——限流号被当健康号继续选中。用独立错误类型携带原文，让 handler
+// 走与流式完全一致的 FrameKind/Classify 分类与冷却分支（单一事实来源）。
+type ErrFrame struct{ Payload string }
+
+func (e *ErrFrame) Error() string {
+	return "upstream error frame: " + truncate(e.Payload, 200)
+}
+
+// IsErrorFrameError 报告 err 是否由上游 error 帧触发，并返回帧原文。
+func IsErrorFrameError(err error) (string, bool) {
+	var ef *ErrFrame
+	if errors.As(err, &ef) {
+		return ef.Payload, true
+	}
+	return "", false
+}
+
+// StreamReadError 包装「读上游 SSE 流失败」（连接中断 / 空闲看门狗掐流 / 读超时），
+// 与「写客户端失败」区分开。此前 StreamHint 把两类错误用同一个 error 返回，handler
+// 只能一律按「客户端写失败 → 账号健康」处理：上游半途断流/停滞时账号被记成功并清
+// 11102 负缓存、绑粘性，坏号长期留在池内。用独立类型让调用方按来源分别处置。
+type StreamReadError struct{ Err error }
+
+func (e *StreamReadError) Error() string { return "upstream stream read: " + e.Err.Error() }
+func (e *StreamReadError) Unwrap() error { return e.Err }
+
+// IsStreamReadError 报告 err 是否为读上游流失败（读侧），与写客户端失败（写侧）区分。
+func IsStreamReadError(err error) bool {
+	var re *StreamReadError
+	return errors.As(err, &re)
+}
+
 // Aggregate 读取完整 SSE 流，聚合 delta.content 为单个 OpenAI chat.completion 响应。
 // 分片/半行由 bufio.Reader.ReadString 处理；遇到 "data: [DONE]" 结束。
 // tool_calls 以流式 delta 到达（按 index 合并：首片带 id/type/name，后续只带 arguments 片段）。
@@ -154,6 +190,15 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 			} else {
 				var chunk map[string]any
 				if json.Unmarshal([]byte(payload), &chunk) == nil {
+					// 上游 error 帧（HTTP 200 已开流 + 首帧 error，真实形态）：
+					// 不是回答正文。若继续走下面的 validEvents++，会合成出
+					// content:"" + finish_reason:"stop" 的 200 假成功，客户端误判成
+					// 「模型返回空」，且账号不被处置（限流号被当健康号继续选中）。
+					// 原样带出帧原文，交给 handler 复用流式同一套 FrameKind/Classify
+					// 分类与冷却分支（6004 只锁该模型，账号对其他模型仍可选）。
+					if frameIsError(chunk) {
+						return nil, &ErrFrame{Payload: payload}
+					}
 					// 有效事件计数：仅 JSON 解析成功的数据帧计入（解析失败沿用静默 continue）。
 					validEvents++
 					if v, ok := chunk["id"].(string); ok && id == "" {
@@ -243,6 +288,17 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 		if len(calls) > 0 {
 			message["tool_calls"] = calls
 		}
+	}
+	// 截断识别：上游连接中断（EOF 收尾但从未发 data: [DONE]，sawDone=false）时
+	// 正文可能被截断，而 finish_reason 仍是默认 "stop"——客户端无法察觉，会把
+	// 半句话当完整回答落库。这里把「未正常收尾」如实报出来（与上方 tool_calls
+	// 用 !sawDone 判截断的口径一致）。仅改默认值，上游显式给过 finish_reason 的
+	// （如 length/tool_calls）不动。
+	// 仅当确实取到正文才把「未收到 [DONE]」标成截断：上游省略 [DONE]、但已给完整
+	// 正文并以 stop 收尾时，标 length 会把完整回答误报成被截断（客户端据此误判）。
+	// 无正文（如仅 role 帧的收尾）不涉及截断，保留原 finish_reason。
+	if !sawDone && finishReason == "stop" && gotAnyContent {
+		finishReason = "length"
 	}
 	resp := map[string]any{
 		"id":      id,
@@ -735,10 +791,11 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 		// normalizeFrame 白名单——白名单会剥掉 error 字段，客户端就看不到上游
 		// code/msg/requestId。error.message 即上游原文（如 6004 限流、审核拦截），
 		// 计入有效帧（避免误判空流补写 "empty upstream stream"）。
-		if _, hasErr := obj["error"]; hasErr {
+		if frameIsError(obj) {
 			// 正文还没写出：扣住这一帧，让调用方换号。不写响应头、不通知观察者
 			// （观察者挂在「已经透传」之后；换号成功时客户端不该看到这次失败）。
-			// 顶层 error 与 OpenAI 形态的 error 帧都算；choices 里夹带的 error 不在此列。
+			// OpenAI 形态（{"error":{...}}）与业务信封形态（{"code":<非0>,"msg":...}）
+			// 都算；choices 里夹带的 error 不在此列。
 			if o.holdErrorUntilContent && !clientSawContent {
 				return 0, &ErrStreamHeld{Payload: payload}
 			}
@@ -794,7 +851,9 @@ readLoop:
 			if err == io.EOF {
 				break
 			}
-			return err
+			// 读上游失败（连接中断 / 空闲看门狗掐流 / 读超时）：用 StreamReadError
+			// 包一层，与写客户端失败区分——handler 据此不把该次尝试记成账号成功。
+			return &StreamReadError{Err: err}
 		}
 	}
 	if werr := flushPending(); werr != nil {
@@ -843,11 +902,55 @@ readLoop:
 	return nil
 }
 
+// frameIsError 报告该帧是否为「上游报错帧」，覆盖上游两种真实形态：
+//
+//	形态一（OpenAI 形态）：顶层 error 为非 nil 的 error 对象，如 {"error":{"code":6004,...}}。
+//	  注意 "error": null 必须判为**非**错误帧——上游正常收尾帧会显式把 error 置空，
+//	  此前用 `_, hasErr := obj["error"]` 只判键存在，把这种帧误判成错误帧 → 非流式
+//	  Aggregate 直接返回 ErrFrame（把正常响应变成失败），流式 StreamHint 扣住并当作
+//	  限流帧错误处置账号。
+//
+//	形态二（业务信封形态）：顶层 code 为**数值非 0**，如
+//	  {"code":6004,"msg":"The model provider is rate-limiting requests."}。
+//	  这类信封是上游网关/供应商的业务错误回执，**没有** error 对象，也不是模型回答正文。
+//	  若当普通数据帧处理：非流式 Aggregate 会合成 content:"" + finish_reason:"stop" 的
+//	  200 空内容假成功；流式 StreamHint 走 normalizeFrame 白名单把 code/msg 剥掉后转发
+//	  一个空 chunk 假成功——两条路径都会把被限流的账号记成健康、粘性钉死，后续每轮都失败。
+//
+// 「业务信封」判定需**同时**满足两个条件，缺一不可：
+//  1. 顶层 code 存在且数值非 0；code == 0 / code 缺失 → 非错误（{"code":0,...} 是
+//     上游常见的心跳/元信息帧）。
+//  2. 该帧**没有**可用 choices（obj["choices"] 缺失或为空数组）；带 choices 的帧即便
+//     同时夹带 code 也仍是回答正文，不能误杀。
+//
+// code 编码兼容数字（6004）与字符串（"6004"）：统一 fmt.Sprint 后比较，并容忍前后空白
+// （上游偶尔输出 " 6004 "）。
+func frameIsError(obj map[string]any) bool {
+	// 形态一：顶层 error 对象（"error":null 视为非错误，既有行为保持不变）。
+	if v, ok := obj["error"]; ok && v != nil {
+		if m, ok := v.(map[string]any); ok {
+			return len(m) > 0
+		}
+		return true
+	}
+	// 带可用 choices 的帧是回答正文：即便夹带 code 也不判为错误。
+	if chs, ok := obj["choices"].([]any); ok && len(chs) > 0 {
+		return false
+	}
+	// 形态二：业务信封——code 存在且数值非 0。
+	code, ok := obj["code"]
+	if !ok || code == nil {
+		return false
+	}
+	trimmed := strings.TrimSpace(fmt.Sprint(code))
+	return trimmed != "" && trimmed != "0"
+}
+
 // frameHasClientContent 报告这一帧是否已经是客户端可见的回答。
 // role-only 首帧（delta 只有 role，或 content 为空串）不算：上游常在限流 error
 // 帧之前先发一帧空 role，此时客户端还没有正文，换号不会拼出半截回答。
 func frameHasClientContent(obj map[string]any) bool {
-	if _, hasErr := obj["error"]; hasErr {
+	if frameIsError(obj) {
 		return false
 	}
 	choices, _ := obj["choices"].([]any)
@@ -874,6 +977,11 @@ func deltaHasClientContent(delta map[string]any) bool {
 		return true
 	}
 	if tcs, ok := delta["tool_calls"].([]any); ok && len(tcs) > 0 {
+		return true
+	}
+	// 遗留 function_call（非 tool_calls 数组形态）：也是客户端可见的回答内容，
+	// 此前漏判会让「首帧即 function_call」的流被当成还没有正文。
+	if fc, ok := delta["function_call"].(map[string]any); ok && len(fc) > 0 {
 		return true
 	}
 	return false

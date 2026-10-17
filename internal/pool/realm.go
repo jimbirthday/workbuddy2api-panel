@@ -39,7 +39,7 @@ func (p *Pool) AvailableUIDsForRealm(realm string) []string {
 // 原有序列表哈希，即可让新会话对快过期账号形成温和偏好。重复项按 UID 排序后
 // 展开，保证同一账号拓扑下不同进程得到一致列表。
 //
-// 该方法是现有 AvailableUIDsForModelRealm 的增量入口，不改变旧方法语义，也不
+// 该方法是现有 AvailableUIDsForModelRealm 的增量入口，不改变既有方法语义，也不
 // 修改配置、状态或 Redis schema。prefer_expiring=false 时退化为逐账号一次。
 func (p *Pool) WeightedAvailableUIDsForModelRealm(model, realm string) []string {
 	p.mu.RLock()
@@ -75,8 +75,9 @@ func (p *Pool) WeightedAvailableUIDsForModelRealm(model, realm string) []string 
 	return out
 }
 
-// AvailableUIDsForModelRealm 同 AvailableUIDsForModel，但仅返回 Realm()==realm 的账号
-// （6004 模型豁免照常生效）。realm=="" 退化为 AvailableUIDsForModel。
+// AvailableUIDsForModelRealm 返回模型口径可用（healthyForModel）的账号 UID：在该模型上被
+// 6004 限流的账号不列入，而在**其他模型**被限流的账号照常列入（模型豁免）；realm 非空时
+// 再仅保留 Realm()==realm 的账号，realm=="" 时不按域过滤。
 func (p *Pool) AvailableUIDsForModelRealm(model, realm string) []string {
 	p.mu.RLock()
 	defer p.mu.RUnlock()

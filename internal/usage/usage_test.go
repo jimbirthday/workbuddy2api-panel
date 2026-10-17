@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -351,5 +352,38 @@ func TestCacheTokensPersistRoundtrip(t *testing.T) {
 	snap := r2.Snapshot(0, nil)
 	if snap.CreditByModel[0].CacheHitRate != 75 {
 		t.Fatalf("恢复后 cache_hit_rate=%v want 75", snap.CreditByModel[0].CacheHitRate)
+	}
+}
+
+// TestConcurrentSaveNoTmpCollision：并发 Save 使用唯一临时名，不发生互相截断；
+// 最终文件必须仍是完整合法 JSON（旧实现固定 ".tmp" 会让并发写踩 rename 竞态）。
+func TestConcurrentSaveNoTmpCollision(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/usage.json"
+	r := New(path)
+	r.Add(time.Now(), "cn", "u1", "m", Delta{PromptTokens: 1, HasPromptTokens: true}, true)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			r.Save()
+		}()
+	}
+	wg.Wait()
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("读回落盘文件失败: %v", err)
+	}
+	var f struct {
+		Buckets []json.RawMessage `json:"buckets"`
+	}
+	if err := json.Unmarshal(raw, &f); err != nil {
+		t.Fatalf("并发 Save 后文件损坏（非法 JSON）: %v", err)
+	}
+	if len(f.Buckets) == 0 {
+		t.Fatal("并发 Save 后应仍有桶数据")
 	}
 }

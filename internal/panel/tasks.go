@@ -6,6 +6,7 @@ package panel
 
 import (
 	"encoding/json"
+	"io"
 	"log"
 	"net/http"
 	"time"
@@ -62,10 +63,18 @@ func (p *Panel) accountTaskAccept(w http.ResponseWriter, r *http.Request) {
 	if a == nil {
 		return
 	}
+	// per-account 互斥：与 auto_all / 任务队列共用同一把账号锁，避免同一账号上
+	// 并发打上游（动作幂等但会浪费配额、放大风控面）。
+	if !p.tryLockAccount(uid) {
+		writeErr(w, http.StatusConflict, "already_running")
+		return
+	}
+	defer p.unlockAccount(uid)
 	var body struct {
 		TaskCodes []string `json:"task_codes"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || len(body.TaskCodes) == 0 {
+	// 限读 1 MiB（同 config.go 口径）：task_codes 是小数组，加闸防超大 JSON 内存放大。
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body); err != nil || len(body.TaskCodes) == 0 {
 		writeErr(w, http.StatusBadRequest, "task_codes required")
 		return
 	}
@@ -89,6 +98,13 @@ func (p *Panel) taskAcceptAll(w http.ResponseWriter, r *http.Request) {
 	if a == nil {
 		return
 	}
+	// 与 accountTaskAccept 同源：批量接受会连续多次调上游（含批间节流），
+	// 必须与 auto_all / 任务队列互斥，否则同账号会被多路并发打。
+	if !p.tryLockAccount(uid) {
+		writeErr(w, http.StatusConflict, "already_running")
+		return
+	}
+	defer p.unlockAccount(uid)
 	tasks, err := p.cfg.Upstream.ListTasks(a)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, "list tasks: "+err.Error())
@@ -159,7 +175,7 @@ func (p *Panel) accountTaskClaim(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		TaskCode string `json:"task_code"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.TaskCode == "" {
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body); err != nil || body.TaskCode == "" {
 		writeErr(w, http.StatusBadRequest, "task_code required")
 		return
 	}

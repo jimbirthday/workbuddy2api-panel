@@ -18,8 +18,11 @@ import (
 // RunStreakBonusNow 对所有可用账号执行连登兑换 + 抽奖（幂等：locked/无次数自动跳过）。
 // 由签到排程（RunCheckinNow）末尾调用；也可面板手动触发。
 func (s *Scheduler) RunStreakBonusNow() {
+	includeDisabled := s.includeDisabledInTasks()
 	for _, st := range s.cfg.Pool.List() {
-		if st.Disabled {
+		// 与其余保号类任务（签到/活跃上报/保活/余额刷新）口径一致：默认跳过禁用号，
+		// include_disabled_in_tasks 打开时一并执行，避免「禁用号保号全覆盖」漏掉连登兑换。
+		if st.Disabled && !includeDisabled {
 			continue
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)

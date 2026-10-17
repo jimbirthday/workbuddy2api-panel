@@ -12,7 +12,9 @@
 """
 import json, os, time, glob, urllib.request, urllib.error
 
-AUTHS = "/root/workbuddy2api/auths"
+# auths 目录：与 Go 侧同口径（cmd/server/config.go / cmd/credit/main.go 读 WB2A_AUTH_DIR），
+# 默认 /app/auths（镜像内工作目录）；WB2A_AUTHS_DIR 作为历史名的兼容别名保留。
+AUTHS = os.environ.get("WB2A_AUTH_DIR") or os.environ.get("WB2A_AUTHS_DIR") or "/app/auths"
 CHAT_BASE = "https://copilot.tencent.com"   # growth / tasks / buddy / streak / chat
 BILL_BASE = "https://www.codebuddy.cn"      # report / billing
 
@@ -47,9 +49,14 @@ def load_auth(uid_or_file: str) -> dict:
     # encoding 必须显式指定：Windows 上 open() 默认用 locale 代码页（中文系统为
     # GBK），而 auth 文件是 UTF-8，非 ASCII 昵称会 UnicodeDecodeError 中断全部任务。
     d = json.load(open(p, encoding="utf-8"))
-    a, acc = d["auth"], d["account"]
-    return {"token": a["accessToken"], "domain": a.get("domain") or "",
-            "uid": acc["uid"], "nick": acc.get("nickname", ""),
+    a, acc = d.get("auth") or {}, d.get("account") or {}
+    # 一律用 .get()：多账号批处理跑到一半抛裸 KeyError 既没有文件路径也没有字段名，
+    # 排查成本极高。缺字段直接 SystemExit 并带上文件路径与字段名。
+    token, uid = a.get("accessToken"), acc.get("uid")
+    if not token or not uid:
+        raise SystemExit(f"auth file {p} missing accessToken/uid")
+    return {"token": token, "domain": a.get("domain") or "",
+            "uid": uid, "nick": acc.get("nickname", ""),
             "file": os.path.basename(p)}
 
 

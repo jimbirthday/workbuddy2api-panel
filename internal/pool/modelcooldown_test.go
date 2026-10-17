@@ -105,11 +105,70 @@ func TestCooldownSoftForModelCapsUntilKeepsResetAt(t *testing.T) {
 	if !ok {
 		t.Fatal("modelCooldowns 缺少 glm-5.3")
 	}
-	if rem := mc.Until.Sub(time.Now()); rem <= 0 || rem > 10*time.Minute+time.Second {
+	if rem := time.Until(mc.Until); rem <= 0 || rem > 10*time.Minute+time.Second {
 		t.Errorf("Until 应在 (0,10m] 区间，实际剩余 %v", rem)
 	}
 	if d := mc.ResetAt.Sub(reset); d < -time.Second || d > time.Second {
 		t.Errorf("ResetAt=%v want ~2h 后=%v", mc.ResetAt, reset)
+	}
+}
+
+// TestCooldownModelQueueDoesNotFreezeAccount 6021 只锁触发模型：
+// 账号级 until / softStreak 不动，其他模型仍可选，已有的别的模型冷却不被清掉。
+func TestCooldownModelQueueDoesNotFreezeAccount(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	reset := time.Now().Add(2 * time.Hour)
+	p.CooldownSoftForModel("u1", time.Minute, reset, "glm-5.3", "6004 model rate limit")
+
+	p.CooldownModelQueue("u1", "deepseek-v4.1-flash", time.Minute, "6021 queue full")
+	p.mu.RLock()
+	e := p.byUID["u1"]
+	until, streak := e.until, e.softStreak
+	mcQ := e.modelCooldowns["deepseek-v4.1-flash"]
+	mcA := e.modelCooldowns["glm-5.3"]
+	p.mu.RUnlock()
+
+	if !until.IsZero() || streak != 0 {
+		t.Fatalf("6021 不得写账号级冷却 until=%v streak=%d", until, streak)
+	}
+	if mcQ.Until.IsZero() || mcQ.AuditOnly {
+		t.Fatalf("queue cooldown missing: %+v", mcQ)
+	}
+	if d := mcA.Until.Sub(reset); d < -time.Second || d > time.Second {
+		t.Errorf("既有 6004 被 6021 改写: until=%v want ~%v", mcA.Until, reset)
+	}
+	now := time.Now()
+	if e.healthyForModel(now, "deepseek-v4.1-flash") {
+		t.Fatal("队列满的模型应不可选")
+	}
+	if e.healthyForModel(now, "glm-5.3") {
+		t.Fatal("glm 的 6004 冷却应仍在")
+	}
+	if !e.healthyForModel(now, "hy3-x") {
+		t.Fatal("其他模型应仍可选")
+	}
+	if !e.healthy(now) {
+		t.Fatal("账号级 healthy 应仍为真")
+	}
+
+	// 冷却中再来一次 6021：不延长。
+	first := mcQ.Until
+	p.CooldownModelQueue("u1", "deepseek-v4.1-flash", time.Hour, "6021 queue full")
+	p.mu.RLock()
+	again := p.byUID["u1"].modelCooldowns["deepseek-v4.1-flash"].Until
+	p.mu.RUnlock()
+	if !again.Equal(first) {
+		t.Errorf("重复 6021 延长了截止: %v -> %v", first, again)
+	}
+
+	// 更长的既有模型冷却不被一次短队列满缩短。
+	p.CooldownModelQueue("u1", "glm-5.3", time.Minute, "6021 queue full")
+	p.mu.RLock()
+	kept := p.byUID["u1"].modelCooldowns["glm-5.3"].Until
+	p.mu.RUnlock()
+	if d := kept.Sub(reset); d < -time.Second || d > time.Second {
+		t.Errorf("6021 缩短了更长的 6004: until=%v want ~%v", kept, reset)
 	}
 }
 
@@ -276,7 +335,9 @@ func TestRateLimitedModelsMultiModel(t *testing.T) {
 	}
 }
 
-// 无重置时间的 6004 只写 AuditOnly 台账：账号页可见，但不得改变模型路由。
+// 无重置时间的 6004 只写 AuditOnly 台账：不得改变模型路由，也**不得**出现在账号页的
+// 限额行（RateLimitedModels）里——与 ModelLockView 同口径，口径由状态层
+// rateLimitedModelsLocked 显式跳过 AuditOnly 保证。
 func TestModelRateLimitAuditDoesNotAffectRouting(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
@@ -302,8 +363,12 @@ func TestModelRateLimitAuditDoesNotAffectRouting(t *testing.T) {
 	}
 
 	st, _ := p.Status("u1")
-	if len(st.RateLimitedModels) != 1 || st.RateLimitedModels[0].Kind != "rate_limit" {
-		t.Fatalf("audit status = %+v, want one rate_limit row", st.RateLimitedModels)
+	if len(st.RateLimitedModels) != 0 {
+		t.Fatalf("AuditOnly 条目不得渲染成限额行: %+v", st.RateLimitedModels)
+	}
+	// 但账号级软冷却本身仍在生效：Reason 活性判据必须继续透出（不是被本次改动静默）。
+	if st.Reason == "" || !st.Cooling {
+		t.Fatalf("账号级软冷却应仍生效: %+v", st)
 	}
 }
 
@@ -315,6 +380,30 @@ func TestRateLimitedModelKindModelUnavailable(t *testing.T) {
 	st, _ := p.Status("u1")
 	if len(st.RateLimitedModels) != 1 || st.RateLimitedModels[0].Kind != "model_unavailable" {
 		t.Fatalf("rows=%+v want model_unavailable", st.RateLimitedModels)
+	}
+}
+
+// TestRateLimitedModelsSkipsAuditOnly 状态层的限额行必须与 ModelLockView 同口径跳过
+// AuditOnly 条目：只审计、不拦路由的条目不得在账号页被渲染成「限流中」。
+func TestRateLimitedModelsSkipsAuditOnly(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	reset := time.Now().Add(time.Hour)
+	p.CooldownSoftForModel("u1", time.Minute, reset, "glm-5.3", "6004 model rate limit")
+	p.RecordModelRateLimitAudit("u1", "audit-only-model", "6004 model rate limit (reset unknown)")
+
+	st, ok := p.Status("u1")
+	if !ok {
+		t.Fatal("status missing")
+	}
+	if len(st.RateLimitedModels) != 1 || st.RateLimitedModels[0].Model != "glm-5.3" {
+		t.Fatalf("AuditOnly 条目不得出现在限额行: %+v", st.RateLimitedModels)
+	}
+	// 全池视图（ModelLockView）同口径：绝不报告只审计的模型被限流。
+	for _, row := range p.ModelLockView() {
+		if row.Model == "audit-only-model" {
+			t.Fatalf("ModelLockView 不得包含 AuditOnly 模型: %+v", row)
+		}
 	}
 }
 
@@ -604,5 +693,194 @@ func TestModelCooldownsPersistCompatOldState(t *testing.T) {
 	}
 	if until.IsZero() {
 		t.Error("旧文件 until 应照常加载（账号级冷却兼容）")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 冷却域覆盖语义（回归）：until 取更晚者时 coolKind 必须保持同源；异语义的模型
+// 条目不被短冷却缩短。对应代码走查 P1【1】【2】【3】。
+// ---------------------------------------------------------------------------
+
+// TestCooldownKeepsKindWhenLongerUntilPreserved 既有更长的软限流冷却，被一次更短的
+// 硬冷却覆盖时：until 保持更晚者，coolKind 必须仍是 soft_rate——否则随后一次余额
+// 刷新（ReenableIfCredits）会按「积分解冻」把这段 2h 限流冷却整段清掉，限流保护
+// 被压到一个刷新周期内（走查 P1【1】）。
+func TestCooldownKeepsKindWhenLongerUntilPreserved(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.SetSoftRateMax(2 * time.Hour)
+	p.CooldownSoftRate("u1", 2*time.Hour, time.Time{}, "429 rate limit") // until=+2h kind=soft_rate
+	p.mu.RLock()
+	softUntil := p.byUID["u1"].until
+	p.mu.RUnlock()
+
+	p.Cooldown("u1", CoolHard, time.Minute, "余额不足") // 更短：不得改写 kind、不得缩短 until
+
+	st, _ := p.Status("u1")
+	if st.CoolKind != "soft_rate" {
+		t.Fatalf("coolKind 被更短的硬冷却改写：%q（应保持 soft_rate）", st.CoolKind)
+	}
+	if !st.Until.Equal(softUntil) {
+		t.Fatalf("until 被缩短：%v want %v", st.Until, softUntil)
+	}
+
+	// 余额刷新不得把这段限流冷却按「积分解冻」清掉。
+	p.ReenableIfCredits("u1", 500, 0)
+	st2, _ := p.Status("u1")
+	if !st2.Cooling || st2.CoolKind != "soft_rate" {
+		t.Fatalf("余额刷新提前解冻了限流冷却：%+v", st2)
+	}
+}
+
+// TestCooldownSoftRateNoResetDoesNotShortenHard 处于硬冷却（次日 04:00）的账号撞一次
+// 无重置时间的 429：硬冷却不被截断成 600s，coolKind 不变（走查 P1【2】）。
+func TestCooldownSoftRateNoResetDoesNotShortenHard(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.CooldownUntilTomorrow4AM("u1", "余额不足")
+	p.mu.RLock()
+	hardUntil := p.byUID["u1"].until
+	p.mu.RUnlock()
+
+	p.CooldownSoftRate("u1", 10*time.Minute, time.Time{}, "429 rate limit")
+
+	st, _ := p.Status("u1")
+	if st.CoolKind != "hard_credit" {
+		t.Fatalf("coolKind=%q want hard_credit（软冷却不得覆盖硬冷却）", st.CoolKind)
+	}
+	if !st.Until.Equal(hardUntil) {
+		t.Fatalf("until=%v want %v（不得缩短）", st.Until, hardUntil)
+	}
+	if st.SoftStreak != 0 {
+		t.Errorf("被保留的硬冷却不得推进 softStreak, got %d", st.SoftStreak)
+	}
+}
+
+// TestCooldownSoftForModelKeepsLongerModelCooldown 11102 的 6h 负缓存不被一次短 reset
+// 的 6004 压短，且 Hits 沿用（退避不从基数重学）（走查 P2【3】）。
+func TestCooldownSoftForModelKeepsLongerModelCooldown(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.BlockModelBackoff("u1", "glm-5.3", "11102 model unavailable")
+	p.mu.RLock()
+	before := p.byUID["u1"].modelCooldowns["glm-5.3"]
+	p.mu.RUnlock()
+
+	p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(5*time.Minute), "glm-5.3", "6004 model rate limit")
+
+	p.mu.RLock()
+	after := p.byUID["u1"].modelCooldowns["glm-5.3"]
+	p.mu.RUnlock()
+	if !after.Until.Equal(before.Until) {
+		t.Fatalf("短 reset 的 6004 缩短了 11102 长冷却：%v want %v", after.Until, before.Until)
+	}
+	if after.Hits != before.Hits {
+		t.Errorf("11102 Hits 被 6004 覆盖丢失：%d want %d", after.Hits, before.Hits)
+	}
+	if !strings.HasPrefix(after.Reason, "11102") {
+		t.Errorf("reason 被改写：%q（应保留 11102 语义）", after.Reason)
+	}
+}
+
+// TestCooldownSoftForModelNoResetWithModelNeverFreezesAccount 回归钉死红线：
+// CooldownSoftForModel 传**非零 model + 零 resetAt** 时绝不允许走账号级分支——
+// 账号级 e.until 不被写、softStreak 不推进，且只写 modelCooldowns[model]（模型级有界退避）。
+// 这是「单模型限流绝不冻整号」的库层保证（此前 else 分支会写账号 until + 推进 softStreak
+// + clearRoutingModelCooldownsLocked，任何调用方误传都会冻整号）。
+func TestCooldownSoftForModelNoResetWithModelNeverFreezesAccount(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.SetSoftRateMax(time.Hour)
+	before := time.Now()
+
+	p.CooldownSoftForModel("u1", time.Minute, time.Time{}, "glm-5.3", "6004 model rate limit (reset unknown)")
+
+	p.mu.RLock()
+	e := p.byUID["u1"]
+	until, streak, kind := e.until, e.softStreak, e.coolKind
+	mc, ok := e.modelCooldowns["glm-5.3"]
+	modelCount := len(e.modelCooldowns)
+	p.mu.RUnlock()
+
+	if !until.IsZero() {
+		t.Fatalf("传 model 时绝不允许写账号级 until: %v", until)
+	}
+	if streak != 0 {
+		t.Fatalf("传 model 时绝不推进账号 softStreak: %d", streak)
+	}
+	if kind == CoolSoft {
+		t.Fatalf("传 model 时绝不写账号级 coolKind: %q", kind)
+	}
+	if !ok || mc.AuditOnly {
+		t.Fatalf("必须写入模型级退避条目: %+v ok=%v", mc, ok)
+	}
+	if modelCount != 1 {
+		t.Fatalf("只应有一条模型级条目，得到 %d", modelCount)
+	}
+	if rem := time.Until(mc.Until); rem <= 0 || rem > time.Minute+time.Second {
+		t.Errorf("模型级退避剩余=%v 期望 ~1m（base 起，封顶 softRateMax）", rem)
+	}
+	if mc.Until.Before(before) {
+		t.Errorf("模型级 until=%v 早于调用前 %v", mc.Until, before)
+	}
+	// 账号对**其他模型**仍可选（切模型即可用），且账号整体未被冻结。
+	st, _ := p.Status("u1")
+	if st.Cooling {
+		t.Fatalf("模型级限流不得让账号 Cooling: %+v", st)
+	}
+}
+
+// TestCooldownSoftForModelNoResetWithModelMatchesNoResetAPI 两条入口在「零 resetAt +
+// 有 model」时必须完全同形（同一实现），否则修一处漏一处。这里用两个池分别调用
+// CooldownSoftForModel 与 CooldownSoftForModelNoReset，比较模型条目时长/原因。
+func TestCooldownSoftForModelNoResetWithModelMatchesNoResetAPI(t *testing.T) {
+	const model = "glm-5.3"
+	p1 := New("")
+	p1.Add(&auth.Auth{UID: "u1"})
+	p2 := New("")
+	p2.Add(&auth.Auth{UID: "u1"})
+	p1.CooldownSoftForModel("u1", time.Minute, time.Time{}, model, "6004 x")
+	p2.CooldownSoftForModelNoReset("u1", model, time.Minute, "6004 x")
+
+	read := func(p *Pool) modelCooldown {
+		p.mu.RLock()
+		defer p.mu.RUnlock()
+		return p.byUID["u1"].modelCooldowns[model]
+	}
+	a, b := read(p1), read(p2)
+	if a.Reason != b.Reason || a.AuditOnly != b.AuditOnly || a.Hits != b.Hits {
+		t.Fatalf("两条入口结果不一致: %+v vs %+v", a, b)
+	}
+	if d := a.Until.Sub(b.Until); d < -time.Second || d > time.Second {
+		t.Fatalf("两条入口退避截止不一致: %v vs %v", a.Until, b.Until)
+	}
+	// 再次命中：两条入口都应「已在有效模型冷却中 → 不延长」。
+	p1.CooldownSoftForModel("u1", time.Minute, time.Time{}, model, "6004 x")
+	p2.CooldownSoftForModelNoReset("u1", model, time.Minute, "6004 x")
+	if again := read(p1); !again.Until.Equal(a.Until) {
+		t.Errorf("CooldownSoftForModel 重复命中延长了模型冷却: %v want %v", again.Until, a.Until)
+	}
+	if again := read(p2); !again.Until.Equal(b.Until) {
+		t.Errorf("CooldownSoftForModelNoReset 重复命中延长了模型冷却: %v want %v", again.Until, b.Until)
+	}
+}
+
+// TestCooldownSoftForModel6004OverwritesShortAudit 既有 AuditOnly 台账（无路由效果）被
+// 真正的 6004 路由冷却取代：可以覆盖，且不沿用 AuditOnly 标记。
+func TestCooldownSoftForModel6004OverwritesShortAudit(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.CooldownSoftRate("u1", time.Minute, time.Time{}, "429 rate limit")
+	p.RecordModelRateLimitAudit("u1", "glm-5.3", "6004 model rate limit (reset unknown)")
+	reset := time.Now().Add(30 * time.Minute)
+	p.CooldownSoftForModel("u1", time.Minute, reset, "glm-5.3", "6004 model rate limit")
+	p.mu.RLock()
+	mc, ok := p.byUID["u1"].modelCooldowns["glm-5.3"]
+	p.mu.RUnlock()
+	if !ok || mc.AuditOnly {
+		t.Fatalf("真实 6004 冷却应取代 AuditOnly 台账：%+v", mc)
+	}
+	if d := mc.Until.Sub(reset); d < -time.Second || d > time.Second {
+		t.Errorf("Until=%v want ~%v", mc.Until, reset)
 	}
 }

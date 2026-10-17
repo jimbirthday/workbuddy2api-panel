@@ -80,10 +80,10 @@ type Event struct {
 	HasCredit        bool      `json:"credit_known"`
 	// CacheHitTokens / CacheMissTokens 上游前缀缓存命中/未命中 token（issue #92）。
 	// 上游未回该维度时两者皆零值省略；hit=0 + miss>0 即整段未命中。
-	CacheHitTokens  int64 `json:"cache_hit_tokens,omitempty"`
-	CacheMissTokens int64 `json:"cache_miss_tokens,omitempty"`
-	ClientIP         string    `json:"client_ip,omitempty"`
-	UserAgent        string    `json:"user_agent,omitempty"`
+	CacheHitTokens  int64  `json:"cache_hit_tokens,omitempty"`
+	CacheMissTokens int64  `json:"cache_miss_tokens,omitempty"`
+	ClientIP        string `json:"client_ip,omitempty"`
+	UserAgent       string `json:"user_agent,omitempty"`
 }
 
 // Filter 用于从归档中筛选最近记录。字符串字段一律「包含」匹配（大小写不敏感），
@@ -526,28 +526,83 @@ func (w *archiveWriter) read(limit int, filter Filter) ([]Event, error) {
 	if err != nil {
 		return nil, err
 	}
-	// 文件读取顺序无关紧要：结果一律按事件时间排序。不能依赖归档文件的 mtime 还原时间
-	// 顺序——同一秒内连续轮转写出的多个文件 mtime 经常完全相同（Linux 文件时间戳粒度粗），
-	// os.ReadDir 的字典序又会把装着最早事件的基准文件 requests-<day>.jsonl 排在
-	// requests-<day>.N.jsonl 之后；目录被整体拷贝 / 恢复备份后 mtime 更不可信。
+	// 归档文件名固定为 requests-<day>.jsonl / requests-<day>.N.jsonl，N 是当天内的
+	// 轮转序号。按「日期倒序、同日序号倒序」排列即从新到旧，能保证在读取到足够条数
+	// 后剩余旧文件无需再读。不依赖 mtime：同一秒内连续轮转写出的多个文件 mtime 经常
+	// 完全相同（Linux 文件时间戳粒度粗），字典序又会把装着最早事件的基准文件
+	// requests-<day>.jsonl 排到 requests-<day>.N.jsonl 之后；目录被整体拷贝 / 恢复
+	// 备份后 mtime 更不可信（见 TestReadArchiveOrdersByEventTimeNotFileMtime）。
+	names := archiveFileNamesNewestFirst(entries)
 	var out []Event
+	// 从新到旧逐文件读取，累积到 limit 即停：每 5s 轮询只需最近 limit 条，
+	// 无可避免读遍全量旧归档。读取总量有界（limit*单文件）后仍按事件时间倒序
+	// 排序并截断，排序与过滤语义不变（见下方注释）。
+	for _, name := range names {
+		rows, err := readFile(filepath.Join(w.cfg.Dir, name), filter)
+		if err != nil {
+			// 与旧实现一致：出错时返回已累积结果 + 错误，不静默吞掉。
+			sortArchiveNewestFirst(out)
+			return out, err
+		}
+		out = append(out, rows...)
+		if len(out) >= limit {
+			break
+		}
+	}
+	// 契约：按事件时间倒序返回最近 limit 条（同一时刻用 Stable 保留落盘先后）。
+	sortArchiveNewestFirst(out)
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+// archiveFileNamesNewestFirst 从归档目录条目中筛出归档文件，按「日期倒序、同日
+// 轮转序号倒序」返回，即从可能覆盖最新事件的文件开始。
+func archiveFileNamesNewestFirst(entries []os.DirEntry) []string {
+	type archFile struct {
+		name string
+		day  string
+		idx  int
+	}
+	files := make([]archFile, 0, len(entries))
 	for _, entry := range entries {
 		name := entry.Name()
 		if entry.IsDir() || !strings.HasPrefix(name, "requests-") || !strings.HasSuffix(name, ".jsonl") {
 			continue
 		}
-		rows, err := readFile(filepath.Join(w.cfg.Dir, name), filter)
-		if err != nil {
-			return out, err
+		day, idx := parseArchiveName(name)
+		files = append(files, archFile{name: name, day: day, idx: idx})
+	}
+	sort.Slice(files, func(i, j int) bool {
+		if files[i].day != files[j].day {
+			return files[i].day > files[j].day // 日期倒序：新的在前
 		}
-		out = append(out, rows...)
+		return files[i].idx > files[j].idx // 同日序号倒序：轮转更晚的在前
+	})
+	out := make([]string, len(files))
+	for i, f := range files {
+		out[i] = f.name
 	}
-	// 契约：按事件时间倒序返回最近 limit 条（同一时刻用 Stable 保留落盘先后）。
-	sort.SliceStable(out, func(i, j int) bool { return out[i].Time.After(out[j].Time) })
-	if len(out) > limit {
-		out = out[:limit]
+	return out
+}
+
+// parseArchiveName 从 requests-<day>.jsonl / requests-<day>.N.jsonl 解析出日期与
+// 轮转序号。解析失败时返回 (name, 0)，保证文件仍被读到（只是排序位置靠后）。
+func parseArchiveName(name string) (day string, idx int) {
+	base := strings.TrimPrefix(name, "requests-")
+	base = strings.TrimSuffix(base, ".jsonl")
+	if i := strings.LastIndex(base, "."); i >= 0 {
+		if n, err := strconv.Atoi(base[i+1:]); err == nil {
+			return base[:i], n
+		}
 	}
-	return out, nil
+	return base, 0
+}
+
+// sortArchiveNewestFirst 按事件时间倒序排序（同一时刻 Stable 保留落盘先后）。
+func sortArchiveNewestFirst(events []Event) {
+	sort.SliceStable(events, func(i, j int) bool { return events[i].Time.After(events[j].Time) })
 }
 
 func readFile(path string, filter Filter) ([]Event, error) {

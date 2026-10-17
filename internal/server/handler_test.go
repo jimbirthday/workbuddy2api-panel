@@ -315,6 +315,64 @@ func TestChatStreamRoleOnlyNotFakeSuccess(t *testing.T) {
 	}
 }
 
+// TestChatStreamEmptyRecordsUsageFailure 空流必须按失败计入 usage：复用 role-only
+// 空回答形态，断言 usage 的请求数增加而成功数不增加。此前流式成功标志在空流分支
+// 仍是 true，导致面板「成功请求」把上游缺陷算成健康。
+func TestChatStreamEmptyRecordsUsageFailure(t *testing.T) {
+	const roleOnly = "data: {\"id\":\"x\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\ndata: [DONE]\n\n"
+	up := newFakeUpstream(t, func(string) (int, string, bool) {
+		return 200, roleOnly, true
+	})
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	usageRec := usage.New("")
+	h := NewHandler(Config{Pool: p, Upstream: up, Usage: usageRec})
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[{"role":"user","content":"hi"}]}`)))
+	totals := usageRec.Snapshot(0, nil).Totals
+	if totals.Requests != 1 || totals.Errors != 1 {
+		t.Fatalf("empty stream usage totals=%+v want requests=1 errors=1", totals)
+	}
+}
+
+// TestChatStreamClientGoneUsageNotFailed 客户端主动断连（写侧失败）不罚账号：
+// 这一跳可能已收到完整上游回答，usage 事件应是成功或至少不是账号失败（Errors=0），
+// 避免「用户点停止」把健康号的成功率打下去。
+func TestChatStreamClientGoneUsageNotFailed(t *testing.T) {
+	up := newFakeUpstream(t, func(string) (int, string, bool) { return 200, sseOK, true })
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	usageRec := usage.New("")
+	h := NewHandler(Config{Pool: p, Upstream: up, Usage: usageRec})
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	ctx, cancel := context.WithCancel(req.Context())
+	cancel()
+	h.ServeHTTP(httptest.NewRecorder(), req.WithContext(ctx))
+	totals := usageRec.Snapshot(0, nil).Totals
+	if totals.Requests != 1 || totals.Errors != 0 {
+		t.Fatalf("client-gone usage totals=%+v want requests=1 errors=0", totals)
+	}
+}
+
+// TestChatStreamHalfErrorFrameRecordsUsageFailure 正文之后才出现 error 帧：
+// StreamHint 返回 nil（字节已透传），但 usage 必须把这次尝试记成失败；否则
+// 「正文+错误收尾」的坏流会在面板上伪装成成功。
+func TestChatStreamHalfErrorFrameRecordsUsageFailure(t *testing.T) {
+	const halfErr = "data: {\"id\":\"x\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n" +
+		"data: {\"error\":{\"code\":6004,\"message\":\"model rate limit\"}}\n\ndata: [DONE]\n\n"
+	up := newFakeUpstream(t, func(string) (int, string, bool) {
+		return 200, halfErr, true
+	})
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	usageRec := usage.New("")
+	h := NewHandler(Config{Pool: p, Upstream: up, Usage: usageRec})
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[{"role":"user","content":"hi"}]}`)))
+	totals := usageRec.Snapshot(0, nil).Totals
+	if totals.Requests != 1 || totals.Errors != 1 {
+		t.Fatalf("half error stream usage totals=%+v want requests=1 errors=1", totals)
+	}
+}
+
 func TestChatRecordsCreditForStreamAndSync(t *testing.T) {
 	const sseCredit = "data: {\"id\":\"chatcmpl-credit\",\"object\":\"chat.completion.chunk\",\"created\":1753600000,\"model\":\"glm-5.2\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"ok\"}}],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":6,\"total_tokens\":10,\"credit\":1.25}}\n\n" +
 		"data: [DONE]\n\n"
@@ -2207,6 +2265,40 @@ func TestChatStreamUpstreamReadErrorNotSuccess(t *testing.T) {
 	st, _ := p.Status("u1")
 	if st.SuccessCount != 0 {
 		t.Fatalf("upstream read error must not be recorded as success: success_count=%d", st.SuccessCount)
+	}
+}
+
+// TestChatStreamUpstreamReadErrorAfterClientGoneUsageNotFailed 上游读失败与客户端
+// 断连同时发生时，账号不罚、usage 也不记错误：人已走，这次截断不能算上游协议失败。
+// 缺少这条时「用户点停止」会以 StreamReadError 收场并把 Errors 抬高。
+func TestChatStreamUpstreamReadErrorAfterClientGoneUsageNotFailed(t *testing.T) {
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: 200,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body: io.NopCloser(&errReader{
+					data: []byte("data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n"),
+				}),
+			}, nil
+		})},
+		ChatBaseCN: "https://fake.example",
+	}
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	usageRec := usage.New("")
+	h := NewHandler(Config{Pool: p, Upstream: up, Usage: usageRec})
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	ctx, cancel := context.WithCancel(req.Context())
+	cancel()
+	h.ServeHTTP(httptest.NewRecorder(), req.WithContext(ctx))
+	totals := usageRec.Snapshot(0, nil).Totals
+	if totals.Requests != 1 || totals.Errors != 0 {
+		t.Fatalf("client-gone read error usage totals=%+v want requests=1 errors=0", totals)
+	}
+	st, _ := p.Status("u1")
+	if st.ConsecutiveFails != 0 {
+		t.Fatalf("client-gone read error must not accumulate failures: consecutive_fails=%d", st.ConsecutiveFails)
 	}
 }
 

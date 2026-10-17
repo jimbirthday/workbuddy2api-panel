@@ -132,8 +132,13 @@ type Recorder struct {
 	succeeded   int64
 	httpSuccess int64
 	durationSum int64
-	recent      []Event
-	archive     *archiveWriter
+	// recent 是最近事件的环形缓冲：recentHead 指向下一写入位，recentLen 为有效条数。
+	// 旧实现每请求 append([]Event{e}, r.recent...) 复制最多 100 条 Event（含字符串头），
+	// 在请求热路径上是无谓的 O(100) 分配；环形写入为 O(1)，只在 Snapshot 时按时间倒序展开。
+	recent     []Event
+	recentHead int
+	recentLen  int
+	archive    *archiveWriter
 }
 
 // New 创建记录器；Dir 为空或 Enabled=false 时只启用内存指标。
@@ -144,7 +149,7 @@ func New(cfg Config) *Recorder {
 	if cfg.QueueSize <= 0 {
 		cfg.QueueSize = defaultQueue
 	}
-	r := &Recorder{started: time.Now(), recent: make([]Event, 0, recentLimit)}
+	r := &Recorder{started: time.Now(), recent: make([]Event, recentLimit)}
 	r.archive = newArchiveWriter(cfg)
 	return r
 }
@@ -186,10 +191,17 @@ func (r *Recorder) Record(e Event) {
 		r.httpSuccess++
 	}
 	r.durationSum += e.DurationMs
-	r.recent = append([]Event{e}, r.recent...)
-	if len(r.recent) > recentLimit {
-		r.recent = r.recent[:recentLimit]
+	// 导出类型允许零值 Recorder（旧实现靠 append 自动分配）；环形缓冲必须在锁内
+	// 懒初始化，否则 `var r Recorder; r.Record(...)` 会在空切片上越界 panic。
+	if len(r.recent) != recentLimit {
+		r.recent = make([]Event, recentLimit)
+		r.recentHead, r.recentLen = 0, 0
 	}
+	if r.recentLen < recentLimit {
+		r.recentLen++
+	}
+	r.recent[r.recentHead] = e
+	r.recentHead = (r.recentHead + 1) % recentLimit
 	r.mu.Unlock()
 	if r.archive != nil {
 		r.archive.enqueue(e)
@@ -207,7 +219,7 @@ func (r *Recorder) Snapshot() Snapshot {
 		Completed: r.completed,
 		InFlight:  r.inFlight,
 		Succeeded: r.succeeded,
-		Recent:    append([]Event(nil), r.recent...),
+		Recent:    r.recentSnapshotLocked(),
 	}
 	if r.completed > 0 {
 		s.Failed = r.completed - r.succeeded
@@ -220,6 +232,21 @@ func (r *Recorder) Snapshot() Snapshot {
 		s.Archive = r.archive.stats()
 	}
 	return s
+}
+
+// recentSnapshotLocked 把环形缓冲展开成「最新在前」的切片。调用方必须已持 r.mu。
+// 条数达到 recentLimit 后 head 指向最旧一条；未满时从 0 开始。
+func (r *Recorder) recentSnapshotLocked() []Event {
+	if r.recentLen == 0 {
+		return nil
+	}
+	out := make([]Event, r.recentLen)
+	start := (r.recentHead - r.recentLen + recentLimit) % recentLimit
+	for i := 0; i < r.recentLen; i++ {
+		// 环形起点是最旧、顺时针到 head-1 是次新；倒序写入即最新在前。
+		out[i] = r.recent[(start+r.recentLen-1-i+recentLimit)%recentLimit]
+	}
+	return out
 }
 
 // ReadArchive 返回最近的归档事件（按时间倒序）。limit<=0 时回落 200，最大 1000。
@@ -613,10 +640,11 @@ func readFile(path string, filter Filter) ([]Event, error) {
 	defer f.Close()
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 64<<10), 1<<20)
+	filter = filter.normalized()
 	var out []Event
 	for scanner.Scan() {
 		var e Event
-		if json.Unmarshal(scanner.Bytes(), &e) != nil || !filter.match(e) {
+		if json.Unmarshal(scanner.Bytes(), &e) != nil || !filter.matchNormalized(e) {
 			continue
 		}
 		out = append(out, e)
@@ -628,16 +656,42 @@ func (f Filter) match(e Event) bool {
 	if f.Outcome != "" && e.Outcome != f.Outcome {
 		return false
 	}
-	if !containsFold(e.Account, f.Account) {
+	return f.normalized().matchNormalized(e)
+}
+
+// normalized 返回把字符串 needle 预先转小写的副本。readFile 对每个文件只算一次，
+// 避免每一行、每个字段都重复 ToLower（归档大/过滤条件多时是明显的 CPU 放大）。
+func (f Filter) normalized() Filter {
+	f.Account = strings.ToLower(f.Account)
+	f.Model = strings.ToLower(f.Model)
+	f.ClientIP = strings.ToLower(f.ClientIP)
+	f.UserAgent = strings.ToLower(f.UserAgent)
+	return f
+}
+
+// containsFoldLower 与 containsFold 同义，但 needle 已是小写，省一次 ToLower。
+func containsFoldLower(haystack, needleLower string) bool {
+	if needleLower == "" {
+		return true
+	}
+	return strings.Contains(strings.ToLower(haystack), needleLower)
+}
+
+// matchNormalized 与 match 同义，但要求 f 已经 normalized() 预处理。
+func (f Filter) matchNormalized(e Event) bool {
+	if f.Outcome != "" && e.Outcome != f.Outcome {
 		return false
 	}
-	if !containsFold(e.Model, f.Model) {
+	if !containsFoldLower(e.Account, f.Account) {
 		return false
 	}
-	if !containsFold(e.ClientIP, f.ClientIP) {
+	if !containsFoldLower(e.Model, f.Model) {
 		return false
 	}
-	if !containsFold(e.UserAgent, f.UserAgent) {
+	if !containsFoldLower(e.ClientIP, f.ClientIP) {
+		return false
+	}
+	if !containsFoldLower(e.UserAgent, f.UserAgent) {
 		return false
 	}
 	if !f.From.IsZero() && e.Time.Before(f.From) {
@@ -647,14 +701,6 @@ func (f Filter) match(e Event) bool {
 		return false
 	}
 	return true
-}
-
-// containsFold 大小写不敏感的子串匹配；needle 为空视为命中（不筛该字段）。
-func containsFold(haystack, needle string) bool {
-	if needle == "" {
-		return true
-	}
-	return strings.Contains(strings.ToLower(haystack), strings.ToLower(needle))
 }
 
 func (w *archiveWriter) stats() ArchiveStats {

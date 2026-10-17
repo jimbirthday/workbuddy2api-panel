@@ -3,6 +3,7 @@
 package pool
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -309,10 +310,78 @@ func (p *Pool) saveSnapshot(sf stateFile, seq uint64) {
 	if store == nil {
 		return
 	}
-	snapRaw, err := json.Marshal(snapshot{stateFile: sf, SavedAt: time.Now()})
+	snapRaw, err := snapshotFromStateJSON(raw, time.Now())
 	if err == nil {
 		store.SaveState(snapRaw)
 	}
+}
+
+// snapshotFromStateJSON 由已序列化的 state.json 原文构造 Redis 快照：
+//
+//	{"accounts":{...}} → {"accounts":{...},"saved_at":"..."}
+//
+// 旧实现先 MarshalIndent 写本地文件、再对同一 stateFile 做整份 Marshal 镜像 Redis，
+// 同一份 470 账号状态被 JSON 编码两遍（实测 46 账号即多 ~56µs / ~48KB 分配）。
+// 这里复用第一份字节、只补一个顶层 saved_at 字段；输出仍是合法 JSON，且字段
+// （accounts 在前、saved_at 在后）与旧 snapshot 结构一致，RestoreFromSnapshot 的
+// 解析路径无需改动。若 raw 不是预期的对象形态（理论上不会发生），回退到完整
+// Marshal，绝不让镜像写出一份不可恢复的快照。
+func snapshotFromStateJSON(raw []byte, savedAt time.Time) (json.RawMessage, error) {
+	trimmed := compactJSON(raw)
+	if len(trimmed) >= 2 && trimmed[0] == '{' && trimmed[len(trimmed)-1] == '}' {
+		saved, err := json.Marshal(snapshotSavedAt{Time: savedAt})
+		if err != nil {
+			return nil, err
+		}
+		out := make([]byte, 0, len(trimmed)+1+len(saved))
+		out = append(out, trimmed[:len(trimmed)-1]...)
+		body := bytes.TrimSpace(trimmed[1 : len(trimmed)-1])
+		if len(body) > 0 {
+			out = append(out, ',')
+		}
+		out = append(out, saved[1:]...)
+		return out, nil
+	}
+	var sf stateFile
+	if err := json.Unmarshal(raw, &sf); err != nil {
+		return nil, err
+	}
+	return json.Marshal(snapshot{stateFile: sf, SavedAt: savedAt})
+}
+
+// compactJSON 去掉 JSON 字符串外的空白，输出紧凑 JSON。只做一遍线性扫描，
+// 保留字符串内的空白（含转义引号），比 json.Compact 少一次 bytes.Buffer 的增长。
+func compactJSON(raw []byte) []byte {
+	out := make([]byte, 0, len(raw)/2)
+	inString, escaped := false, false
+	for _, c := range raw {
+		if inString {
+			out = append(out, c)
+			if escaped {
+				escaped = false
+			} else if c == '\\' {
+				escaped = true
+			} else if c == '"' {
+				inString = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inString = true
+			out = append(out, c)
+		case ' ', '\n', '\r', '\t':
+			// 结构空白：丢弃
+		default:
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// snapshotSavedAt 只用于给已编码的 state.json 追加 "saved_at" 字段。
+type snapshotSavedAt struct {
+	Time time.Time `json:"saved_at"`
 }
 
 // writeStateAtomic 原子落盘：临时文件写入 + fsync + rename + 目录 fsync。

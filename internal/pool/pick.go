@@ -272,7 +272,9 @@ func (p *Pool) pickLocked(tried map[string]bool, reqModel, realm string) (*auth.
 // 只会偏低不会偏高（官方对账延迟方向安全），正是保底需要的安全方向。
 // 调用方必须已持有 p.mu（读 e.credits / e.modelCost / p.modelRateOf）。
 // floorBlockedForRealmModel 同上，但带 realm 上下文（倍率按 (realm, 模型) 分桶，
-// 同名模型在 CN / global 两域倍率可不同）。realm 为空时按倍率表的空域键查。
+// 同名模型在 CN / global 两域倍率可不同）。realm 为空表示调用方未限定域（结果会
+// 混入两域账号）：此时不能只查空域键（上游会把空域归一成 cn），否则 global 触底号
+// 会绕过保底。两个桶分别判定，只有都明确免费/未知才放行；任一边收费即拦。
 func (p *Pool) floorBlockedForRealmModel(e *entry, model, realm string, now time.Time) bool {
 	if p.creditFloor <= 0 || model == "" || e.credits >= p.creditFloor {
 		return false
@@ -285,7 +287,24 @@ func (p *Pool) floorBlockedForRealmModel(e *entry, model, realm string, now time
 	if p.modelRateOf == nil {
 		return false
 	}
-	rate := p.modelRateOf(realm, model)
+	if realm == "" {
+		return p.paidRateForAnyRealm(model, "cn", "global")
+	}
+	return p.isPaidRate(p.modelRateOf(realm, model))
+}
+
+// paidRateForAnyRealm 对多个域查同一模型倍率：任一域收费即视为收费。
+// 空域/未知倍率仍按「无法判收费 → 放行」处理，与单域判定一致。
+func (p *Pool) paidRateForAnyRealm(model string, realms ...string) bool {
+	for _, r := range realms {
+		if p.isPaidRate(p.modelRateOf(r, model)) {
+			return true
+		}
+	}
+	return false
+}
+
+func (p *Pool) isPaidRate(rate string) bool {
 	if rate == "" {
 		return false // 目录未覆盖：未知，放行（见上方注释）
 	}

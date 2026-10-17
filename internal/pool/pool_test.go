@@ -1,6 +1,7 @@
 package pool
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"math/rand/v2"
@@ -1591,6 +1592,77 @@ func TestSaveMirrorsSnapshot(t *testing.T) {
 	}
 	if !strings.Contains(raw, `"credits":42`) {
 		t.Fatalf("snapshot should carry account state: %s", raw)
+	}
+}
+
+// TestSnapshotFromStateJSONRoundTrip 复用 state.json 字节构造的 Redis 快照必须是
+// 紧凑合法 JSON，且 accounts 与 saved_at 都能被恢复路径解析；同时覆盖空账号表。
+func TestSnapshotFromStateJSONRoundTrip(t *testing.T) {
+	sf := stateFile{Accounts: map[string]stateAccount{
+		"u1": {Credits: 42, TokenUsage: TokenUsage{RequestCount: 3}},
+	}}
+	raw, err := json.MarshalIndent(sf, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := time.Date(2026, 10, 17, 12, 0, 0, 0, time.UTC)
+	snapRaw, err := snapshotFromStateJSON(raw, at)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(snapRaw, []byte("\n")) {
+		t.Fatalf("redis snapshot should be compact: %s", snapRaw)
+	}
+	var got snapshot
+	if err := json.Unmarshal(snapRaw, &got); err != nil {
+		t.Fatalf("snapshot unmarshal: %v: %s", err, snapRaw)
+	}
+	if !got.SavedAt.Equal(at) || got.Accounts["u1"].Credits != 42 {
+		t.Fatalf("snapshot round-trip = %+v", got)
+	}
+	empty, err := json.Marshal(stateFile{Accounts: map[string]stateAccount{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := snapshotFromStateJSON(empty, at); err != nil {
+		t.Fatalf("empty accounts snapshot: %v", err)
+	}
+}
+
+// TestSnapshotFromStateJSONPreservesStringWhitespace 快照复用 state.json 字节时，
+// compactJSON 只应裁掉结构空白，绝不能改动字符串内容。字符串里的空格、制表符、
+// 换行、引号和反斜杠都必须原样往返；否则账号原因、UID 等运维信息会被静默改写。
+func TestSnapshotFromStateJSONPreservesStringWhitespace(t *testing.T) {
+	uid := "u \"quoted\"\\\t中文 空格\nnext"
+	reason := "reason with spaces\tand tabs\\backslash\"quote\" 中文空格\nline2"
+	sf := stateFile{Accounts: map[string]stateAccount{
+		uid: {Credits: 7, Reason: reason},
+	}}
+	raw, err := json.MarshalIndent(sf, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := time.Date(2026, 10, 17, 12, 0, 0, 0, time.UTC)
+	snapRaw, err := snapshotFromStateJSON(raw, at)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(snapRaw, []byte("\n")) {
+		t.Fatalf("redis snapshot should be compact: %s", snapRaw)
+	}
+	var got snapshot
+	if err := json.Unmarshal(snapRaw, &got); err != nil {
+		t.Fatalf("snapshot unmarshal: %v: %s", err, snapRaw)
+	}
+	acct, ok := got.Accounts[uid]
+	if !ok {
+		t.Fatalf("account key changed after snapshot: %q in %+v", uid, got.Accounts)
+	}
+	if acct.Reason != reason {
+		t.Fatalf("reason changed after snapshot: got %q want %q", acct.Reason, reason)
+	}
+	if !got.SavedAt.Equal(at) {
+		t.Fatalf("saved_at=%v want %v", got.SavedAt, at)
 	}
 }
 

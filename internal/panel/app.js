@@ -473,14 +473,28 @@ function renderAccounts(list) {
     accCount.textContent = !accAll.length ? '' : (filtered ? '命中 ' + shown.length + ' / ' + accAll.length + ' 个账号' : accAll.length + ' 个账号');
     accCount.className = filtered ? 'note src-off' : 'note';
   }
+  // 5 秒轮询会走到这里。若用户正聚焦在账号表内（按钮/tab/链接），整表 innerHTML
+  // 重建会丢焦点、标题悬停与横向滚动位置；本轮先只更新统计，保留 DOM，等焦点
+  // 移出后再按最新数据重建。accAll 已在上面更新，不会因此显示旧快照。
+  const focusInTable = document.activeElement && typeof tb.contains === 'function' &&
+    tb.contains(document.activeElement);
+  const scrollTop = tb.scrollTop || 0;
+  const scrollLeft = tb.scrollLeft || 0;
+  const restoreScroll = () => {
+    // 重建后恢复滚动位置；部分测试 DOM 桩没有可写 scrollTop，忽略即可。
+    try { tb.scrollTop = scrollTop; tb.scrollLeft = scrollLeft; } catch (e) { /* inert DOM */ }
+  };
   if (!list.length) {
     tb.innerHTML = '<tr><td colspan="9"><div class="empty"><div class="big">账号池是空的</div>点击右上角「添加账号」，用浏览器登录一个 WorkBuddy 账号</div></td></tr>';
+    restoreScroll();
     return;
   }
   if (!shown.length) {
     tb.innerHTML = '<tr><td colspan="9"><div class="empty">没有符合当前筛选条件的账号</div></td></tr>';
+    restoreScroll();
     return;
   }
+  if (focusInTable) return;
   // 有总额度（credits_total）→ 进度条按自身 剩余/总额 百分比；旧数据无总额 → 退回池内最高=100%
   // 企业版不限量（credits_total === -1）的 credits 是 1<<40 量级的哨兵值，若计入会把
   // 池内最高额度抬到 1.1e12，导致所有普通账号的进度条恒为 0%。求 maxCred 时排除它们。
@@ -548,6 +562,7 @@ function renderAccounts(list) {
       '<td class="acts">' + actButtons(s, frozen) +
       '</td></tr>';
   }).join('');
+  restoreScroll();
 }
 
 /* actButtons 渲染单行的动作按钮。在途动作（busyKeys 命中）恢复 disabled 与
@@ -3175,28 +3190,28 @@ function expDaysLeft(dateStr, today) {
 function renderExpiry(d) {
   const list = (d.accounts || []);
   const today = new Date(); today.setHours(0, 0, 0, 0);
-  // 首页只放「7 天内会蒸发」的账号，其余账号（含长期包）折叠成一行汇总。
-  // 逐个账号平铺在 470 个账号时会把首页变成一堵墙，真正需要行动的少数反而被淹没；
-  // 完整逐包明细仍在「积分构成」页，点「实时检查」也能拿到。
+  // 提醒收敛（首页信息密度）：只把 3 天内到期的账号逐行展示，4–7 天合并成一行
+  // 汇总，7 天外与无到期批次折叠成一行。逐个账号平铺在 470 个账号时会把首页变成
+  // 一堵墙，真正需要行动的少数反而被淹没；完整逐包明细仍在「积分构成」页。
   // 后端 /panel/api/packages 按余额降序返回，所以这里仍按最早到期日重排（issue #125）。
-  const urgent = [], failed = [];
+  const urgent = [], soon = [], failed = [];
   let quiet = 0;
   for (const a of list) {
     if (a.error) { failed.push(a); continue; }
     const bs = expBatches(a.packages).filter(b => expDaysLeft(b.date, today) >= 0);
     const week = bs.filter(b => expDaysLeft(b.date, today) <= 7);
     if (!week.length) { quiet++; continue; }
-    urgent.push({ a, first: week[0], week });
+    const item = { a, first: week[0], week, days: expDaysLeft(week[0].date, today) };
+    (item.days <= 3 ? urgent : soon).push(item);
   }
-  urgent.sort((x, y) => (x.first.date < y.first.date ? -1 : x.first.date > y.first.date ? 1 : 0));
+  const byDate = (x, y) => x.first.date < y.first.date ? -1 : x.first.date > y.first.date ? 1 : 0;
+  urgent.sort(byDate); soon.sort(byDate);
   const rows = urgent.map(({ a, first, week }) => {
     const days = expDaysLeft(first.date, today);
     const daily = Math.ceil(first.remain / Math.max(1, days));
     const weekRemain = week.reduce((s, b) => s + b.remain, 0);
-    // 危险度：≤3 天红（不抓紧就真没了）、≤7 天琥珀。
-    // 上游扣包是 FEFO（按失效时刻升序）：快过期批次正是被优先消耗的，
-    // 日均需耗给的是「哪怕单靠这个账号的自然流量也能对齐」的参照。
-    const cls = days <= 3 ? 'var(--bad)' : 'var(--warn)';
+    // 只有 ≤3 天需要红色逐行提醒；4–7 天汇总成一行，避免整页红点。
+    const cls = 'var(--bad)';
     const dayWord = days === 0 ? '今天到期' : days === 1 ? '明天到期' : days + ' 天后到期';
     const more = week.length > 1
       ? '<div class="note">另有 ' + (week.length - 1) + ' 批 · 7 天内合计 ' + fmtTok(weekRemain) + '</div>'
@@ -3207,6 +3222,14 @@ function renderExpiry(d) {
       '）· 该批 <b>' + fmtTok(first.remain) + '</b> 积分 · 到期前日均需耗 ≥<b>' +
       fmtTok(daily) + '</b>' + more + '</span></div>';
   });
+  if (soon.length) {
+    const weekRemain = soon.reduce((s, x) => s + x.week.reduce((a, b) => a + b.remain, 0), 0);
+    const names = soon.slice(0, 3).map(x => x.a.nickname || String(x.a.uid || '').slice(0, 8)).join('、');
+    const detail = soon.map(x => (x.a.nickname || String(x.a.uid || '').slice(0, 8)) + '：' +
+      x.first.date + ' 到期 ' + fmtTok(x.first.remain) + ' 积分').join('；');
+    rows.push(expSummaryRow('var(--warn)', '另有 <b>' + soon.length + '</b> 个账号 4–7 天内到期 · 合计 <b>' +
+      fmtTok(weekRemain) + '</b> 积分', esc(names) + (soon.length > 3 ? ' 等' : ''), detail));
+  }
   if (failed.length) {
     const names = failed.slice(0, 3).map(a => a.nickname || String(a.uid || '').slice(0, 8)).join('、');
     const detail = failed.map(a => (a.nickname || String(a.uid || '').slice(0, 8)) + '：' + a.error).join('；');
@@ -3219,7 +3242,8 @@ function renderExpiry(d) {
   $('expList').innerHTML = rows.join('') || '<div class="empty">没有账号</div>';
   // 数据新鲜度透明化：走缓存时标注年龄，免得把旧数据误当实时。
   const ageMin = lastPackages ? Math.floor((Date.now() - lastPackagesAt) / 60000) : 0;
-  const state = (urgent.length ? urgent.length + ' 个 7 天内有到期' : '7 天内无到期') +
+  const state = (urgent.length ? urgent.length + ' 个 3 天内有到期' : '3 天内无到期') +
+    (soon.length ? ' · ' + soon.length + ' 个 4–7 天内' : '') +
     (failed.length ? ' · ' + failed.length + ' 个查询失败' : '') +
     (lastPackagesAt && ageMin > 0 ? ' · ' + ageMin + ' 分钟前' : '');
   $('expNote').textContent = state;
@@ -3238,7 +3262,7 @@ function renderExpiry(d) {
 function renderExpirySnapshot(d) {
   const list = (d && d.accounts) || [];
   const today = new Date(); today.setHours(0, 0, 0, 0);
-  const urgent = [], failed = [];
+  const urgent = [], soon = [], failed = [];
   let quiet = 0;
   for (const a of list) {
     if (a.error) { failed.push(a); continue; }
@@ -3254,12 +3278,14 @@ function renderExpirySnapshot(d) {
     if (ms <= 0 || remain <= 0) { quiet++; continue; }
     const rawDays = Math.ceil((ms - today.getTime()) / 86400000);
     if (rawDays > 7) { quiet++; continue; }
-    urgent.push({ a, ms, remain, days: Math.max(0, rawDays) });
+    const item = { a, ms, remain, days: Math.max(0, rawDays) };
+    (item.days <= 3 ? urgent : soon).push(item);
   }
   urgent.sort((x, y) => x.ms - y.ms);
+  soon.sort((x, y) => x.ms - y.ms);
   const rows = urgent.map(({ a, ms, remain, days }) => {
     const daily = Math.ceil(remain / Math.max(1, days));
-    const cls = days <= 3 ? 'var(--bad)' : 'var(--warn)';
+    const cls = 'var(--bad)';
     const dayWord = days === 0 ? '今天到期' : days === 1 ? '明天到期' : days + ' 天后到期';
     const when = localDate(ms);
     return '<div class="exp-row"><span class="exp-dot" style="background:' + cls + '"></span>' +
@@ -3268,6 +3294,14 @@ function renderExpirySnapshot(d) {
       '）· 该批 <b>' + fmtTok(remain) + '</b> 积分 · 到期前日均需耗 ≥<b>' +
       fmtTok(daily) + '</b></span></div>';
   });
+  if (soon.length) {
+    const remainSum = soon.reduce((s, x) => s + x.remain, 0);
+    const names = soon.slice(0, 3).map(x => x.a.nickname || String(x.a.uid || '').slice(0, 8)).join('、');
+    const detail = soon.map(x => (x.a.nickname || String(x.a.uid || '').slice(0, 8)) + '：' +
+      localDate(x.ms) + ' 到期 ' + fmtTok(x.remain) + ' 积分').join('；');
+    rows.push(expSummaryRow('var(--warn)', '另有 <b>' + soon.length + '</b> 个账号 4–7 天内到期 · 合计 <b>' +
+      fmtTok(remainSum) + '</b> 积分', esc(names) + (soon.length > 3 ? ' 等' : ''), detail));
+  }
   if (failed.length) {
     const names = failed.slice(0, 3).map(a => a.nickname || String(a.uid || '').slice(0, 8)).join('、');
     const detail = failed.map(a => (a.nickname || String(a.uid || '').slice(0, 8)) + '：' + a.error).join('；');
@@ -3278,7 +3312,8 @@ function renderExpirySnapshot(d) {
     rows.push(expSummaryRow('var(--ok)', '其余 <b>' + quiet + '</b> 个账号 7 天内无到期积分'));
   }
   $('expList').innerHTML = rows.join('') || '<div class="empty">没有账号</div>';
-  $('expNote').textContent = (urgent.length ? urgent.length + ' 个 7 天内有到期' : '7 天内无到期') +
+  $('expNote').textContent = (urgent.length ? urgent.length + ' 个 3 天内有到期' : '3 天内无到期') +
+    (soon.length ? ' · ' + soon.length + ' 个 4–7 天内' : '') +
     (failed.length ? ' · ' + failed.length + ' 个查询失败' : '') + ' · 快照';
   $('expNote').title = '共 ' + list.length + ' 个账号 · 数据来自本地状态；点「实时检查」拉取逐包明细';
   $('expBox').hidden = false;

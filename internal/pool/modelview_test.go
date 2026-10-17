@@ -121,6 +121,29 @@ func TestModelLockViewStarved(t *testing.T) {
 	}
 }
 
+// TestModelLockViewStarvedWhenAccountAndModelCoolingOverlap 同一账号既有账号级
+// 冷却、又有该模型的独立冷却时，不能把它同时算进「健康基数」和「模型锁」：
+// 否则 Servable 会变成负数或误判 locked/partial。另一账号也在账号级冷却，故
+// 此刻仍然没有号能服务，状态必须是 starved。
+func TestModelLockViewStarvedWhenAccountAndModelCoolingOverlap(t *testing.T) {
+	p := lockViewPool(t)
+	p.Cooldown("u1", CoolSoft, time.Hour, "account-wide rate limit")
+	setModelCooldown(p, "u1", "glm-5.3", time.Now().Add(time.Hour), "6004 model rate limit", false)
+	p.Cooldown("u2", CoolHard, time.Hour, "14018 credits exhausted")
+
+	rows := p.ModelLockView()
+	if len(rows) != 1 {
+		t.Fatalf("want 1 row, got %+v", rows)
+	}
+	r := rows[0]
+	if r.Total != 2 || r.Locked != 1 || r.Servable != 0 {
+		t.Errorf("total/locked/servable = %d/%d/%d want 2/1/0", r.Total, r.Locked, r.Servable)
+	}
+	if r.State != "starved" {
+		t.Errorf("state = %q want starved（账号级冷却与模型冷却叠加不得误判 locked/partial）", r.State)
+	}
+}
+
 // TestModelLockViewSkipsAuditOnly AuditOnly 台账只审计不拦路由 → 既不产生行，
 // 也不计入 locked（口径与 modelCooled 一致，否则会把其实能调的模型报成不可用）。
 func TestModelLockViewSkipsAuditOnly(t *testing.T) {

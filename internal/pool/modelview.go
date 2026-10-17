@@ -68,6 +68,11 @@ func (p *Pool) ModelLockView() []ModelLockRow {
 	}
 	rows := make(map[string]*agg)
 	routable := make(map[string]int) // realm → 参与选号的账号数
+	// base 是「账号级健康且未占满」的号数；blocked 是其中被该模型独立冷却挡住的号数。
+	// servable = base - blocked，把原先每个模型行再扫一遍全池的 O(模型数×账号数)
+	// 收成一次账号遍历（每号只遍历自己的模型冷却表）。
+	base := make(map[string]int)    // realm → 账号级健康且未占满的号数
+	blocked := make(map[string]int) // realm+"\x1f"+model → 其中被该模型冷却挡住的号数
 
 	for _, e := range p.byUID {
 		realm := e.a.Realm()
@@ -75,11 +80,18 @@ func (p *Pool) ModelLockView() []ModelLockRow {
 			continue
 		}
 		routable[realm]++
+		healthy := e.healthy(now) && !p.inFlightFull(e)
+		if healthy {
+			base[realm]++
+		}
 		for model, mc := range e.modelCooldowns {
 			if mc.AuditOnly || mc.Until.IsZero() || !now.Before(mc.Until) {
 				continue
 			}
 			key := realm + "\x1f" + model
+			if healthy {
+				blocked[key]++
+			}
 			a := rows[key]
 			if a == nil {
 				a = &agg{}
@@ -103,22 +115,19 @@ func (p *Pool) ModelLockView() []ModelLockRow {
 	for key, a := range rows {
 		sep := strings.IndexByte(key, '\x1f')
 		realm, model := key[:sep], key[sep+1:]
+		servable := base[realm] - blocked[key]
+		if servable < 0 {
+			servable = 0
+		}
 		row := ModelLockRow{
 			Model:         model,
 			Realm:         realm,
 			Total:         routable[realm],
 			Locked:        a.locked,
+			Servable:      servable,
 			UnlockAt:      a.unlockAt,
 			FullyUnlockAt: a.fullyAt,
 			Reason:        a.reason,
-		}
-		for _, e := range p.byUID {
-			if e.a.Realm() != realm {
-				continue
-			}
-			if e.healthyForModel(now, model) && !p.inFlightFull(e) {
-				row.Servable++
-			}
 		}
 		switch {
 		case row.Servable > 0:

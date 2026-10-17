@@ -1012,6 +1012,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				return h.hintContext(bareModel, reqHasImage)
 			}), upstream.WithErrorFrameObserver(func(payload string) { errFrame = payload }),
 				upstream.WithMarkupRepair(repair), upstream.HoldErrorUntilContent())
+			// attemptOK 是本次尝试的协议结果，默认成功，但空流/错误帧/读上游失败都
+			// 必须显式置 false：此前这里无条件传 true，导致错误流也计入 usage 成功数。
+			// 客户端主动断连不算账号失败（人已走），保持 true 与账号健康语义一致。
+			attemptOK := true
 			// 正文写出前的 error 帧：客户端还没看到失败。可换号的限流在此换号，
 			// 不把 429 帧交给用户。不可换号（池子没有别的号，或错误与账号无关）
 			// 则把扣住的帧补写出去，语义与「直接透传」一致。
@@ -1068,6 +1072,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				// 502 观测没有意义）。
 				st.status = http.StatusBadGateway
 				st.outcome = reqlog.OutcomeStreamError
+				attemptOK = false
 				log.Printf("WARN: [server] stream acct=%s model=%s: empty upstream stream (200+0 frames)", logfmt.Label(acct.UID, acct.Nickname), bareModel)
 			case errFrame != "":
 				// 上游以 error 帧报错（6004 限流 / 内容拦截 / 审核）：按帧内容分类并
@@ -1078,6 +1083,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				h.applyErrorPolicy(acct.UID, kind, errFrame, bareModel, nil)
 				st.status = http.StatusServiceUnavailable
 				st.outcome = reqlog.OutcomeStreamError
+				attemptOK = false
 				log.Printf("WARN: [server] stream acct=%s model=%s: upstream error frame kind=%s payload=%s",
 					logfmt.Label(acct.UID, acct.Nickname), bareModel, kind, logfmt.Truncate(errFrame, 200))
 			case upstream.IsStreamReadError(sErr):
@@ -1092,8 +1098,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				// 连败计数会让健康号 5 次后被临时踢出选号池，多号池表现成「可用号越来越少」。
 				st.status = http.StatusBadGateway
 				st.outcome = reqlog.OutcomeStreamError
+				attemptOK = false
 				if r.Context().Err() != nil {
 					st.outcome = reqlog.OutcomeInterrupted
+					// 客户端已断连不是账号失败：与下面的写失败分支一致，usage 不记错误。
+					attemptOK = true
 					log.Printf("INFO: [server] client gone during stream acct=%s: %v (account not penalized)",
 						logfmt.Label(acct.UID, acct.Nickname), sErr)
 				} else {
@@ -1127,7 +1136,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			if hit, miss, ok := stats.CacheTokens(); ok {
 				st.cacheHit, st.cacheMiss, st.hasCache = hit, miss, true
 			}
-			recordAttempt(acct.UID, stats.Usage(), credit, hasCredit, true, attemptStarted, stats.TTFB())
+			recordAttempt(acct.UID, stats.Usage(), credit, hasCredit, attemptOK, attemptStarted, stats.TTFB())
 			// WARN 信号放 recordAttempt 之后：st.promptTokens 此时才是本次的观测值。
 			if st.hasCache {
 				cacheMissWarn.noteCacheTokens(bareModel, st.promptTokens, st.cacheHit, st.cacheMiss)

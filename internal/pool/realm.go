@@ -53,6 +53,11 @@ func (p *Pool) WeightedAvailableUIDsForModelRealm(model, realm string) []string 
 		if !e.healthyForModel(now, model) {
 			continue
 		}
+		// 积分保底必须与 Pick/pickEarliestExpiry 同口径：会话首次分配直接走本列表，
+		// 若不在这里拦，触底号仍会被新会话分到收费模型上，绕过 pick 的保护。
+		if p.floorBlockedForRealmModel(e, model, realm, now) {
+			continue
+		}
 		if p.inFlightFull(e) {
 			continue
 		}
@@ -88,6 +93,9 @@ func (p *Pool) AvailableUIDsForModelRealm(model, realm string) []string {
 			continue
 		}
 		if !e.healthyForModel(now, model) {
+			continue
+		}
+		if p.floorBlockedForRealmModel(e, model, realm, now) {
 			continue
 		}
 		if p.inFlightFull(e) {

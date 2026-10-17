@@ -1202,6 +1202,71 @@ try {
 	}
 }
 
+// TestAppJSRenderAccountsKeepsFocusAndScroll 账号表 5 秒轮询重建时：
+//   - 焦点位于表内 → 本轮不写 innerHTML（避免按钮/tab 焦点丢失）；
+//   - 焦点不在表内 → 重建后恢复 scrollTop/scrollLeft（避免长列表跳回顶部）。
+//
+// 复用真实 app.js；accBody 用带 contains 与可写 scroll 属性的普通对象桩。
+func TestAppJSRenderAccountsKeepsFocusAndScroll(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; renderAccounts focus test skipped")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const inert = new Proxy(function () {}, {
+  get(t, k) { if (k === Symbol.toPrimitive) return () => ''; return inert; },
+  set() { return true; }, apply() { return inert; }, construct() { return inert; },
+});
+const tb = { innerHTML: 'old', scrollTop: 420, scrollLeft: 7, contains: () => false, addEventListener() {} };
+const sandbox = {
+  location: { hash: '#accounts' },
+  history: { replaceState() {} },
+  localStorage: { getItem: () => null, setItem() {} },
+  navigator: { clipboard: { writeText: () => Promise.resolve() } },
+  document: { activeElement: null, querySelectorAll: () => [], querySelector: () => inert, getElementById: id => id === 'accBody' ? tb : inert, addEventListener() {}, documentElement: inert, head: inert, body: inert, createElement: () => inert, cookie: '' },
+  fetch: () => new Promise(() => {}),
+  addEventListener() {}, removeEventListener() {},
+  matchMedia: () => ({ matches: false, addEventListener() {} }),
+  setInterval: () => 0, clearInterval() {}, setTimeout: () => 0, clearTimeout() {},
+  console, JSON, Math, Date, Number, String, Boolean, Object, Array, Promise, Map, Set, RegExp, Error, TypeError, isNaN, parseInt, parseFloat, encodeURIComponent, decodeURIComponent, URL, Symbol, Proxy, Reflect,
+};
+sandbox.window = sandbox; sandbox.globalThis = sandbox;
+vm.createContext(sandbox);
+vm.runInContext(src, sandbox, { filename: 'app.js' });
+const accts = [{ uid: 'u1', nickname: 'n', credits: 5, credits_total: 10, disabled: false, paused: false, cool_remaining_sec: 0 }];
+const out = {};
+sandbox.renderAccounts(accts);
+out.rendered = tb.innerHTML.includes('u1');
+const focused = { inside: true };
+sandbox.document.activeElement = focused;
+tb.contains = el => el === focused;
+const before = tb.innerHTML;
+sandbox.renderAccounts(accts);
+out.focusSkipped = tb.innerHTML === before && tb.scrollTop === 420;
+tb.contains = () => false;
+tb.scrollTop = 420; tb.scrollLeft = 7;
+sandbox.renderAccounts(accts);
+out.scrollRestored = tb.scrollTop === 420 && tb.scrollLeft === 7 && tb.innerHTML.includes('u1');
+process.stdout.write(JSON.stringify(out));`
+	f, err := os.CreateTemp(t.TempDir(), "accfocus-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("renderAccounts focus/scroll test failed: %v\n%s", err, out)
+	}
+	if strings.TrimSpace(string(out)) != `{"rendered":true,"focusSkipped":true,"scrollRestored":true}` {
+		t.Fatalf("renderAccounts focus/scroll state=%s", strings.TrimSpace(string(out)))
+	}
+}
+
 // TestAppJSQueueRunButtonRecovers 队列执行期间按钮保持禁用，轮询终态/异常必须恢复。
 //
 // 复用真实 app.js 与真实 DOM 桩；定时器换成手动 tick，避免等待 3 秒。

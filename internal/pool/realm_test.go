@@ -105,6 +105,58 @@ func TestWeightedAvailableUIDsForModelRealm(t *testing.T) {
 	}
 }
 
+func TestAvailableUIDsHonorsCreditFloor(t *testing.T) {
+	withNoPickGap(t)
+	p := New("")
+	p.SetCostExploreInterval(0)
+	p.SetCreditFloor(100)
+	p.SetModelRateOf(rates(map[string]map[string]string{
+		"global": {"paid-model": "1.62", "free-model": "0.00"},
+	}))
+	near := &auth.Auth{UID: "near"}
+	auth.BackfillRealmFor(near, "global")
+	p.Add(near)
+	p.SetCredits("near", 30, 0)
+
+	if got := p.AvailableUIDsForModelRealm("paid-model", "global"); len(got) != 0 {
+		t.Fatalf("session available list must not contain floor-blocked account: %v", got)
+	}
+	if got := p.WeightedAvailableUIDsForModelRealm("paid-model", "global"); len(got) != 0 {
+		t.Fatalf("weighted session list must not contain floor-blocked account: %v", got)
+	}
+	if got := p.AvailableUIDsForModelRealm("free-model", "global"); len(got) != 1 || got[0] != "near" {
+		t.Fatalf("free model should still be available: %v", got)
+	}
+}
+
+// TestAvailableUIDsHonorsCreditFloorForGlobalWhenRealmEmpty 空 realm 会混入两域
+// 账号，但目录倍率查表会把空域归一成 cn；若只查 cn 桶，global 收费模型会绕过
+// 保底。空域时必须对两域都判定，任一边收费即拦。
+func TestAvailableUIDsHonorsCreditFloorForGlobalWhenRealmEmpty(t *testing.T) {
+	withNoPickGap(t)
+	p := New("")
+	p.SetCostExploreInterval(0)
+	p.SetCreditFloor(100)
+	p.SetModelRateOf(rates(map[string]map[string]string{
+		"cn":     {"shared": "0.00"},
+		"global": {"shared": "1.62", "free-only": "0.00"},
+	}))
+	g := &auth.Auth{UID: "global-near"}
+	auth.BackfillRealmFor(g, "global")
+	p.Add(g)
+	p.SetCredits("global-near", 30, 0)
+
+	if got := p.AvailableUIDsForModelRealm("shared", ""); len(got) != 0 {
+		t.Fatalf("empty realm must check both buckets and block paid global model: %v", got)
+	}
+	if got := p.WeightedAvailableUIDsForModelRealm("shared", ""); len(got) != 0 {
+		t.Fatalf("weighted empty realm must check both buckets: %v", got)
+	}
+	if got := p.AvailableUIDsForModelRealm("free-only", ""); len(got) != 1 || got[0] != "global-near" {
+		t.Fatalf("free in both known buckets should stay available: %v", got)
+	}
+}
+
 func TestPickExcludingForRealm(t *testing.T) {
 	p := realmPool(t)
 	// realm=cn → 只从 cn 集合选。

@@ -3,6 +3,7 @@ package reqlog
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -23,6 +24,50 @@ func TestRecorderMetricsAndRecent(t *testing.T) {
 	}
 	if len(s.Recent) != 2 || s.Recent[0].RequestID != "bad" || s.Recent[1].RequestID != "ok" {
 		t.Fatalf("recent = %+v, want newest first", s.Recent)
+	}
+}
+
+// TestRecorderRecentRingOverwritesOldest recent 必须只保留最近 100 条且最新在前；
+// 满环后第 101 条应覆盖最旧一条，不能丢新事件或倒序错位。
+func TestRecorderRecentRingOverwritesOldest(t *testing.T) {
+	r := New(Config{})
+	for i := 0; i < recentLimit+25; i++ {
+		r.Record(Event{RequestID: "r" + strconv.Itoa(i), Status: 200, OK: true, Outcome: OutcomeSuccess})
+	}
+	got := r.Snapshot().Recent
+	if len(got) != recentLimit {
+		t.Fatalf("recent len=%d want %d", len(got), recentLimit)
+	}
+	if got[0].RequestID != "r"+strconv.Itoa(recentLimit+24) {
+		t.Fatalf("newest=%s want r%d", got[0].RequestID, recentLimit+24)
+	}
+	if got[recentLimit-1].RequestID != "r25" {
+		t.Fatalf("oldest=%s want r25", got[recentLimit-1].RequestID)
+	}
+	for i := 1; i < len(got); i++ {
+		if got[i-1].RequestID == got[i].RequestID {
+			t.Fatalf("duplicate recent entry at %d: %s", i, got[i].RequestID)
+		}
+	}
+}
+
+// TestRecorderZeroValueRecord 零值 Recorder 曾靠 append 自动扩容；改成环形缓冲后
+// 必须保持同样的可用性，不能在空切片上写入 panic。
+func TestRecorderZeroValueRecord(t *testing.T) {
+	var r Recorder
+	r.Record(Event{RequestID: "zero", Status: 200, OK: true, Outcome: OutcomeSuccess})
+	got := r.Snapshot().Recent
+	if len(got) != 1 || got[0].RequestID != "zero" {
+		t.Fatalf("zero-value recorder recent=%+v want one event", got)
+	}
+}
+
+func BenchmarkRecorderRecord(b *testing.B) {
+	r := New(Config{})
+	e := Event{Status: 200, OK: true, Outcome: OutcomeSuccess, DurationMs: 12}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		r.Record(e)
 	}
 }
 

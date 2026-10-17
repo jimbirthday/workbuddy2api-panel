@@ -104,6 +104,7 @@ body {
 .qrow .prog { font-variant-numeric: tabular-nums; color: var(--ink-2); text-align: right; }
 .qrow .st { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
 .qrow .msg { font-size: 12px; color: var(--ink-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.qrow .msg:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; white-space: normal; overflow: visible; text-overflow: clip; }
 .qdot { width: 7px; height: 7px; border-radius: 50%; flex: none; }
 .qdot.done { background: var(--ok); }
 .qdot.run { background: var(--accent); animation: qpulse 1.2s ease-in-out infinite; }
@@ -184,8 +185,15 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
   border: 1px solid var(--line); border-radius: 11px; background: var(--surface);
   overflow: hidden; margin-bottom: 20px; box-shadow: var(--shadow);
 }
-@media (max-width: 980px) { .stats { grid-template-columns: repeat(3, 1fr); } }
-@media (max-width: 560px) { .stats { grid-template-columns: repeat(2, 1fr); } }
+/* 7 个统计项在 4 / 2 列下都会剩单格：让末项跨列补满，避免右侧留白。 */
+@media (max-width: 980px) {
+  .stats { grid-template-columns: repeat(4, 1fr); }
+  .stats .stat:last-child { grid-column: 3 / -1; }
+}
+@media (max-width: 560px) {
+  .stats { grid-template-columns: repeat(2, 1fr); }
+  .stats .stat:last-child { grid-column: 1 / -1; }
+}
 .stat { padding: 14px 17px; border-right: 1px solid var(--line-soft); border-bottom: 1px solid var(--line-soft); }
 .stat .v { font: 600 26px/1.15 var(--mono); font-variant-numeric: tabular-nums; letter-spacing: -.02em; white-space: nowrap; }
 .stat .k { color: var(--ink-3); font-size: 11.5px; margin-top: 5px; }
@@ -332,7 +340,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 .dlg header h3 { font-size: 15px; font-weight: 620; }
 .dlg header .hint { color: var(--ink-3); font-size: 12.5px; margin-top: 5px; }
 .dlg .body { padding: 18px 20px; overflow: auto; }
-.dlg footer { padding: 13px 20px; border-top: 1px solid var(--line-soft); display: flex; gap: 10px; }
+.dlg footer { padding: 13px 20px; border-top: 1px solid var(--line-soft); display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
 .dlg footer .grow { flex: 1; }
 .dlg .tabs { display: inline-flex; gap: 2px; background: var(--surface-2); border-radius: 9px; padding: 3px; margin-left: 10px; vertical-align: middle; }
 .dlg .tabs .tab { padding: 4px 14px; border-radius: 7px; border: none; background: transparent; color: var(--ink-3); font: 550 12.5px var(--sans); cursor: pointer; }
@@ -575,16 +583,25 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 
   /* 用量统计条已改用 .kpis（见「用量视图」段），此处不再保留 .stats.compact 变体。 */
 
-  /* 到期提醒卡片（首页）：每账号一行，色点=危险度，正文数字用 mono 对齐。 */
+  /* 到期提醒卡片（首页）：默认只列 7 天内有到期的账号，其余折叠成一行汇总；
+     色点=危险度，正文数字用 mono 对齐。 */
   .exp-row { display: flex; align-items: flex-start; gap: 10px; padding: 8px 0;
     font-size: 12.5px; }
   .exp-row + .exp-row { border-top: 1px solid var(--line-soft); }
   .exp-dot { width: 9px; height: 9px; border-radius: 50%; margin-top: 4px; flex: none; }
-  .exp-nm { font-weight: 600; flex: none; min-width: 9em; }
-  .exp-main { color: var(--ink-2, inherit); }
+  .exp-nm { font-weight: 600; flex: 0 0 9em; min-width: 0; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap; }
+  .exp-main { color: var(--ink-2, inherit); min-width: 0; overflow-wrap: anywhere; }
   .exp-main b { font-family: var(--mono); font-variant-numeric: tabular-nums; }
   .exp-main .note { margin-top: 2px; font-size: 11px; color: var(--ink-3); }
   .exp-main.err { color: var(--bad); }
+  .exp-sum { color: var(--ink-3); }
+  .exp-sum .exp-main, .exp-sum .exp-main b { color: inherit; }
+  .exp-sum .note { font-size: 11.5px; }
+  @media (max-width: 620px) {
+    .exp-nm { flex-basis: 7em; }
+    .exp-row { gap: 8px; }
+  }
 
 </style>
 </head>
@@ -654,10 +671,11 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
            （数据来自 state.json，不经上游），「检查」按钮改为拉取逐包明细的增强入口。 -->
       <div class="box" id="expBox">
         <header>
-          <h3>积分到期提醒<span class="hint">按最近到期批次估算 · 日均需耗 = 批次剩余 ÷ 距到期天数 · 上游按失效时刻先后自动优先扣减（FEFO）</span></h3>
+          <h3>积分到期提醒<span class="hint" title="上游按失效时刻先后自动优先扣减（FEFO）；日均需耗 = 批次剩余 ÷ 距到期天数">近 7 天</span></h3>
           <span class="grow"></span>
           <span class="note" id="expNote"></span>
-          <button class="xs" id="btnExp">检查</button>
+          <button class="xs ghost" id="btnExpTasks" title="到任务中心查看并执行成长任务">去任务</button>
+          <button class="xs" id="btnExp" title="实时查询每个账号的逐包到期明细">实时检查</button>
         </header>
         <div class="pad"><div id="expList"></div></div>
       </div>
@@ -731,6 +749,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <div class="qprog" id="qProg" hidden>
           <div class="qbar"><i id="qBarFill"></i></div>
           <span class="note" id="qProgText"></span>
+        </div>
+        <div class="hint" id="qcHelp" role="note" style="padding: 10px 16px 0">
+          扫描只读取上游任务，不会执行；执行队列含真实对话，耗时较长。失败原因可悬停或聚焦查看完整内容。
         </div>
         <div class="tc-empty" id="tcEmpty">
           <svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">

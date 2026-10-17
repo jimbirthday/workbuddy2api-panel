@@ -615,7 +615,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// ttfb 首 token 等待（仅流式有观测；非流式传 0 = 无观测，速率不扣减）。
 	// 显式入参而不是读 st.ttfb：后者在流式分支里是**调用之后**才赋值的，
 	// 靠顺序传递会让将来重排代码时静默把速率算回旧的错口径。
-	recordAttempt := func(uid string, delta pool.TokenUsageDelta, credit float64, hasCredit bool, started time.Time, ttfb time.Duration) {
+	recordAttempt := func(uid string, delta pool.TokenUsageDelta, credit float64, hasCredit bool, ok bool, started time.Time, ttfb time.Duration) {
 		st.attempts++
 		if delta.HasPromptTokens {
 			st.promptTokens = delta.PromptTokens
@@ -651,8 +651,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		h.cfg.Pool.RecordTokenUsage(uid, delta)
 
-		// 用量时序记录。ok 以「上游是否给了 usage」判定：空 delta 意味着这次尝试
-		// 没拿到任何 token 统计（传输错误 / >=400 / 解析失败），计为失败尝试。
+		// 用量时序记录。ok 是本次尝试的协议结果，不能以「上游是否给了 usage」代替：
+		// 上游成功但省略 usage 仍是成功，反之错误体里夹带 usage 也不能算成功。
 		// 失败也计入请求数——否则重试放大在「用量」视图里看不见。
 		if h.cfg.Usage != nil {
 			realm := "cn"
@@ -676,7 +676,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				HasLatency:       delta.HasLatencyMs,
 				TokensPerSecond:  delta.TokensPerSecond,
 				HasTPS:           delta.HasTokensPerSecond,
-			}, delta.HasTotalTokens || delta.HasCompletionTokens || delta.HasPromptTokens)
+			}, ok)
 		}
 	}
 
@@ -845,7 +845,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// **客户端仍在但 ctx 被取消**——那只能是我们自己的空闲看门狗掐的流，
 			// 也就是上游停滞。客户端主动断连时 r.Context() 已取消，走下面的抖动分支。
 			if isUpstreamTimeout(terr, r.Context().Err() != nil) {
-				recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
+				recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, false, false, attemptStarted, 0)
 				st.status = http.StatusServiceUnavailable
 				lastErr = fmt.Errorf("%w: %v", errUpstreamTimeout, terr)
 				log.Printf("WARN: [server] upstream timeout acct=%s: %v (rotation stopped, account not penalized)",
@@ -856,7 +856,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 连败兜底（issue #114）：喂连败计数——连不上上游是「不知道原因的失败」，
 			// 连败 N 次临时出池，单次/偶发不罚（NoteFailures 内部达阈才动作）。
 			// 上游 client 已打 transport error 日志。
-			recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
+			recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, false, false, attemptStarted, 0)
 			st.status = http.StatusServiceUnavailable
 			lastErr = terr
 			// 客户端已断连（用户点了「停止生成」/客户端网络抖动）：这是客户端侧的问题，
@@ -876,7 +876,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		if status >= 400 {
-			recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
+			recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, false, false, attemptStarted, 0)
 			st.status = status
 			var kind upstream.ErrKind
 			if uerr != nil {
@@ -1019,7 +1019,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				rc.Close()
 				kind := upstream.FrameKind(held.Payload)
 				h.applyErrorPolicy(acct.UID, kind, held.Payload, bareModel, nil)
-				recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
+				recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, false, false, attemptStarted, 0)
 				fail(acct.UID)
 				// 内容拦截误报（passthrough/append 首遇）：与非流式分支（见 status>=400
 				// 处）同一套降级重试——换 Degraded 中性提示词同请求内重试，避免流式
@@ -1127,7 +1127,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			if hit, miss, ok := stats.CacheTokens(); ok {
 				st.cacheHit, st.cacheMiss, st.hasCache = hit, miss, true
 			}
-			recordAttempt(acct.UID, stats.Usage(), credit, hasCredit, attemptStarted, stats.TTFB())
+			recordAttempt(acct.UID, stats.Usage(), credit, hasCredit, true, attemptStarted, stats.TTFB())
 			// WARN 信号放 recordAttempt 之后：st.promptTokens 此时才是本次的观测值。
 			if st.hasCache {
 				cacheMissWarn.noteCacheTokens(bareModel, st.promptTokens, st.cacheHit, st.cacheMiss)
@@ -1171,7 +1171,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		// 可换号则同样换号重试，与流式的 ErrStreamHeld 分支语义严格对齐。
 		// 此前非流式把 error 帧当有效事件，返回 200 空内容假成功且不处置账号。
 		if payload, isFrame := upstream.IsErrorFrameError(err); isFrame {
-			recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
+			recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, false, false, attemptStarted, 0)
 			kind := upstream.FrameKind(payload)
 			h.applyErrorPolicy(acct.UID, kind, payload, bareModel, nil)
 			releaseHeld()
@@ -1212,7 +1212,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 		if err != nil {
-			recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
+			recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, false, false, attemptStarted, 0)
 			// 上游流解析失败：客户端还没看到任何输出，回 502 并告知原因。
 			writeOpenAIError(w, http.StatusBadGateway, "upstream_parse", err.Error())
 			st.status = http.StatusBadGateway
@@ -1237,7 +1237,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				st.cacheHit, st.cacheMiss, st.hasCache = int64(hit), int64(miss), true
 			}
 		}
-		recordAttempt(acct.UID, usageDeltaFromResponse(resp), credit, hasCredit, attemptStarted, 0)
+		recordAttempt(acct.UID, usageDeltaFromResponse(resp), credit, hasCredit, true, attemptStarted, 0)
 		if st.hasCache {
 			cacheMissWarn.noteCacheTokens(bareModel, st.promptTokens, st.cacheHit, st.cacheMiss)
 		}
@@ -1567,8 +1567,12 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 			return
 		}
 		// 无模型名（model==""）的 6004：无法做模型级路由（RecordModelRateLimitAudit
-		// 要求 model 非空，此处调用必然是空操作，故不再记审计台账），退回账号级有界
-		// 退避避免同一未知请求立刻再打这号。
+		// 要求 model 非空，此处调用必然是空操作，故不记审计台账）。但不能退回账号级
+		// CooldownSoftRate：那会冻结整号，违反「单模型限流不得停整个账号调度」。
+		// 无模型上下文无法做模型级路由，保持账号健康，仅让本次请求透传/换号。
+		if modelRateLimited {
+			return
+		}
 		h.cfg.Pool.CooldownSoftRate(uid, h.softCooldown(), time.Time{}, "429 rate limit")
 	case upstream.ErrWafBlock:
 		// WAF 403（无业务信封拦截形态）。软冷却复用 CooldownSoftRate 家族：基数

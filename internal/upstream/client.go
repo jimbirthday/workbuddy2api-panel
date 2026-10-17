@@ -222,7 +222,6 @@ const softRateResetPatternEN = `(?i)reset at (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2
 // 分类、每个限流 body 上调用，函数体内 MustCompile 是纯浪费；错误风暴（429
 // 轰炸）时尤甚。模式串均为纯常量。regexp 并发安全（匹配只读），无需额外锁。
 var (
-	reModelRateLimit  = regexp.MustCompile(`"code"\s*:\s*"?` + modelRateLimitCode + `"?`)
 	reSoftRateResetCN = regexp.MustCompile(softRateResetPatternCN)
 	reSoftRateResetEN = regexp.MustCompile(softRateResetPatternEN)
 )
@@ -233,8 +232,9 @@ const softRateTimeLayout = "2006-01-02 15:04:05"
 // IsModelRateLimit 报告 429 body 是否明确指向模型级限流（业务 code 6004）。
 // 用于区分"账号级软限流"（按账号冷却）与"模型级用量限流"（切模型即可用）。
 func IsModelRateLimit(body string) bool {
-	// `"code":6004` / `"code": 6004` / `"code":"6004"` 均可命中（JSON 空格容差）。
-	return reModelRateLimit.MatchString(body)
+	// 只认错误信封结构里的 code（顶层或嵌套 error/data），避免正常正文里恰好
+	// 出现 `"code":6004` 文本被误判为限流。无法解析的裸 body 不是可信的业务信封。
+	return hasBusinessCode(body, modelRateLimitCode)
 }
 
 // 模型队列信号：共享的是这个模型的上游队列，不是账号配额。同一秒里多个账号打
@@ -376,7 +376,9 @@ func IsModelBlocked(status int, body string) bool {
 
 // hasBusinessCode reports whether a JSON error envelope contains an exact
 // business code in a field named "code". Upstream envelopes vary between
-// top-level and nested error/data objects, so walk the decoded structure.
+// top-level and nested error/data objects. Walk only envelope-shaped keys
+// (error / extError / data), never arbitrary payload trees: a successful
+// response can legitimately echo request data containing a "code" field.
 func hasBusinessCode(body, want string) bool {
 	var root any
 	if err := json.Unmarshal([]byte(body), &root); err != nil {
@@ -389,14 +391,8 @@ func hasBusinessCode(body, want string) bool {
 			if code, ok := node["code"]; ok && strings.TrimSpace(fmt.Sprint(code)) == want {
 				return true
 			}
-			for _, child := range node {
-				if walk(child) {
-					return true
-				}
-			}
-		case []any:
-			for _, child := range node {
-				if walk(child) {
+			for _, key := range []string{"error", "extError", "data"} {
+				if child, ok := node[key]; ok && walk(child) {
 					return true
 				}
 			}

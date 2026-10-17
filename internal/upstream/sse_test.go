@@ -630,6 +630,26 @@ func TestAggregateEmptyStreamCases(t *testing.T) {
 			wantErr: true,
 		},
 		{
+			name:    "空 choices 控制帧加 DONE 不算有效事件",
+			raw:     "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"choices\":[]}\n\ndata: [DONE]\n\n",
+			wantErr: true,
+		},
+		{
+			name:    "只有元信息帧加 DONE 不算有效事件",
+			raw:     "data: {\"id\":\"x\",\"model\":\"m\",\"usage\":{\"total_tokens\":3}}\n\ndata: [DONE]\n\n",
+			wantErr: true,
+		},
+		{
+			name:    "只有 role 首帧加 DONE 不算有效事件",
+			raw:     "data: {\"id\":\"x\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\ndata: [DONE]\n\n",
+			wantErr: true,
+		},
+		{
+			name:    "role 首帧加空收尾仍不算回答",
+			raw:     "data: {\"id\":\"x\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\ndata: {\"id\":\"x\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+			wantErr: true,
+		},
+		{
 			name:    "DONE 后跟垃圾帧不进聚合",
 			raw:     valid[:len(valid)-len("data: [DONE]\n\n")] + "data: [DONE]\n\ndata: {\"junk\":\"should not aggregate\"}\n\n",
 			wantErr: false,
@@ -680,6 +700,17 @@ func TestAggregateEmptyStreamError(t *testing.T) {
 	}
 }
 
+// TestAggregateMetaOnlyNotSuccess 只有元信息（id/model/usage）但没有 choices 的
+// 帧同样不是回答：不能合成 200 空内容，必须按空流报错。
+func TestAggregateMetaOnlyNotSuccess(t *testing.T) {
+	raw := "data: {\"id\":\"x\",\"model\":\"glm-5.2\",\"usage\":{\"prompt_tokens\":1}}\n\ndata: [DONE]\n\n"
+	if resp, err := Aggregate(strings.NewReader(raw)); err == nil {
+		t.Fatalf("meta-only stream must fail, got %#v", resp)
+	} else if !IsEmptyStreamError(err) {
+		t.Fatalf("err=%v want empty-stream", err)
+	}
+}
+
 // TestStreamEmptyFramesCase 覆盖流式空流检测：0 有效帧时写 error 帧（error 字段存活）,
 // 恰好一个 [DONE]，并返回非 nil error。
 func TestStreamEmptyFramesCase(t *testing.T) {
@@ -690,6 +721,9 @@ func TestStreamEmptyFramesCase(t *testing.T) {
 		{"空流", ""},
 		{"只有注释行", ": comment\n\n"},
 		{"只有 DONE", "data: [DONE]\n\n"},
+		{"只有空 choices 控制帧", "data: {\"id\":\"x\",\"choices\":[]}\n\ndata: [DONE]\n\n"},
+		{"只有 role 首帧", "data: {\"id\":\"x\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\ndata: [DONE]\n\n"},
+		{"role 首帧加空收尾", "data: {\"id\":\"x\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\ndata: {\"id\":\"x\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

@@ -17,6 +17,8 @@ import json, os, time, glob, urllib.request, urllib.error
 AUTHS = os.environ.get("WB2A_AUTH_DIR") or os.environ.get("WB2A_AUTHS_DIR") or "/app/auths"
 CHAT_BASE = "https://copilot.tencent.com"   # growth / tasks / buddy / streak / chat
 BILL_BASE = "https://www.codebuddy.cn"      # report / billing
+GLOBAL_CHAT_BASE = "https://www.workbuddy.ai"
+GLOBAL_BILL_BASE = "https://www.workbuddy.ai"
 
 # growth 域常量（travel.go / report.go 与本次实测对齐）
 PATH_LIST_TASKS     = "/v2/activity/growth/tasks"
@@ -55,8 +57,17 @@ def load_auth(uid_or_file: str) -> dict:
     token, uid = a.get("accessToken"), acc.get("uid")
     if not token or not uid:
         raise SystemExit(f"auth file {p} missing accessToken/uid")
+    realm = (a.get("realm") or "").strip().lower()
+    domain = (a.get("domain") or "").strip().lower()
+    if realm != "global" and (domain == "workbuddy.ai" or domain.endswith(".workbuddy.ai")):
+        realm = "global"
+    if realm not in ("cn", "global"):
+        realm = "cn"
     return {"token": token, "domain": a.get("domain") or "",
             "uid": uid, "nick": acc.get("nickname", ""),
+            "realm": realm,
+            "chat_base": GLOBAL_CHAT_BASE if realm == "global" else CHAT_BASE,
+            "billing_base": GLOBAL_BILL_BASE if realm == "global" else BILL_BASE,
             "file": os.path.basename(p)}
 
 
@@ -177,7 +188,7 @@ def report_activity(auth, count=1, gap=1.05, model_id="deepseek-v4-flash",
     """向 {billing}/v2/report 上报 count 条 chat_request_send。
 
     每次间隔 >= gap 秒（默认 1.05，匹配 probe_active.py 的同接口限速口径）。
-    返回 [(status, code), ...] 汇总。
+    返回 [(status, code), ...] 汇总；批量脚本必须把非 200/非 0 结果计入失败。
     """
     out = []
     for i in range(count):
@@ -228,3 +239,8 @@ def chat_completion(auth, model_id="glm-5.2", prompt="hi", max_tokens=32,
         return e.code, t[:200]
     except Exception as e:
         return -1, repr(e)[:200]
+
+
+def report_ok(results) -> bool:
+    """report_activity 结果是否全部成功（HTTP 200 且业务 code==0）。"""
+    return all(st == 200 and code in (0, None) for st, code in results)

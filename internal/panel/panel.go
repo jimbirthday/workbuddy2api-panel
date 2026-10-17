@@ -94,6 +94,11 @@ type Panel struct {
 	// 任务中心执行队列（taskcenter.go）。
 	queueOnce sync.Once
 	q         *queueState
+
+	// 全账号扫描后台状态（taskcenter.go）。异步 + 进度轮询，账号多时前端不再
+	// 长时间无反馈；scanOnce 单飞，重复点击不会把上游请求翻倍。
+	scanOnce sync.Once
+	sc       *scanState
 }
 
 // tryLockAccount 尝试锁定账号的任务执行；已在执行返回 false。
@@ -176,6 +181,7 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/tasks/auto", p.withAuth(p.accountTaskAuto))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/tasks/auto_all", p.withAuth(p.accountTaskAutoAll))
 	p.mux.HandleFunc("POST /panel/api/tasks/scan_all", p.withAuth(p.tasksScanAll))
+	p.mux.HandleFunc("GET /panel/api/tasks/scan_status", p.withAuth(p.tasksScanStatus))
 	p.mux.HandleFunc("POST /panel/api/tasks/run_queue", p.withAuth(p.tasksRunQueue))
 	p.mux.HandleFunc("GET /panel/api/tasks/queue", p.withAuth(p.tasksQueueStatus))
 	p.mux.HandleFunc("GET /panel/api/school/vouchers", p.withAuth(p.schoolVouchers))

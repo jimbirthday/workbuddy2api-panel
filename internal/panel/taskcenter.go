@@ -59,37 +59,160 @@ func growthPending(t upstream.Task) bool {
 	return autoActionFor(t.TaskCode) != nil
 }
 
-// tasksScanAll 扫描全部账号：成长任务（未完成+可自动化，含 mp 口径合并）。
-// 只读操作，并发拉取（账号数个位数）。
+// scanState 全账号扫描的后台任务状态。
+//
+// 为什么改成异步：账号多时（实测 470 号）扫描要 2 分钟左右——470/3×2 次上游
+// 请求，同步 HTTP 在这段时间里没有任何反馈，前端只能显示「扫描中…」，用户会
+// 误以为卡死。改成「启动即返回 + 轮询进度」后，面板能看到已扫/总数与当前账号。
+//
+// 单飞：同一时刻只允许一个扫描。两次点击（或两个人同时点）不应把上游请求
+// 翻倍——实测日志里两次扫描相隔 87 秒同时段执行过。
+type scanState struct {
+	mu      sync.Mutex
+	running bool
+	started time.Time
+	done    int
+	total   int
+	seq     int
+	items   []scanAccountItem
+	pending int
+	errors  int
+	err     string
+}
+
+func (p *Panel) scan() *scanState {
+	p.scanOnce.Do(func() { p.sc = &scanState{} })
+	return p.sc
+}
+
+// tasksScanAll 启动全账号扫描（后台执行，立即返回）。
+// 重复调用不会启动第二轮：running=true 时返回当前进度（started=false）；
+// 空闲时再次调用则开始新一轮（用于用户主动重扫）。
 func (p *Panel) tasksScanAll(w http.ResponseWriter, r *http.Request) {
+	st := p.scan()
+	st.mu.Lock()
+	if st.running {
+		// 已在扫描：返回当前状态，前端据 started=false 继续轮询而不重复发起。
+		snap := scanSnapshotLocked(st)
+		st.mu.Unlock()
+		writeJSON(w, http.StatusOK, snap)
+		return
+	}
+	st.running = true
+	st.started = time.Now()
+	st.done = 0
+	st.total = 0
+	st.items = nil
+	st.pending = 0
+	st.errors = 0
+	st.err = ""
+	st.seq++
+	seq := st.seq
+	st.mu.Unlock()
+
+	go p.runScan(seq)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "started": true, "running": true, "seq": seq,
+	})
+}
+
+// tasksScanStatus 返回扫描进度与（完成后的）结果。前端每 500ms 轮询。
+func (p *Panel) tasksScanStatus(w http.ResponseWriter, r *http.Request) {
+	st := p.scan()
+	st.mu.Lock()
+	snap := scanSnapshotLocked(st)
+	st.mu.Unlock()
+	writeJSON(w, http.StatusOK, snap)
+}
+
+// scanSnapshotLocked 生成可序列化的进度快照。调用方必须持有 st.mu。
+// accounts 只在完成后返回，避免把半成品当结果渲染。
+func scanSnapshotLocked(st *scanState) map[string]any {
+	out := map[string]any{
+		"ok":            true,
+		"started_at":    st.started,
+		"running":       st.running,
+		"done":          st.done,
+		"total":         st.total,
+		"pending_count": st.pending,
+		"error_count":   st.errors,
+		"seq":           st.seq,
+	}
+	if st.err != "" {
+		out["error"] = st.err
+	}
+	if !st.running {
+		out["accounts"] = st.items
+	}
+	return out
+}
+
+// runScan 后台扫描全部账号：成长任务（未完成+可自动化，含 mp 口径合并）。
+// 只读操作；进度按账号完成数累加，供前端轮询展示。
+func (p *Panel) runScan(seq int) {
+	// 扫描跑在后台 goroutine：任何 panic 都必须收尾 running，否则单飞标志永久为
+	// true，按钮会一直显示扫描中且之后再也无法启动新一轮。
+	defer func() {
+		if v := recover(); v != nil {
+			st := p.scan()
+			st.mu.Lock()
+			if st.seq == seq {
+				st.running = false
+				st.err = fmt.Sprintf("扫描异常：%v", v)
+			}
+			st.mu.Unlock()
+			log.Printf("panel: 队列扫描 panic seq=%d: %v", seq, v)
+		}
+	}()
 	states := p.cfg.Pool.List()
+	// 先算分母再起 goroutine：否则 3 个并发槽位可能先完成，前端会短暂看到
+	// done > total（total 还没写），进度条出现回跳/负值。禁用账号不计入。
+	run := 0
+	for _, st := range states {
+		if !st.Disabled {
+			run++
+		}
+	}
+	st := p.scan()
+	st.mu.Lock()
+	if st.seq != seq {
+		st.mu.Unlock()
+		return
+	}
+	st.total = run
+	st.mu.Unlock()
+
 	items := make([]scanAccountItem, len(states))
-	var wg sync.WaitGroup
 	// sem 限制扫描并发（口径与面板其它读接口一致，concurrency=3）：账号多时
 	// 若每账号无上限地开 goroutine，会瞬间打满上游触发风控。
 	sem := make(chan struct{}, 3)
+	var wg sync.WaitGroup
 	for i, st := range states {
 		if st.Disabled {
 			continue
 		}
+		fixedI, fixedUID := i, st.UID
 		wg.Add(1)
-		go func(i int, uid string) {
+		go func() {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			a := p.cfg.Pool.AuthByUID(uid)
+			a := p.cfg.Pool.AuthByUID(fixedUID)
 			if a == nil {
+				p.scanTick(seq, 1)
 				return
 			}
-			it := &items[i]
-			it.UID, it.Nickname = uid, a.Nickname
+			it := &items[fixedI]
+			it.UID, it.Nickname = fixedUID, a.Nickname
 			// D4 门控：global 账号无 CN 成长任务体系，不发起任何上游调用。
 			if a.IsGlobal() {
+				p.scanTick(seq, 1)
 				return
 			}
 			// 企业版门控：同上——企业版无个人成长体系（GET /v2/activity/growth/tasks
 			// 上游 403「growth system is only available for personal users」）。
 			if a.IsEnterprise() {
+				p.scanTick(seq, 1)
 				return
 			}
 			if tasks, err := p.cfg.Upstream.ListTasks(a); err != nil {
@@ -120,9 +243,12 @@ func (p *Panel) tasksScanAll(w http.ResponseWriter, r *http.Request) {
 				// 计入 error_count，不改变既有字段与前端可见的待办结构。
 				it.hasErr = true
 			}
-		}(i, st.UID)
+			p.scanTick(seq, 1)
+		}()
 	}
+
 	wg.Wait()
+
 	pending := 0
 	errorCount := 0
 	for _, it := range items {
@@ -131,10 +257,29 @@ func (p *Panel) tasksScanAll(w http.ResponseWriter, r *http.Request) {
 			errorCount++
 		}
 	}
+	st.mu.Lock()
+	if st.seq != seq {
+		// 期间被新一轮接管（理论上不会发生：单飞）；放弃旧结果，不覆盖新状态。
+		st.mu.Unlock()
+		return
+	}
+	st.items = items
+	st.pending = pending
+	st.errors = errorCount
+	st.running = false
+	st.done = st.total
+	st.mu.Unlock()
 	log.Printf("panel: 队列扫描完成：全部账号待办 %d 项，查询失败 %d 个", pending, errorCount)
-	// error_count 仅新增键：让前端能区分"已全部完成"（pending_count==0 且
-	// error_count==0）与"查询失败"（error_count>0），旧字段名与类型不变。
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "accounts": items, "pending_count": pending, "error_count": errorCount})
+}
+
+// scanTick 累加一个账号的完成数；seq 不匹配（旧扫描）时忽略。
+func (p *Panel) scanTick(seq, n int) {
+	st := p.scan()
+	st.mu.Lock()
+	if st.seq == seq {
+		st.done += n
+	}
+	st.mu.Unlock()
 }
 
 // ---------------------------------------------------------------------------
@@ -147,6 +292,7 @@ type queueItem struct {
 	Nickname string `json:"nickname"`
 	Kind     string `json:"kind"` // growth
 	Code     string `json:"code"`
+	Progress string `json:"progress,omitempty"`
 	Status   string `json:"status"` // pending | running | done | skipped | error
 	Message  string `json:"message,omitempty"`
 }
@@ -224,6 +370,16 @@ func (p *Panel) startGrowthQueue(concurrency int, growth bool) (started bool, to
 
 	// 扫描待办（复用扫描逻辑的拉取部分）。
 	states := p.cfg.Pool.List()
+	// 预扫同样是后台 goroutine：Panic 必须回滚 running，否则队列单飞永久卡住。
+	defer func() {
+		if v := recover(); v != nil {
+			q.mu.Lock()
+			q.running = false
+			q.startedAt = time.Time{}
+			q.mu.Unlock()
+			log.Printf("panel: 队列预扫 panic: %v", v)
+		}
+	}()
 
 	var accts []queueAccount
 	var wg sync.WaitGroup
@@ -292,7 +448,10 @@ func (p *Panel) startGrowthQueue(concurrency int, growth bool) (started bool, to
 	var items []queueItem
 	for _, one := range accts {
 		for _, t := range one.grow {
-			items = append(items, queueItem{UID: one.a.UID, Nickname: one.a.Nickname, Kind: "growth", Code: t.TaskCode, Status: "pending"})
+			items = append(items, queueItem{
+				UID: one.a.UID, Nickname: one.a.Nickname, Kind: "growth", Code: t.TaskCode,
+				Progress: taskProgressText(&t), Status: "pending",
+			})
 		}
 	}
 	if len(items) == 0 {
@@ -332,6 +491,21 @@ func (p *Panel) RunGrowthQueueOnce() {
 func (p *Panel) runQueueItems(accts []queueAccount, items []queueItem, concurrency int) {
 	q := p.queue()
 	defer func() {
+		if v := recover(); v != nil {
+			// 任一账号 worker panic 都不能把进程带崩，也不能让队列永久停在
+			// running=true：标出失败项并释放单飞闸门，面板可继续重试。
+			q.mu.Lock()
+			for i := range q.items {
+				if q.items[i].Status == "pending" || q.items[i].Status == "running" {
+					q.items[i].Status = "error"
+					q.items[i].Message = fmt.Sprintf("执行异常：%v", v)
+				}
+			}
+			q.running = false
+			q.mu.Unlock()
+			log.Printf("panel: 队列执行 panic: %v", v)
+			return
+		}
 		q.mu.Lock()
 		q.running = false
 		q.mu.Unlock()
@@ -344,6 +518,16 @@ func (p *Panel) runQueueItems(accts []queueAccount, items []queueItem, concurren
 		wg.Add(1)
 		go func(one queueAccount) {
 			defer wg.Done()
+			defer func() {
+				if v := recover(); v != nil {
+					log.Printf("panel: 队列账号 worker panic uid=%s: %v", one.a.UID, v)
+					p.queueSet(q, one.a.UID, func(it *queueItem) {
+						if it.Status == "pending" || it.Status == "running" {
+							it.Status, it.Message = "error", fmt.Sprintf("执行异常：%v", v)
+						}
+					})
+				}
+			}()
 			sem <- struct{}{}
 			defer func() { <-sem }()
 			// per-account 互斥：与单任务/一键完成共用一把锁。

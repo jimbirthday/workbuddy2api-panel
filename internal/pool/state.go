@@ -482,7 +482,7 @@ func (p *Pool) ServableForRealm(realm string) bool {
 		// 存在性语义：账号级 healthy，或处于模型级豁免形态（6004 单模型软冷却——
 		// 对触发模型不可用，对其他模型仍可选）。探活无请求模型上下文，取"存在可服务
 		// 模型"与 chat 实际可达性等价（issue #31 探活侧补齐）。
-		if e.healthy(now) || e.modelExempt() {
+		if e.healthy(now) || e.modelExempt(now) {
 			return true
 		}
 	}

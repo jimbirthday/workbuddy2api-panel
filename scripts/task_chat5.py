@@ -35,13 +35,20 @@ def main():
     else:
         prefixes = [a.account]
 
+    failures = 0
     for pre in prefixes:
-        c = tc.load_auth(pre)
+        try:
+            c = tc.load_auth(pre)
+        except Exception as e:
+            print(f"[fail] {pre}: {e}")
+            failures += 1
+            continue
         print(f"== {c['uid'][:8]} ({c['nick']}) ==")
         try:
             st = tc.task_status(c, TASK_CODE)
         except Exception as e:
             print(f"  [skip] list_tasks 失败: {e}")
+            failures += 1
             continue
         if st is None:
             print(f"  [skip] 无 {TASK_CODE} 任务")
@@ -64,12 +71,17 @@ def main():
                   f"(当前 {cur}/{target}，加 --yes 生效)")
             continue
         results = tc.report_activity(c, count=need, gap=a.gap)
+        if not tc.report_ok(results):
+            failures += 1
         # 回读确认
         st2 = tc.task_status(c, TASK_CODE)
         prog2 = (st2.get("progress") or {}) if st2 else {}
         print(f"  report x{need} -> {results}")
         print(f"  回读 {TASK_CODE}: {prog2.get('current', 0)}/{prog2.get('target', target)} "
               f"accept_status={st2.get('accept_status') if st2 else '?'}")
+    if failures:
+        print(f"[!] {failures} 个账号处理失败", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

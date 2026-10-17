@@ -199,6 +199,10 @@ func main() {
 	}
 	files, _ := filepath.Glob(filepath.Join(authDir, "workbuddy-*.json"))
 	sort.Strings(files)
+	if len(files) == 0 {
+		fmt.Fprintf(os.Stderr, "no auth files in %s (set WB2A_AUTH_DIR or place workbuddy-*.json)\n", authDir)
+		os.Exit(1)
+	}
 
 	accounts := make([]accountResult, 0, len(files))
 	for _, f := range files {

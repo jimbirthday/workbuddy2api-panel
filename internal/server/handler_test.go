@@ -231,6 +231,34 @@ func TestChatNonStreamAggregates(t *testing.T) {
 	}
 }
 
+// TestChatNonStreamEmptyChoicesNotFakeSuccess 上游 200 + 只有空 choices 控制帧：
+// 必须返回 502 upstream_parse，不能合成 200 空内容，也不能把这一跳记成成功
+// （否则失败号会被 NoteSuccess 洗白、粘性绑定钉在坏号上）。
+func TestChatNonStreamEmptyChoicesNotFakeSuccess(t *testing.T) {
+	const emptyChoices = "data: {\"id\":\"chatcmpl-empty\",\"object\":\"chat.completion.chunk\",\"choices\":[]}\n\ndata: [DONE]\n\n"
+	up := newFakeUpstream(t, func(string) (int, string, bool) {
+		return 200, emptyChoices, true
+	})
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`)))
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("code=%d body=%s want 502", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "upstream_parse") {
+		t.Fatalf("body=%s want upstream_parse", rec.Body.String())
+	}
+	st, ok := p.Status("u1")
+	if !ok {
+		t.Fatal("account status missing")
+	}
+	if st.SuccessCount != 0 {
+		t.Fatalf("empty choices must not be recorded as success: %+v", st.TokenUsage)
+	}
+}
+
 func TestChatStreamPassthrough(t *testing.T) {
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		return 200, sseOK, true
@@ -262,6 +290,28 @@ func TestChatStreamPassthrough(t *testing.T) {
 	}
 	if st.TokenUsage.LastLatencyMs < 1 || st.TokenUsage.LastTokensPerSecond == nil || *st.TokenUsage.LastTokensPerSecond <= 0 {
 		t.Errorf("latest performance=%+v", st.TokenUsage)
+	}
+}
+
+// TestChatStreamRoleOnlyNotFakeSuccess 上游只发 role 首帧（没有正文/思考/tool_calls）
+// 时不能按成功收尾：流式必须返回空流错误，且账号成功计数保持 0。
+func TestChatStreamRoleOnlyNotFakeSuccess(t *testing.T) {
+	const roleOnly = "data: {\"id\":\"x\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\ndata: [DONE]\n\n"
+	up := newFakeUpstream(t, func(string) (int, string, bool) {
+		return 200, roleOnly, true
+	})
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[{"role":"user","content":"hi"}]}`)))
+	st, _ := p.Status("u1")
+	if st.SuccessCount != 0 {
+		t.Fatalf("role-only stream must not be recorded as success: %+v", st)
+	}
+	// 流式已经提交 200 头；空流以 error 帧告知客户端，不能合成正常回答。
+	if !strings.Contains(rec.Body.String(), "upstream_parse") && !strings.Contains(rec.Body.String(), "empty upstream stream") {
+		t.Fatalf("role-only stream must surface empty-stream error: %s", rec.Body.String())
 	}
 }
 
@@ -2084,9 +2134,9 @@ func TestChatNonStreamModelRateLimitLocksModelOnly(t *testing.T) {
 }
 
 // TestChat6004WithoutModelNameNoBogusAudit 无模型名的 6004（model==""）：
-// RecordModelRateLimitAudit 首行就 `model == "" { return }`，此前的调用恒为空操作、
-// 审计台账永远写不进。删掉该调用后：仍走账号级有界退避（未知请求不得立刻再打这号），
-// 且不得凭空多出一行「限流中」的模型台账（没有模型名就无从展示）。
+// 没有模型名无法做模型级路由，但 6004 语义仍是模型级限流，绝不能退回账号级
+// 冷却把整号冻住（会违反「单模型限流不得停整个账号调度」）。此时既不能记
+// 模型台账（无模型名），也不能写账号级 until。
 func TestChat6004WithoutModelNameNoBogusAudit(t *testing.T) {
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		return 429, `{"code":6004,"msg":"model usage limit exceeded"}`, false
@@ -2102,8 +2152,8 @@ func TestChat6004WithoutModelNameNoBogusAudit(t *testing.T) {
 	if !ok {
 		t.Fatal("account status missing")
 	}
-	if !st.Cooling || st.Until.IsZero() {
-		t.Fatalf("无模型名的 6004 应退回账号级有界退避: %+v", st)
+	if st.Cooling || !st.Until.IsZero() {
+		t.Fatalf("无模型名的 6004 不得冻结整号: %+v", st)
 	}
 	if len(st.RateLimitedModels) != 0 {
 		t.Fatalf("无模型名不得产生模型限额台账行: %+v", st.RateLimitedModels)

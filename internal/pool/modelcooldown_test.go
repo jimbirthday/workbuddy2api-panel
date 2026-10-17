@@ -358,7 +358,7 @@ func TestModelRateLimitAuditDoesNotAffectRouting(t *testing.T) {
 	if e.modelCooled(time.Now(), "glm-5.3") {
 		t.Fatal("AuditOnly 台账不得参与 modelCooled")
 	}
-	if e.modelExempt() {
+	if e.modelExempt(time.Now()) {
 		t.Fatal("仅 AuditOnly 台账不得让账号进入模型豁免形态")
 	}
 
@@ -425,7 +425,7 @@ func TestModelRateLimitAuditPersists(t *testing.T) {
 	if !ok || !mc.AuditOnly {
 		t.Fatalf("audit entry not restored: %+v ok=%v", mc, ok)
 	}
-	if p2.byUID["u1"].modelExempt() {
+	if p2.byUID["u1"].modelExempt(time.Now()) {
 		t.Fatal("restored AuditOnly entry must not create model exemption")
 	}
 }
@@ -510,6 +510,26 @@ func TestServableNowModelCooldownStillServable(t *testing.T) {
 	p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(5*time.Minute), "glm-5.3", "6004")
 	if !p.ServableNow() {
 		t.Fatal("6004 模型冷却不锁账号，ServableNow 应 true")
+	}
+}
+
+// TestServableNowIgnoresExpiredCooldownRecords 曾经写过的截止字段到期后不能继续
+// 把账号排除在探活之外：账号级 until 已过期、仅模型级冷却仍生效时，账号对其他
+// 模型仍可服务，/healthz 必须返回可服务。
+func TestServableNowIgnoresExpiredCooldownRecords(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	now := time.Now()
+	p.mu.Lock()
+	e := p.byUID["u1"]
+	e.until = now.Add(-time.Minute)
+	e.degradeUntil = now.Add(-time.Hour)
+	e.modelCooldowns = map[string]modelCooldown{
+		"glm-5.3": {Until: now.Add(time.Hour), Reason: "6004 model rate limit"},
+	}
+	p.mu.Unlock()
+	if !p.ServableNow() {
+		t.Fatal("过期的账号级截止字段不得掩盖仍生效的模型级豁免")
 	}
 }
 

@@ -348,6 +348,14 @@ def main() -> None:
 
     done = {}
     out_path = Path(args.out)
+    # --out 的父目录必须在开始探测前就存在且可写；否则本次探测跑完数小时，
+    # 写第一行时才失败，结果全部丢失。
+    if not args.dry_run:
+        parent = out_path.parent
+        if parent and not parent.exists():
+            raise SystemExit(f"[!] --out 父目录不存在: {parent}")
+        if parent and not os.access(parent, os.W_OK):
+            raise SystemExit(f"[!] --out 父目录不可写: {parent}")
     if args.resume and out_path.is_file():
         for line in out_path.read_text(encoding="utf-8").splitlines():
             try:

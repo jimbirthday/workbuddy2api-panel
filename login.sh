@@ -17,7 +17,7 @@ set -euo pipefail
 umask 077
 
 cd "$(dirname "$0")"
-AUTH_DIR="./auths"
+AUTH_DIR="${WB2A_AUTH_DIR:-./auths}"
 CONTAINER="workbuddy2api"
 
 mkdir -p "$AUTH_DIR"
@@ -200,11 +200,23 @@ auth = {
     },
 }
 path = os.environ["WB2A_LOGIN_AUTH_FILE"]
-# 显式 0600 落盘（防 umask 未生效/被覆盖）：先以 0600 建文件再写。
-fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-with os.fdopen(fd, "w") as f:
-    json.dump(auth, f, indent=1)
-os.chmod(path, 0o600)
+# 先写同目录临时文件再 rename：进程中断/磁盘写失败不会把原凭证截成空文件。
+# 显式 0600（防 umask 未生效/被覆盖），rename 在同一文件系统内原子替换。
+tmp = path + ".tmp"
+fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+try:
+    with os.fdopen(fd, "w") as f:
+        json.dump(auth, f, indent=1)
+        f.flush()
+        os.fsync(f.fileno())
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+except Exception:
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+    raise
 print(f"已保存（{os.environ['WB2A_LOGIN_ACTION']}）: {os.environ['WB2A_LOGIN_AUTH_FILE']}")
 PYEOF
 

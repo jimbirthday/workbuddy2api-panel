@@ -74,10 +74,14 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 		finishReason  = "stop"
 		usage         map[string]any
 		gotAnyContent bool
-		validEvents   int
-		sawDone       bool // 上游显式发过 data: [DONE]（正常收尾）
-		toolCalls     = map[int]map[string]any{}
-		toolOrder     []int
+		// gotAnswer 累计「本次流出现过客户端可见内容」：role-only/元信息/空收尾帧
+		// 不算回答。只有内容帧才计入 validEvents；finish_reason 仅在该流已经
+		// 出现内容时才作为有效收尾（避免只发 role + stop 也合成 200 空回答）。
+		gotAnswer   bool
+		validEvents int
+		sawDone     bool // 上游显式发过 data: [DONE]（正常收尾）
+		toolCalls   = map[int]map[string]any{}
+		toolOrder   []int
 		// toolSeq 缺 index 的 tool_call 的分配序号源：跨帧延续「最近分配」槽位，
 		// 同帧内递增（见 mergeToolCallsChunk 注释）。
 		toolSeq int
@@ -199,8 +203,17 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 					if frameIsError(chunk) {
 						return nil, &ErrFrame{Payload: payload}
 					}
-					// 有效事件计数：仅 JSON 解析成功的数据帧计入（解析失败沿用静默 continue）。
-					validEvents++
+					// 有效事件计数：只有真正可用的回答/收尾事件才算，不能用「JSON
+					// 解析成功」代替。上游常见 {"choices":[]} 控制帧、纯元信息帧
+					// 可解析但没有回答；若计入，最终会合成 200 空内容并记账成功。
+					hasContent := frameHasUsableChoice(chunk)
+					hasFinish := frameHasFinishReason(chunk)
+					if hasContent || (hasFinish && gotAnswer) {
+						validEvents++
+					}
+					if hasContent {
+						gotAnswer = true
+					}
 					if v, ok := chunk["id"].(string); ok && id == "" {
 						id = v
 					}
@@ -603,6 +616,9 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 	// clientSawContent 一旦为 true，后续 error 帧必须透传：客户端已经在读回答，
 	// 换号会把两个账号的输出拼进同一条流。
 	clientSawContent := false
+	// gotAnswer 跨帧记录本流是否出现过可用回答内容（正文/思考/tool_calls）。
+	// 收尾帧只有在此为 true 时才计入有效帧，避免 role-only + stop 空流假成功。
+	gotAnswer := false
 	// pending 扣住正文之前的帧（role-only 首帧、注释）。限流 error 帧若出现在
 	// 正文之前，这些字节也不能写出去——一写就提交了 200，换号会拼进同一条流。
 	var pending []string
@@ -777,7 +793,7 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 	}
 
 	// writeFrame 把 payload 按规范白名单重建后以 data: 帧写出并 flush。
-	// 仅 JSON 解析成功时计数记为一次有效转发（JSON 解析失败照常降级原样写出，但不计数）。
+	// 只有真正可用的回答/收尾帧才计数（JSON 解析失败照常降级原样写出，但不计数）。
 	writeFrame := func(payload string) (int, error) {
 		var obj map[string]any
 		if json.Unmarshal([]byte(payload), &obj) != nil {
@@ -815,12 +831,22 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 				return 0, werr
 			}
 		}
+		hasContent := frameHasUsableChoice(obj)
+		if hasContent {
+			gotAnswer = true
+		}
+		// 收尾帧只有在已经出现正文/思考/tool_calls 后才算有效；单独的空 finish
+		// 帧与 role-only 首帧不能构成一次回答。
+		usable := hasContent || (frameHasFinishReason(obj) && gotAnswer)
 		for _, ch := range repairFrame(obj) {
 			if werr := writeChunk(ch, payload); werr != nil {
 				return 0, werr
 			}
 		}
-		return 1, nil
+		if usable {
+			return 1, nil
+		}
+		return 0, nil
 	}
 
 	br := bufio.NewReaderSize(r, 64*1024)
@@ -944,6 +970,57 @@ func frameIsError(obj map[string]any) bool {
 	}
 	trimmed := strings.TrimSpace(fmt.Sprint(code))
 	return trimmed != "" && trimmed != "0"
+}
+
+// frameHasUsableChoice 报告帧是否包含真正可用的 choice（正文、思考、
+// tool_calls/function_call）。空 choices、纯元信息/心跳帧、业务信封（无 choices）
+// 不算——它们不能证明上游完成了一次有效回答。
+//
+// role-only 首帧与单独的空收尾帧也不算：上游可能只发 {"delta":{"role":"assistant"}}
+// 或 {"finish_reason":"stop"} 就结束，客户端实际没有任何回答。finish_reason 的
+// 有效性由调用方结合「此前是否见过正文」判定（见 Aggregate/StreamHint）。
+func frameHasUsableChoice(obj map[string]any) bool {
+	if frameIsError(obj) {
+		return false
+	}
+	choices, ok := obj["choices"].([]any)
+	if !ok || len(choices) == 0 {
+		return false
+	}
+	for _, ci := range choices {
+		c, _ := ci.(map[string]any)
+		if c == nil {
+			continue
+		}
+		if delta, ok := c["delta"].(map[string]any); ok && deltaHasUsableSignal(delta) {
+			return true
+		}
+		if msg, ok := c["message"].(map[string]any); ok && deltaHasUsableSignal(msg) {
+			return true
+		}
+	}
+	return false
+}
+
+// deltaHasUsableSignal 是 delta/message 的「有可用内容」判据：正文、思考内容、
+// tool_calls、遗留 function_call。空对象/空串/仅 role 不算。
+func deltaHasUsableSignal(delta map[string]any) bool {
+	return deltaHasClientContent(delta)
+}
+
+// frameHasFinishReason 报告帧是否携带非空 finish_reason（收尾语义）。
+func frameHasFinishReason(obj map[string]any) bool {
+	choices, _ := obj["choices"].([]any)
+	for _, ci := range choices {
+		c, _ := ci.(map[string]any)
+		if c == nil {
+			continue
+		}
+		if fr, ok := c["finish_reason"].(string); ok && fr != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // frameHasClientContent 报告这一帧是否已经是客户端可见的回答。

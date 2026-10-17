@@ -24,6 +24,7 @@ import json, os, sys, time, glob, argparse, urllib.request, urllib.error
 AUTHS = os.environ.get("WB2A_AUTH_DIR") or os.environ.get("WB2A_AUTHS_DIR") or "/app/auths"
 CHAT_BASE = "https://copilot.tencent.com"   # growth / report
 BILL_BASE = "https://www.codebuddy.cn"      # billing / report
+GLOBAL_BASE = "https://www.workbuddy.ai"
 
 def cred(prefix):
     hits = glob.glob(os.path.join(AUTHS, f"workbuddy-{prefix}*.json"))
@@ -39,8 +40,17 @@ def cred(prefix):
     token, uid = a.get("accessToken"), acc.get("uid")
     if not token or not uid:
         raise SystemExit(f"auth file {path} missing accessToken/uid")
+    realm = (a.get("realm") or "").strip().lower()
+    domain = (a.get("domain") or "").strip().lower()
+    if realm != "global" and (domain == "workbuddy.ai" or domain.endswith(".workbuddy.ai")):
+        realm = "global"
+    if realm not in ("cn", "global"):
+        realm = "cn"
     return {"token": token, "domain": a.get("domain") or "",
             "uid": uid, "nick": acc.get("nickname", ""),
+            "realm": realm,
+            "chat_base": GLOBAL_BASE if realm == "global" else CHAT_BASE,
+            "billing_base": GLOBAL_BASE if realm == "global" else BILL_BASE,
             "file": os.path.basename(path)}
 
 def call(c, method, path, body=None, host=CHAT_BASE, timeout=30):

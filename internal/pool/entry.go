@@ -297,13 +297,14 @@ func (e *entry) healthy(now time.Time) bool {
 // 模型级冷却（modelCooldowns 非空），且尚未禁用、未熔断。
 // 此形态下账号仅对限流中的模型不可用，对其他模型仍可选（issue #31）。
 // healthyForModel 与 ServableNow 共用本谓词，保证 chat 选号与探活口径一致。
-// 调用方负责 now 与冷却有效性的判断（本方法只看形态，不看冷却是否已过期）。
-func (e *entry) modelExempt() bool {
-	if e.disabled || e.paused || !e.until.IsZero() || !e.degradeUntil.IsZero() || !e.breakerUntil.IsZero() {
+// now 用于区分「曾经写过、现已到期」的旧字段：只把仍在未来的截止视为阻断，
+// 避免历史冷却记录把账号永久排除在探活之外。
+func (e *entry) modelExempt(now time.Time) bool {
+	if e.disabled || e.paused || now.Before(e.until) || now.Before(e.degradeUntil) || now.Before(e.breakerUntil) {
 		return false
 	}
 	for _, mc := range e.modelCooldowns {
-		if !mc.AuditOnly && !mc.Until.IsZero() {
+		if !mc.AuditOnly && now.Before(mc.Until) {
 			return true
 		}
 	}

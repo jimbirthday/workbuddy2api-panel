@@ -21,6 +21,7 @@ let reqRangeState = null; // 请求记录的时间范围（用量页的见 trang
 //  - accAll/accFilter：账号表最近一次数据 + 搜索/排序条件（前端筛选，零额外请求）。
 let usageSeq = 0;
 let tasksSeq = 0;
+let overviewSeq = 0;
 const busyKeys = new Set();
 let accAll = [];
 let accFilter = { q: '', sort: 'default' };
@@ -77,6 +78,32 @@ function esc(s) {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;');
+}
+// 弹窗焦点管理：打开时记住触发元素，关闭后归还；打开后把焦点送到首个输入/按钮。
+// 键盘用户不再需要在整页 Tab 一圈才能找到弹窗内容。按 veil id 分开记录，
+// 避免鉴权弹窗与业务弹窗交替打开时把焦点还错地方。
+const modalFocusReturn = new Map();
+function showModal(id, focusSel) {
+  const veil = $(id);
+  if (!veil) return;
+  // 同一个弹窗已打开时不再覆盖归还目标：重复调用（如轮询刷新）会让
+  // activeElement 变成弹窗内部元素，关闭后焦点就回不到触发按钮。
+  if (!veil.classList.contains('on') && !modalFocusReturn.has(id)) {
+    modalFocusReturn.set(id, document.activeElement);
+  }
+  veil.classList.add('on');
+  if (focusSel) setTimeout(() => {
+    const el = $(focusSel);
+    if (el && typeof el.focus === 'function' && el.offsetParent !== null) el.focus();
+  }, 60);
+}
+function hideModal(id) {
+  const veil = $(id);
+  if (!veil) return;
+  veil.classList.remove('on');
+  const back = modalFocusReturn.get(id);
+  modalFocusReturn.delete(id);
+  if (back && typeof back.focus === 'function' && (!document.contains || document.contains(back))) back.focus();
 }
 function ago(iso) {
   if (!iso || iso.startsWith('0001-')) return '—';
@@ -332,7 +359,7 @@ function formatRate(rate) {
 }
 
 /* ── 密钥门 ───────────────────────────────────────────────────────── */
-function openKey() { $('keyVeil').classList.add('on'); setTimeout(() => $('keyInput').focus(), 60); }
+function openKey() { showModal('keyVeil', 'keyInput'); }
 $('btnKey').onclick = async () => {
   const v = $('keyInput').value.trim();
   if (!v) return;
@@ -340,7 +367,7 @@ $('btnKey').onclick = async () => {
   try {
     await api('overview');
     $('keyErr').hidden = true;
-    $('keyVeil').classList.remove('on');
+    hideModal('keyVeil');
     start();
   } catch (e) { $('keyErr').hidden = false; }
 };
@@ -370,6 +397,15 @@ function invalidatePackagesCache() {
 
 const TITLES = { accounts: '账号池', usage: '用量', packages: '积分构成', taskscenter: '任务中心', models: '模型与档位', config: '配置', logs: '运行日志' };
 function go(v) {
+  // 离开任务中心时停掉扫描轮询：扫描本身在后端继续，但 500ms 一次的轮询
+  // 没有理由在别的视图里继续跑；回到任务中心会重新接上进度。
+  // 切到任务页时由 reattachScanView 决定是否恢复进度；切到任何别的视图都要
+  // 停表并复位按钮，避免首次初始化或异常路径留下「扫描中…」。
+  if (v !== 'taskscenter') {
+    stopScanPolling();
+    const sb = $('btnScanAll');
+    if (sb) { sb.disabled = false; sb.textContent = '扫描待办'; }
+  }
   view = v;
   document.querySelectorAll('.view').forEach(s => s.hidden = s.id !== 'view-' + v);
   document.querySelectorAll('.nav a').forEach(a => a.classList.toggle('on', a.dataset.view === v));
@@ -578,8 +614,12 @@ function renderModelLocks(rows) {
 }
 
 async function loadOverview(quiet) {
+  const my = ++overviewSeq;
   try {
     const d = await api('overview');
+    // 5 秒轮询、账号动作后的刷新和手动刷新可能并发：晚到的旧响应不得回写
+    // 账号表/统计条，否则页面会整体倒退到上一份快照。
+    if (my !== overviewSeq) return;
     overviewData = d;
     $('sTotal').textContent = d.total;
     $('sHealthy').textContent = d.healthy;
@@ -1292,7 +1332,7 @@ $('cfgForm').onsubmit = async ev => {
 
 /* ── 添加账号 ─────────────────────────────────────────────────────── */
 function openAdd() {
-  $('addVeil').classList.add('on');
+  showModal('addVeil', 'btnStartLogin');
   // 重置到登录标签
   switchAddTab('login');
   $('addPick').hidden = false;
@@ -1350,7 +1390,7 @@ async function pollLogin() {
     $('addErr').textContent = e.message + '（关闭后重新添加）';
   }
 }
-function closeAdd() { stopPoll(); loginState = null; $('addVeil').classList.remove('on'); }
+function closeAdd() { stopPoll(); loginState = null; hideModal('addVeil'); }
 $('btnCloseAdd').onclick = closeAdd;
 $('btnStartLogin').onclick = startAddLogin;
 $('btnOpenUrl').onclick = () => open($('addUrl').textContent, '_blank');
@@ -1452,11 +1492,11 @@ const AUTO_TASKS = {
 function openTasks(uid) {
   taskUID = uid;
   $('taskWho').textContent = uid.slice(0, 16);
-  $('taskVeil').classList.add('on');
+  showModal('taskVeil', 'btnCloseTask');
   $('btnTaskReload').hidden = false;
   loadTasks();
 }
-function closeTasks() { $('taskVeil').classList.remove('on'); taskUID = null; }
+function closeTasks() { hideModal('taskVeil'); taskUID = null; }
 $('btnCloseTask').onclick = closeTasks;
 $('btnTaskReload').onclick = loadTasks;
 
@@ -1790,7 +1830,7 @@ function vcCard(v) {
 
 async function loadSchoolVouchers() {
   const body = $('vcBody');
-  $('vcVeil').classList.add('on');
+  showModal('vcVeil', 'btnVcClose');
   body.innerHTML = '<div class="state"><span class="dots">查询中</span></div>';
   $('vcNote').textContent = '';
   try {
@@ -1829,7 +1869,7 @@ async function loadSchoolVouchers() {
   }
 }
 $('btnSchoolVouchers').onclick = loadSchoolVouchers;
-$('btnVcClose').onclick = () => $('vcVeil').classList.remove('on');
+$('btnVcClose').onclick = () => hideModal('vcVeil');
 
 /* Esc 关闭最上层弹窗（易用性修复 10）。「最上层」= DOM 里最后一个可见的 .veil
    （同一 z-index 下后写者覆盖先写者）。data-lock="1" 的是鉴权网关（keyVeil），
@@ -1844,7 +1884,7 @@ document.addEventListener('keydown', ev => {
   ev.preventDefault();
   if (top.id === 'taskVeil') closeTasks();
   else if (top.id === 'addVeil') closeAdd();
-  else top.classList.remove('on');
+  else hideModal(top.id);
 });
 $('btnVcRefresh').onclick = loadSchoolVouchers;
 
@@ -1853,30 +1893,132 @@ $('btnVcRefresh').onclick = loadSchoolVouchers;
    队列状态覆盖。 */
 let queueTimer = null, lastQueueSeq = 0;
 const GROWTH_TITLES = {}; // code → 展示名（扫描时从任务列表带出）
+// 扫描是后台任务：POST 只负责启动，随后每 500ms 拉 scan_status。
+// 账号多时一次扫描可能 2 分钟（470 号 × 2 个上游接口 / 并发 3），同步请求
+// 期间前端没有任何反馈，用户会以为卡死。进度直接写在按钮上。
+let scanTimer = null;
+// scanPollSeq 给轮询代次：离开任务中心会让在途请求的响应过期；若它晚于
+// reattachScanView 返回，不能把刚恢复的按钮又改回「扫描中…」。
+let scanPollSeq = 0;
+// scanReqSeq 标记当前真正在途的 scan_status 请求代次（0 = 无在途请求）。
+// 用一个独立的请求代次而不是布尔值：旧代请求的 finally 不能清掉新代请求的
+// 在途标记，否则 5 秒刷新会把请求叠加起来。
+let scanReqSeq = 0;
+// lastScanRenderSeq 记录本页已渲染的扫描结果代次：reattach 每 5 秒访问
+// scan_status 时，同一结果只渲染一次，避免滚动位置丢失和重复 toast。
+let lastScanRenderSeq = null;
+function stopScanPolling() {
+  scanPollSeq++;
+  scanReqSeq = 0;
+  if (scanTimer) { clearTimeout(scanTimer); scanTimer = null; }
+}
+function renderScanResult(d) {
+  const groups = groupItems(d);
+  // error_count>0：本次扫描有账号查不到任务（上游超时/风控/mp 列表失败）。
+  // 后端契约（panel/taskcenter.go）：pending_count==0 && error_count==0 才是
+  // 「全部完成」；有查询失败时必须区分——否则把「没查到」显示成「全做完了」，
+  // 用户以为今日无待办、实际是漏扫。
+  const errN = Number(d.error_count || 0);
+  if (!groups.length && errN > 0) {
+    renderQueue([], null, '扫描不完整（' + errN + ' 个账号查询失败）',
+      '这些账号的成长任务没拉到（上游超时/风控等），不代表没有待办。请稍后重新扫描。');
+    toast(errN + ' 个账号的任务查询失败，结果可能不完整', 'err');
+  } else {
+    renderQueue(groups, null, '没有待办任务 🎉', '全部账号的成长任务与开学季活动都已完成，明日再来。');
+    if (errN > 0) toast(errN + ' 个账号的任务查询失败，结果可能不完整', 'err');
+  }
+}
+// startScanPolling 接上一个正在后台执行的扫描（首次点击或离开后回到任务中心）。
+// POST 只负责启动；真正的进度与结果都经 scan_status 拉取。
+function startScanPolling() {
+  const b = $('btnScanAll');
+  if (!b) return;
+  // 已有排队中的轮询链时不要重复开链；在途请求可能是上一代（已 stop），
+  // 允许新代次继续，旧响应会由 scanPollSeq 丢弃。
+  if (scanTimer) return;
+  b.disabled = true; b.textContent = '扫描中…';
+  stopScanPolling();
+  const seq = scanPollSeq;
+  const req = ++scanReqSeq;
+  const poll = async () => {
+    let d;
+    try { d = await api('tasks/scan_status'); }
+    catch (e) {
+      if (seq !== scanPollSeq) return;
+      if (scanTimer) { clearTimeout(scanTimer); scanTimer = null; }
+      b.disabled = false; b.textContent = '扫描待办';
+      toast(e.message, 'err');
+      return;
+    }
+    if (seq !== scanPollSeq) return;
+    if (req !== scanReqSeq) return;
+    if (d.running) {
+      const done = Number(d.done || 0), total = Number(d.total || 0);
+      b.textContent = total ? '扫描中 ' + done + '/' + total : '扫描中…';
+      // setTimeout 链而不是 setInterval：上一次请求没回来就不发下一次，
+      // 避免慢网络下扫描状态请求叠加。
+      if (view === 'taskscenter') scanTimer = setTimeout(poll, 500);
+      else { scanTimer = null; b.disabled = false; b.textContent = '扫描待办'; }
+      return;
+    }
+    stopScanPolling();
+    b.disabled = false; b.textContent = '扫描待办';
+    if (d.error) { toast('扫描失败：' + d.error, 'err'); return; }
+    renderScanResult(d);
+  };
+  scanTimer = setTimeout(poll, 500);
+}
+// reattachScanView 回到任务中心时接回正在跑的扫描；已结束则恢复按钮，
+// 不主动发 scan_all（那会启动一轮新扫描，违背用户只是切页的预期）。
+function reattachScanView() {
+  // scanTimer 代表轮询链已经在续跑；由它自己负责。scanReqSeq 表示已有
+  // scan_status 请求在途（可能是另一个 reattach）——此时拒绝重复请求，避免
+  // 5 秒刷新与用户切页叠加。
+  if (scanTimer || scanReqSeq) return;
+  const seq = scanPollSeq;
+  const req = ++scanReqSeq;
+  (async () => {
+    try {
+      const d = await api('tasks/scan_status');
+      // 请求返回前用户可能已经切走：此时代次可能还没变（go() 已 stop，
+      // 但 await 前还没执行到），必须再校验视图，不能重新起轮询。
+      if (seq !== scanPollSeq || req !== scanReqSeq || view !== 'taskscenter') return;
+      if (d.running) startScanPolling();
+      else {
+        const b = $('btnScanAll');
+        if (b) { b.disabled = false; b.textContent = '扫描待办'; }
+        // 已完成的扫描结果仍保存在后端；切回任务中心应展示它，而不是只剩按钮。
+        // 只渲染有 accounts 的终态，避免把「从未扫描」当成「零待办」。
+        if (Array.isArray(d.accounts) && d.seq !== lastScanRenderSeq) {
+          renderScanResult(d);
+          lastScanRenderSeq = d.seq;
+        }
+      }
+    } catch (e) { /* 静默：轮询/手动点击会再次暴露错误 */ }
+    finally { if (req === scanReqSeq) scanReqSeq = 0; }
+  })();
+}
 $('btnScanAll').onclick = async () => {
   const b = $('btnScanAll');
   // 停掉队列轮询：显式扫描 = 切到待办视图。否则在途队列的下一 tick 会把扫描
   // 结果冲掉重渲染回队列视图（服务端执行不受影响，只是不再实时回写本视图）。
   if (queueTimer) { clearInterval(queueTimer); queueTimer = null; }
+  // 手动扫描是新一轮：先清掉旧轮询/在途标记，避免旧请求返回后覆盖新结果。
+  stopScanPolling();
   b.disabled = true; b.textContent = '扫描中…';
   try {
     const d = await api('tasks/scan_all', { method: 'POST' });
-    const groups = groupItems(d);
-    // error_count>0：本次扫描有账号查不到任务（上游超时/风控/mp 列表失败）。
-    // 后端契约（panel/taskcenter.go）：pending_count==0 && error_count==0 才是
-    // 「全部完成」；有查询失败时必须区分——否则把「没查到」显示成「全做完了」，
-    // 用户以为今日无待办、实际是漏扫。
-    const errN = Number(d.error_count || 0);
-    if (!groups.length && errN > 0) {
-      renderQueue([], null, '扫描不完整（' + errN + ' 个账号查询失败）',
-        '这些账号的成长任务没拉到（上游超时/风控等），不代表没有待办。请稍后重新扫描。');
-      toast(errN + ' 个账号的任务查询失败，结果可能不完整', 'err');
-    } else {
-      renderQueue(groups, null, '没有待办任务 🎉', '全部账号的成长任务与开学季活动都已完成，明日再来。');
-      if (errN > 0) toast(errN + ' 个账号的任务查询失败，结果可能不完整', 'err');
+    if (!d.running) {
+      // 后端判定已在扫描：直接接上现有进度，不重复启动。
+      startScanPolling();
+      return;
     }
-  } catch (e) { toast(e.message, 'err'); }
-  finally { b.disabled = false; b.textContent = '扫描待办'; }
+  } catch (e) {
+    b.disabled = false; b.textContent = '扫描待办';
+    toast(e.message, 'err');
+    return;
+  }
+  startScanPolling();
 };
 $('btnRunQueue').onclick = async () => {
   const conc = Number($('qcConc').value) || 1;
@@ -1890,7 +2032,7 @@ $('btnRunQueue').onclick = async () => {
     toast('队列已启动：' + r.total + ' 项（并发 ' + conc + '）', 'ok');
     startQueuePolling();
   } catch (e) { toast(e.message, 'err'); }
-  finally { b.disabled = false; b.textContent = '执行全部待办'; }
+  finally { if (!queueTimer) setQueueRunBusy(false); }
 };
 // 扫描结果 → 分组条目（无执行状态）
 function groupItems(d) {
@@ -1911,12 +2053,15 @@ function qrowHTML(it) {
   const title = isSchool ? '开学季闭环' : (GROWTH_TITLES[it.code] || it.code);
   const dotCls = it.status === 'scan' ? 'wait' : it.status === 'running' ? 'run' : it.status === 'error' ? 'err' : it.status === 'skipped' ? 'skip' : it.status === 'done' ? 'done' : 'wait';
   const stWord = it.status === 'scan' ? '待执行' : (ST_WORDS[it.status] || it.status);
-  return '<div class="qrow" title="' + esc(it.message || '') + '">' +
+  // 失败原因不能只靠原生 title（触屏无 hover、键盘不可达）：给消息单元格加
+  // tabindex，聚焦后 CSS 展开完整文本，同时保留 title 供鼠标悬停。
+  const msgAttr = it.message ? ' tabindex="0" role="note" title="' + esc(it.message) + '"' : '';
+  return '<div class="qrow">' +
     '<span class="code">' + esc(it.code) + '</span>' +
     '<span class="name"><span class="t">' + esc(title) + '</span>' + (isSchool ? '<span class="tag mute">开学季</span>' : '') + '</span>' +
     '<span class="prog">' + esc(it.prog || '') + '</span>' +
     '<span class="st"><span class="qdot ' + dotCls + '"></span>' + stWord + '</span>' +
-    '<span class="msg">' + esc(it.message || '') + '</span>' +
+    '<span class="msg"' + msgAttr + '>' + esc(it.message || '') + '</span>' +
     '</div>';
 }
 function renderQueue(groups, progress, emptyTitle, emptyDesc) {
@@ -1939,13 +2084,25 @@ function renderQueue(groups, progress, emptyTitle, emptyDesc) {
   $('qcSummary').textContent = total + ' 项';
   updateProgress(progress);
 }
+// setQueueRunBusy 统一维护「执行全部待办」的禁用态。队列是后台任务：
+// 轮询终态、轮询异常、切回页面接管都要能恢复，否则按钮会永久卡在
+// 「执行中…」——账号表 busyKeys 解决过同类问题，这里用同一个思路。
+function setQueueRunBusy(busy) {
+  const b = $('btnRunQueue');
+  if (!b) return;
+  b.disabled = busy;
+  b.textContent = busy ? '执行中…' : '执行全部待办';
+}
 function updateProgress(q) {
   if (!q || !q.items) { $('qProg').hidden = true; return; }
   const total = q.items.length;
-  const done = q.items.filter(it => it.status === 'done' || it.status === 'error' || it.status === 'skipped').length;
+  const ok = q.items.filter(it => it.status === 'done').length;
+  const bad = q.items.filter(it => it.status === 'error' || it.status === 'skipped').length;
+  const finished = ok + bad;
   $('qProg').hidden = false;
-  $('qBarFill').style.width = (total ? Math.round(done / total * 100) : 0) + '%';
-  $('qProgText').textContent = (q.running ? '执行中 ' : '已结束 ') + done + ' / ' + total;
+  $('qBarFill').style.width = (total ? Math.round(finished / total * 100) : 0) + '%';
+  $('qProgText').textContent = (q.running ? '执行中 ' : '已结束 ') +
+    finished + ' / ' + total + (bad ? '（成功 ' + ok + '，失败/跳过 ' + bad + '）' : '');
 }
 // 队列状态 → 分组（执行时轮询）
 function groupsFromQueue(items) {
@@ -1954,7 +2111,7 @@ function groupsFromQueue(items) {
     if (!by.has(it.uid)) by.set(it.uid, { uid: it.uid, nick: it.nickname, rows: [] });
     by.get(it.uid).rows.push({
       kind: it.kind, code: it.code,
-      prog: it.kind === 'school' ? '—' : '',
+      prog: it.progress || '—',
       status: it.status, message: it.message,
     });
   }
@@ -1962,12 +2119,25 @@ function groupsFromQueue(items) {
 }
 function startQueuePolling() {
   if (queueTimer) clearInterval(queueTimer);
+  setQueueRunBusy(true);
   queueTimer = setInterval(async () => {
     let q;
-    try { q = await api('tasks/queue'); } catch (e) { return; }
-    if (!q.started) return;
+    try { q = await api('tasks/queue'); }
+    catch (e) {
+      clearInterval(queueTimer); queueTimer = null;
+      setQueueRunBusy(false);
+      toast('队列状态查询失败：' + e.message, 'err');
+      return;
+    }
+    if (!q.started) { clearInterval(queueTimer); queueTimer = null; setQueueRunBusy(false); return; }
     // 只渲染本页启动过的那轮队列（刷新页面后不再接管旧队列）。
-    if (lastQueueSeq && q.seq !== lastQueueSeq) return;
+    if (lastQueueSeq && q.seq !== lastQueueSeq) {
+      // 别页/上一轮队列接管了状态：停止本轮轮询并恢复按钮，不能留下永不
+      // 停止的 interval（页签切回时会持续叠加请求）。
+      clearInterval(queueTimer); queueTimer = null;
+      setQueueRunBusy(false);
+      return;
+    }
     if (q.running) {
       renderQueue(groupsFromQueue(q.items || []), q);
       return;
@@ -1976,6 +2146,7 @@ function startQueuePolling() {
     // 回写视图——曾把用户刚点开的「扫描待办」结果在下一个 tick 冲掉。
     renderQueue(groupsFromQueue(q.items || []), q);
     clearInterval(queueTimer); queueTimer = null;
+    setQueueRunBusy(false);
     toast('任务队列执行结束', 'ok');
   }, 3000);
 }
@@ -1991,8 +2162,10 @@ function reattachQueueView() {
       const q = await api('tasks/queue');
       if (queueTimer) return; // 轮询已在跑（跨视图不中断）
       if (q.started && q.running && (!lastQueueSeq || q.seq === lastQueueSeq)) startQueuePolling();
+      else setQueueRunBusy(false);
     } catch (e) { /* 静默 */ }
   })();
+  reattachScanView();
 }
 
 /* ── 用量 ─────────────────────────────────────────────────────────── */
@@ -3002,69 +3175,56 @@ function expDaysLeft(dateStr, today) {
 function renderExpiry(d) {
   const list = (d.accounts || []);
   const today = new Date(); today.setHours(0, 0, 0, 0);
-  // 按「最近到期」升序排（issue #125）。
-  //
-  // 后端 /panel/api/packages 是按**余额降序**返回的，恰好把 CN 账号都排在前面、
-  // global 排在末尾，看起来像"按域分组"，其实只是余额顺序。这里再排一次，让
-  // "最快过期的排最前"这个唯一重要的顺序成立，且不分域。
-  //
-  // 排序键用最早到期批次的日期（expBatches 已按日期升序，故 [0] 即最早）。
-  // 查询失败的账号、以及 7 天内无到期的账号没有可比较的到期时间，统一排在最后，
-  // 保持它们原本的相对顺序（稳定排序）。
-  const keyed = list.map(a => {
-    let key = null;
-    if (!a.error) {
-      const bs = expBatches(a.packages).filter(b => expDaysLeft(b.date, today) >= 0);
-      if (bs.length) key = bs[0].date;
-    }
-    return { a, key };
-  });
-  keyed.sort((x, y) => {
-    if (x.key === y.key) return 0;
-    if (x.key === null) return 1;
-    if (y.key === null) return -1;
-    return x.key < y.key ? -1 : 1;
-  });
-  const rows = keyed.map(({ a }) => {
-    if (a.error) {
-      return '<div class="exp-row"><span class="exp-dot" style="background:var(--ink-3)"></span>' +
-        '<span class="exp-nm">' + esc(a.nickname || a.uid.slice(0, 8)) + '</span>' +
-        '<span class="exp-main err">查询失败：' + esc(a.error) + '</span></div>';
-    }
+  // 首页只放「7 天内会蒸发」的账号，其余账号（含长期包）折叠成一行汇总。
+  // 逐个账号平铺在 470 个账号时会把首页变成一堵墙，真正需要行动的少数反而被淹没；
+  // 完整逐包明细仍在「积分构成」页，点「实时检查」也能拿到。
+  // 后端 /panel/api/packages 按余额降序返回，所以这里仍按最早到期日重排（issue #125）。
+  const urgent = [], failed = [];
+  let quiet = 0;
+  for (const a of list) {
+    if (a.error) { failed.push(a); continue; }
     const bs = expBatches(a.packages).filter(b => expDaysLeft(b.date, today) >= 0);
-    if (!bs.length) {
-      return '<div class="exp-row"><span class="exp-dot" style="background:var(--ok)"></span>' +
-        '<span class="exp-nm">' + esc(a.nickname || a.uid.slice(0, 8)) + '</span>' +
-        '<span class="exp-main">7 天内无到期积分</span></div>';
-    }
-    const first = bs[0];
+    const week = bs.filter(b => expDaysLeft(b.date, today) <= 7);
+    if (!week.length) { quiet++; continue; }
+    urgent.push({ a, first: week[0], week });
+  }
+  urgent.sort((x, y) => (x.first.date < y.first.date ? -1 : x.first.date > y.first.date ? 1 : 0));
+  const rows = urgent.map(({ a, first, week }) => {
     const days = expDaysLeft(first.date, today);
     const daily = Math.ceil(first.remain / Math.max(1, days));
-    const week = bs.filter(b => expDaysLeft(b.date, today) <= 7)
-      .reduce((s, b) => s + b.remain, 0);
-    // 危险度：≤3 天红（不抓紧就真没了）、≤7 天琥珀、更远绿。
-    // 上游扣包是 FEFO（按失效时刻升序，实测两号口径一致）：这些快过期批次正是
-    // 被消耗得最快的，日均需耗给的是「哪怕单靠这个账号的自然流量也能对齐」的参照。
-    const cls = days <= 3 ? 'var(--bad)' : days <= 7 ? 'var(--warn)' : 'var(--ok)';
+    const weekRemain = week.reduce((s, b) => s + b.remain, 0);
+    // 危险度：≤3 天红（不抓紧就真没了）、≤7 天琥珀。
+    // 上游扣包是 FEFO（按失效时刻升序）：快过期批次正是被优先消耗的，
+    // 日均需耗给的是「哪怕单靠这个账号的自然流量也能对齐」的参照。
+    const cls = days <= 3 ? 'var(--bad)' : 'var(--warn)';
     const dayWord = days === 0 ? '今天到期' : days === 1 ? '明天到期' : days + ' 天后到期';
-    const more = bs.length > 4 ? '　等 ' + bs.length + ' 批' : '';
-    const rest = bs.slice(1, 4).map(b =>
-      '随后 ' + esc(b.date.slice(5)) + ' · ' + fmtTok(b.remain)).join('　') + more;
+    const more = week.length > 1
+      ? '<div class="note">另有 ' + (week.length - 1) + ' 批 · 7 天内合计 ' + fmtTok(weekRemain) + '</div>'
+      : '';
     return '<div class="exp-row"><span class="exp-dot" style="background:' + cls + '"></span>' +
-      '<span class="exp-nm">' + esc(a.nickname || a.uid.slice(0, 8)) + '</span>' +
+      '<span class="exp-nm">' + esc(a.nickname || String(a.uid || '').slice(0, 8)) + '</span>' +
       '<span class="exp-main">最近到期 <b>' + esc(first.date) + '</b>（' + dayWord +
       '）· 该批 <b>' + fmtTok(first.remain) + '</b> 积分 · 到期前日均需耗 ≥<b>' +
-      fmtTok(daily) + '</b>' +
-      (week > first.remain ? ' · 7 天内合计 ' + fmtTok(week) : '') +
-      (rest ? '<div class="note">' + rest + '</div>' : '') +
-      '</span></div>';
-  }).join('');
-  $('expList').innerHTML = rows || '<div class="empty">没有账号</div>';
+      fmtTok(daily) + '</b>' + more + '</span></div>';
+  });
+  if (failed.length) {
+    const names = failed.slice(0, 3).map(a => a.nickname || String(a.uid || '').slice(0, 8)).join('、');
+    const detail = failed.map(a => (a.nickname || String(a.uid || '').slice(0, 8)) + '：' + a.error).join('；');
+    rows.push(expSummaryRow('var(--ink-3)', failed.length + ' 个账号查询失败',
+      esc(names) + (failed.length > 3 ? ' 等' : '') + ' · 点「实时检查」重试', detail));
+  }
+  if (quiet) {
+    rows.push(expSummaryRow('var(--ok)', '其余 <b>' + quiet + '</b> 个账号 7 天内无到期积分'));
+  }
+  $('expList').innerHTML = rows.join('') || '<div class="empty">没有账号</div>';
   // 数据新鲜度透明化：走缓存时标注年龄，免得把旧数据误当实时。
   const ageMin = lastPackages ? Math.floor((Date.now() - lastPackagesAt) / 60000) : 0;
-  $('expNote').textContent = (lastPackagesAt && ageMin > 0)
-    ? list.length + ' 个账号 · ' + ageMin + ' 分钟前的数据，可点「检查」刷新'
-    : list.length + ' 个账号 · 实时查询上游';
+  const state = (urgent.length ? urgent.length + ' 个 7 天内有到期' : '7 天内无到期') +
+    (failed.length ? ' · ' + failed.length + ' 个查询失败' : '') +
+    (lastPackagesAt && ageMin > 0 ? ' · ' + ageMin + ' 分钟前' : '');
+  $('expNote').textContent = state;
+  $('expNote').title = '共 ' + list.length + ' 个账号 · ' +
+    (lastPackagesAt && ageMin > 0 ? '缓存数据，可点「实时检查」刷新' : '实时查询上游');
   $('expBox').hidden = false;
 }
 
@@ -3078,7 +3238,10 @@ function renderExpiry(d) {
 function renderExpirySnapshot(d) {
   const list = (d && d.accounts) || [];
   const today = new Date(); today.setHours(0, 0, 0, 0);
-  const keyed = list.map(a => {
+  const urgent = [], failed = [];
+  let quiet = 0;
+  for (const a of list) {
+    if (a.error) { failed.push(a); continue; }
     // 后端给的是 RFC3339 带时区；无到期信息（长期包/未刷新）的账号排在最后。
     //
     // 必须走 parseAPITime 而不是裸 new Date()：CreditsEarliestExpiry 是 time.Time，
@@ -3087,40 +3250,47 @@ function renderExpirySnapshot(d) {
     // 「无到期批次」的账号反而排到最前，真正快过期的被挤到最后——功能被反转。
     // parseAPITime 对 "0001-" 前缀显式返回 0，这里只认 ms > 0（= 真有到期时间）。
     const ms = parseAPITime(a.credits_earliest_expiry);
-    const key = ms > 0 ? ms : null;
-    return { a, key, ms };
-  });
-  keyed.sort((x, y) => {
-    if (x.key === null && y.key === null) return 0;
-    if (x.key === null) return 1;
-    if (y.key === null) return -1;
-    return x.key - y.key;
-  });
-  const rows = keyed.map(({ a, ms }) => {
-    const nm = esc(a.nickname || String(a.uid || '').slice(0, 8));
-    // 判据与排序键保持一致：ms > 0 才代表有真实到期时间（零值时间已被 parseAPITime 归零）。
-    if (ms <= 0 || !a.credits_earliest_remaining) {
-      return '<div class="exp-row"><span class="exp-dot" style="background:var(--ok)"></span>' +
-        '<span class="exp-nm">' + nm + '</span>' +
-        '<span class="exp-main">无近期到期批次</span></div>';
-    }
-    const days = Math.max(0, Math.ceil((ms - today.getTime()) / 86400000));
     const remain = Number(a.credits_earliest_remaining || 0);
+    if (ms <= 0 || remain <= 0) { quiet++; continue; }
+    const rawDays = Math.ceil((ms - today.getTime()) / 86400000);
+    if (rawDays > 7) { quiet++; continue; }
+    urgent.push({ a, ms, remain, days: Math.max(0, rawDays) });
+  }
+  urgent.sort((x, y) => x.ms - y.ms);
+  const rows = urgent.map(({ a, ms, remain, days }) => {
     const daily = Math.ceil(remain / Math.max(1, days));
-    const cls = days <= 3 ? 'var(--bad)' : days <= 7 ? 'var(--warn)' : 'var(--ok)';
+    const cls = days <= 3 ? 'var(--bad)' : 'var(--warn)';
     const dayWord = days === 0 ? '今天到期' : days === 1 ? '明天到期' : days + ' 天后到期';
     const when = localDate(ms);
     return '<div class="exp-row"><span class="exp-dot" style="background:' + cls + '"></span>' +
-      '<span class="exp-nm">' + nm + '</span>' +
+      '<span class="exp-nm">' + esc(a.nickname || String(a.uid || '').slice(0, 8)) + '</span>' +
       '<span class="exp-main">最近到期 <b>' + esc(when) + '</b>（' + dayWord +
       '）· 该批 <b>' + fmtTok(remain) + '</b> 积分 · 到期前日均需耗 ≥<b>' +
-      fmtTok(daily) + '</b>' +
-      '<div class="note">仅最早一批，点「检查」看全部到期批次</div>' +
-      '</span></div>';
-  }).join('');
-  $('expList').innerHTML = rows || '<div class="empty">没有账号</div>';
-  $('expNote').textContent = list.length + ' 个账号 · 快照（来自本地状态，点「检查」拉实时明细）';
+      fmtTok(daily) + '</b></span></div>';
+  });
+  if (failed.length) {
+    const names = failed.slice(0, 3).map(a => a.nickname || String(a.uid || '').slice(0, 8)).join('、');
+    const detail = failed.map(a => (a.nickname || String(a.uid || '').slice(0, 8)) + '：' + a.error).join('；');
+    rows.push(expSummaryRow('var(--ink-3)', failed.length + ' 个账号查询失败',
+      esc(names) + (failed.length > 3 ? ' 等' : '') + ' · 点「实时检查」重试', detail));
+  }
+  if (quiet) {
+    rows.push(expSummaryRow('var(--ok)', '其余 <b>' + quiet + '</b> 个账号 7 天内无到期积分'));
+  }
+  $('expList').innerHTML = rows.join('') || '<div class="empty">没有账号</div>';
+  $('expNote').textContent = (urgent.length ? urgent.length + ' 个 7 天内有到期' : '7 天内无到期') +
+    (failed.length ? ' · ' + failed.length + ' 个查询失败' : '') + ' · 快照';
+  $('expNote').title = '共 ' + list.length + ' 个账号 · 数据来自本地状态；点「实时检查」拉取逐包明细';
   $('expBox').hidden = false;
+}
+
+// expSummaryRow 渲染被折叠的账号汇总（无到期 / 查询失败），避免首页逐账号平铺。
+// main/note 是调用方拼好的 HTML；title 是纯文本且在这里统一转义。
+function expSummaryRow(color, main, note, title) {
+  return '<div class="exp-row exp-sum"' + (title ? ' title="' + esc(title) + '"' : '') + '>' +
+    '<span class="exp-dot" style="background:' + color + '"></span>' +
+    '<span class="exp-main">' + main + (note ? '<span class="note">' + note + '</span>' : '') +
+    '</span></div>';
 }
 
 /* localDate 按**本地时区**取 YYYY-MM-DD。不能用 toISOString().slice(0, 10)：
@@ -3155,6 +3325,7 @@ async function loadExpiry(force) {
 }
 
 if ($('btnExp')) $('btnExp').onclick = () => loadExpiry(true);
+if ($('btnExpTasks')) $('btnExpTasks').onclick = () => go('taskscenter');
 
 // 「刷新」始终实时查（显式 force，不依赖事件对象真值）
 if ($('btnPk')) $('btnPk').onclick = () => loadPackages(true);

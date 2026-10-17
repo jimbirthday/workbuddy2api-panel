@@ -45,9 +45,10 @@ type Store interface {
 }
 
 const (
-	bindPrefix  = "wb2api:bind:"
-	stateKey    = "wb2api:state"
-	readTimeout = 3 * time.Second
+	bindPrefix      = "wb2api:bind:"
+	stateKey        = "wb2api:state"
+	readTimeout     = 3 * time.Second
+	bindLoadTimeout = 30 * time.Second
 )
 
 // New 根据 url+token 构建 Store。
@@ -242,14 +243,19 @@ func (u *Upstash) LoadState() ([]byte, bool) {
 }
 
 // LoadBinds 全量读取粘性会话绑定（SCAN bind:* 前缀）。
+// 使用独立的冷启动预算：绑定多时 SCAN + 逐条 GET 共用 3 秒会中途超时，
+// 导致恢复不完整且用户无感。单次 GET 仍受 readTimeout 约束，避免一条慢 key
+// 拖住整个恢复；总预算放宽到 bindLoadTimeout。
 func (u *Upstash) LoadBinds() map[string]string {
 	out := map[string]string{}
-	ctx, cancel := context.WithTimeout(context.Background(), readTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), bindLoadTimeout)
 	defer cancel()
 	iter := u.client.Scan(ctx, 0, bindPrefix+"*", 200).Iterator()
 	for iter.Next(ctx) {
 		key := iter.Val()
-		v, err := u.client.Get(ctx, key).Result()
+		getCtx, getCancel := context.WithTimeout(ctx, readTimeout)
+		v, err := u.client.Get(getCtx, key).Result()
+		getCancel()
 		if err != nil {
 			continue
 		}

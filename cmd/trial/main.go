@@ -60,7 +60,10 @@ type trialRow struct {
 }
 
 func main() {
-	authDir := "auths"
+	authDir := os.Getenv("WB2A_AUTH_DIR")
+	if authDir == "" {
+		authDir = "auths"
+	}
 	if len(os.Args) > 1 {
 		authDir = os.Args[1]
 	}

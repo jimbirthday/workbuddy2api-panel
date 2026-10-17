@@ -33,13 +33,20 @@ def main():
     else:
         prefixes = [account]
 
+    failures = 0
     for pre in prefixes:
-        c = tc.load_auth(pre)
+        try:
+            c = tc.load_auth(pre)
+        except Exception as e:
+            print(f"[fail] {pre}: {e}")
+            failures += 1
+            continue
         print(f"== {c['uid'][:8]} ({c['nick']}) ==")
         try:
             st = tc.task_status(c, TASK_CODE)
         except Exception as e:
             print(f"  [skip] list_tasks 失败: {e}")
+            failures += 1
             continue
         if st is None:
             print(f"  [skip] 无 {TASK_CODE} 任务")
@@ -55,13 +62,21 @@ def main():
         # 写链路
         st_code, code = tc.report_activity(c, count=1, gap=gap)[0]
         print(f"  report      -> {st_code} code={code}")
+        if st_code != 200 or code not in (0, None):
+            failures += 1
+            continue
         time.sleep(2)
         st2, ag = tc.do_post(c, tc.chat_base(c), tc.PATH_BUDDY_AGREEMENT, {"agree": True})
         print(f"  agreement   -> {st2} code={ag.get('code')}")
         st3, bf = tc.do_post(c, tc.chat_base(c), tc.PATH_BUDDY_FIRST, {})
         d = bf.get("data") or {}
         print(f"  buddy/first -> {st3} {bf.get('msg')} credit={d.get('credit')} energy={d.get('energy')}")
+        if st3 != 200 or (isinstance(bf, dict) and bf.get("code") not in (0, None)):
+            failures += 1
         time.sleep(gap)
+    if failures:
+        print(f"[!] {failures} 个账号处理失败", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

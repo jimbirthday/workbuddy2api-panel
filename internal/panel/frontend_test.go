@@ -796,7 +796,8 @@ process.stdout.write(JSON.stringify([
 	}
 }
 
-// TestAppJSExpirySortedByExpiry 到期提醒按「最近到期」升序，且不分域（issue #125）。
+// TestAppJSExpirySortedByExpiry 到期提醒只列「7 天内会蒸发」的账号，按最近到期升序，
+// 其余账号折叠成一行汇总（issue #125 + 首页信息密度收敛）。
 //
 // 后端 /panel/api/packages 是按**余额降序**返回的，恰好把 CN 账号都排在前面、
 // global 排在末尾，看上去像"按域分组"，实际只是余额顺序。本用例刻意按这个形态构造
@@ -831,16 +832,22 @@ const iso = n => {
 };
 const pack = (days, amount) => ({ end_time: iso(days) + ' 00:00:00', remain: amount });
 // 模拟后端顺序：余额降序 → CN 高余额在前且到期最晚，global 最少且最快到期。
+// 10 天后的批次不在首页 7 天窗口内，应只进汇总；0 天（今天）必须排在 2 天前。
 const d = { accounts: [
   { uid: 'a', nickname: 'cn-late',  realm: 'cn',     packages: [pack(16, 900)] },
   { uid: 'b', nickname: 'cn-mid',   realm: 'cn',     packages: [pack(12, 700)] },
   { uid: 'c', nickname: 'gl-soon',  realm: 'global', packages: [pack(2, 500)] },
+  { uid: 'f', nickname: 'due-today', realm: 'global', packages: [pack(0, 300)] },
   { uid: 'd', nickname: 'no-expiry', realm: 'cn',    packages: [pack(-3, 100)] },
   { uid: 'e', nickname: 'broken',   realm: 'cn',     error: 'offline' },
 ] };
 ctx.renderExpiry(d);
 const names = [...sink.innerHTML.matchAll(/<span class="exp-nm">([^<]*)<\/span>/g)].map(m => m[1]);
-process.stdout.write(JSON.stringify(names));`
+process.stdout.write(JSON.stringify({
+  names,
+  quiet: /其余 <b>3<\/b> 个账号 7 天内无到期积分/.test(sink.innerHTML),
+  failed: /1 个账号查询失败/.test(sink.innerHTML),
+}));`
 	f, err := os.CreateTemp(t.TempDir(), "expsort-*.cjs")
 	if err != nil {
 		t.Fatal(err)
@@ -853,8 +860,8 @@ process.stdout.write(JSON.stringify(names));`
 	if err != nil {
 		t.Fatalf("expiry sort node test failed: %v\n%s", err, out)
 	}
-	// 最快到期的排最前（跨域）；无 7 天内到期的与查询失败的排最后。
-	const want = `["gl-soon","cn-mid","cn-late","no-expiry","broken"]`
+	// 今天到期排最前，2 天后其次；7 天外与查询失败的账号不再逐行展示。
+	const want = `{"names":["due-today","gl-soon"],"quiet":true,"failed":true}`
 	if strings.TrimSpace(string(out)) != want {
 		t.Fatalf("expiry order=%s\nwant %s", strings.TrimSpace(string(out)), want)
 	}
@@ -914,13 +921,14 @@ const d = { accounts: [
 ctx.renderExpirySnapshot(d);
 const html = sinks['expList'] ? sinks['expList'].innerHTML : '';
 const names = [...html.matchAll(/<span class="exp-nm">([^<]*)<\/span>/g)].map(m => m[1]);
-// 2 天到期的应排最前（红），30 天其次，无到期信息的排最后。
-const wantNames = JSON.stringify(['秋', '秋千易', '长期包']);
+// 只有 2 天到期的「秋」在 7 天窗口内；30 天的「秋千易」与长期包都折叠进汇总。
+const wantNames = JSON.stringify(['秋']);
 const gotNames = JSON.stringify(names);
 process.stdout.write(JSON.stringify({
   visible: sinks['expBox'] ? sinks['expBox'].hidden === false : false,
   rows: names.length,
   order: gotNames === wantNames,
+  summary: /其余 <b>2<\/b> 个账号 7 天内无到期积分/.test(html),
   got: gotNames,
   want: wantNames,
 }));`
@@ -936,9 +944,9 @@ process.stdout.write(JSON.stringify({
 	if err != nil {
 		t.Fatalf("expiry snapshot node test failed: %v\n%s", err, out)
 	}
-	const want = `{"visible":true,"rows":3,"order":true,"got":"[\"秋\",\"秋千易\",\"长期包\"]","want":"[\"秋\",\"秋千易\",\"长期包\"]"}`
+	const want = `{"visible":true,"rows":1,"order":true,"summary":true,"got":"[\"秋\"]","want":"[\"秋\"]"}`
 	if strings.TrimSpace(string(out)) != want {
-		t.Fatalf("expiry snapshot=%s\nwant %s（visible 必须为 true，否则卡片仍隐藏）",
+		t.Fatalf("expiry snapshot=%s\nwant %s（visible 必须为 true；7 天外账号应折叠成汇总）",
 			strings.TrimSpace(string(out)), want)
 	}
 }
@@ -1001,16 +1009,16 @@ const d = { accounts: [
 ctx.renderExpirySnapshot(d);
 const html = sinks['expList'] ? sinks['expList'].innerHTML : '';
 const names = [...html.matchAll(/<span class="exp-nm">([^<]*)<\/span>/g)].map(m => m[1]);
-// 2 天到期排最前（红），30 天其次；零值时间的「长期包」必须排**最后**。
-const wantNames = JSON.stringify(['秋', '秋千易', '长期包']);
+// 2 天到期排最前（红）；30 天与零值时间「长期包」都折叠进汇总。
+// 零值时间必须按「无近期到期」处理，不能被渲染成到期日、更不能排到「秋」前面。
+const wantNames = JSON.stringify(['秋']);
 const gotNames = JSON.stringify(names);
-// 零值时间不得被渲染成到期日；该账号那一行必须是「无近期到期批次」。
-const longRow = /<span class="exp-nm">长期包<\/span><span class="exp-main">([^<]*)/.exec(html);
 process.stdout.write(JSON.stringify({
   order: gotNames === wantNames,
   got: gotNames,
   want: wantNames,
-  longRow: longRow ? longRow[1] : 'MISSING',
+  summary: /其余 <b>2<\/b> 个账号 7 天内无到期积分/.test(html),
+  leakedZero: html.includes('0001-01-01'),
 }));`
 	f, err := os.CreateTemp(t.TempDir(), "expsnap-zero-*.cjs")
 	if err != nil {
@@ -1024,9 +1032,9 @@ process.stdout.write(JSON.stringify({
 	if err != nil {
 		t.Fatalf("expiry zero-time node test failed: %v\n%s", err, out)
 	}
-	const want = `{"order":true,"got":"[\"秋\",\"秋千易\",\"长期包\"]","want":"[\"秋\",\"秋千易\",\"长期包\"]","longRow":"无近期到期批次"}`
+	const want = `{"order":true,"got":"[\"秋\"]","want":"[\"秋\"]","summary":true,"leakedZero":false}`
 	if strings.TrimSpace(string(out)) != want {
-		t.Fatalf("expiry zero-time=%s\nwant %s（零值时间必须排最后且按无到期渲染，不能排最前）",
+		t.Fatalf("expiry zero-time=%s\nwant %s（零值时间必须按无到期折叠，不能渲染成到期日或排最前）",
 			strings.TrimSpace(string(out)), want)
 	}
 }
@@ -1191,5 +1199,236 @@ try {
 	}
 	if !strings.Contains(string(out), "RENDER OK") {
 		t.Fatalf("renderAccounts 未成功：%s", out)
+	}
+}
+
+// TestAppJSQueueRunButtonRecovers 队列执行期间按钮保持禁用，轮询终态/异常必须恢复。
+//
+// 复用真实 app.js 与真实 DOM 桩；定时器换成手动 tick，避免等待 3 秒。
+// 这里只覆盖前端状态机，服务端并发逻辑由 scan_async_test.go 负责。
+func TestAppJSQueueRunButtonRecovers(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; queue button test skipped")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const btn = { disabled: false, textContent: '', onclick: null };
+const inert = new Proxy(function () {}, {
+  get(t, k) { if (k === Symbol.toPrimitive) return () => ''; return inert; },
+  set() { return true; }, apply() { return inert; }, construct() { return inert; },
+});
+const live = new Map();
+let nextTimer = 1;
+const sandbox = {
+  location: { hash: '#taskscenter' },
+  history: { replaceState() {} },
+  localStorage: { getItem: () => null, setItem() {} },
+  navigator: { clipboard: { writeText: () => Promise.resolve() } },
+  document: {
+    querySelectorAll: sel => sel === '.view' ? [{ id: 'view-accounts' }, { id: 'view-taskscenter' }] : [],
+    querySelector: () => inert,
+    getElementById: id => id === 'btnRunQueue' ? btn : inert,
+    addEventListener() {}, documentElement: inert, head: inert, body: inert,
+    createElement: () => ({ style: {}, classList: { add() {}, remove() {} }, appendChild() {}, remove() {} }),
+    cookie: '',
+  },
+  fetch: () => Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(sandbox.__queue || { started: false }) }),
+  addEventListener() {}, removeEventListener() {},
+  matchMedia: () => ({ matches: false, addEventListener() {} }),
+  setInterval: fn => { const id = nextTimer++; live.set(id, fn); return id; },
+  clearInterval: id => live.delete(id),
+  setTimeout: () => 0, clearTimeout() {},
+  console, JSON, Math, Date, Number, String, Boolean, Object, Array, Promise, Map, Set, RegExp, Error, TypeError, isNaN, parseInt, parseFloat, encodeURIComponent, decodeURIComponent, URL, Symbol, Proxy, Reflect,
+};
+sandbox.window = sandbox; sandbox.globalThis = sandbox;
+vm.createContext(sandbox);
+vm.runInContext(src, sandbox, { filename: 'app.js' });
+
+const flush = async () => { for (let i = 0; i < 8; i++) await Promise.resolve(); };
+const tick = async () => { await flush(); for (const fn of [...live.values()]) await fn(); await flush(); };
+const queueState = running => ({
+  started: true, running, seq: 1,
+  items: [{ uid: 'u1', nickname: 'n', kind: 'growth', code: 'c', status: running ? 'running' : 'done', message: '' }],
+});
+
+const out = {};
+(async () => {
+  sandbox.setQueueRunBusy(true);
+  out.active = btn.disabled && btn.textContent === '执行中…';
+
+  sandbox.lastQueueSeq = 1;
+  sandbox.__queue = queueState(false);
+  sandbox.startQueuePolling();
+  await tick();
+  out.done = !btn.disabled && btn.textContent === '执行全部待办';
+  // 页面的常驻刷新定时器也可能注册在同一个桩里，这里只验证队列轮询本身停了：
+  // 再给一次终态，若定时器还在会再渲染一次，按钮不应重新进入 busy。
+  sandbox.__queue = queueState(false);
+  await tick();
+  out.stopped = !btn.disabled && btn.textContent === '执行全部待办';
+
+  sandbox.__queue = null;
+  sandbox.fetch = () => Promise.reject(new Error('network down'));
+  sandbox.startQueuePolling();
+  await tick();
+  out.failed = !btn.disabled && btn.textContent === '执行全部待办';
+  process.stdout.write(JSON.stringify(out));
+})().catch(e => { process.stdout.write('ERR ' + (e && e.stack ? e.stack : e)); process.exitCode = 1; });`
+	f, err := os.CreateTemp(t.TempDir(), "queuebtn-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("queue button node test failed: %v\n%s", err, out)
+	}
+	if strings.TrimSpace(string(out)) != `{"active":true,"done":true,"stopped":true,"failed":true}` {
+		t.Fatalf("queue button state=%s", strings.TrimSpace(string(out)))
+	}
+}
+
+// TestAppJSScanPollingLifecycle 扫描进度轮询必须能接回、离页停止，且旧响应不得复活按钮。
+//
+// 场景：离开任务中心后 stopScanPolling 递增代次；若某个旧的 scan_status 请求
+// 晚到，它只能被丢弃，不能把刚恢复的「扫描待办」按钮改回「扫描中…」。
+func TestAppJSScanPollingLifecycle(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; scan polling test skipped")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const btn = { disabled: false, textContent: '', onclick: null };
+const inert = new Proxy(function () {}, {
+  get(t, k) { if (k === Symbol.toPrimitive) return () => ''; return inert; },
+  set() { return true; }, apply() { return inert; }, construct() { return inert; },
+});
+// go() 会写 #ttl；真实 DOM 元素可赋值，Proxy 函数不能，单独给一个普通对象。
+const ttl = { textContent: '', hidden: false };
+const timeouts = new Map();
+let nextTimer = 1;
+let fetchImpl = () => Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(sandbox.__scan || {}) });
+const sandbox = {
+  location: { hash: '#taskscenter' },
+  history: { replaceState() {} },
+  localStorage: { getItem: () => null, setItem() {} },
+  navigator: { clipboard: { writeText: () => Promise.resolve() } },
+  document: {
+    querySelectorAll: sel => sel === '.view' ? [{ id: 'view-accounts' }, { id: 'view-taskscenter' }] : sel === '.nav a' ? [] : [],
+    querySelector: () => inert,
+    getElementById: id => id === 'btnScanAll' ? btn : id === 'ttl' ? ttl : inert,
+    addEventListener() {}, documentElement: inert, head: inert, body: inert,
+    createElement: () => ({ style: {}, classList: { add() {}, remove() {} }, appendChild() {}, remove() {} }),
+    cookie: '',
+  },
+  fetch: (...args) => fetchImpl(...args),
+  addEventListener() {}, removeEventListener() {},
+  matchMedia: () => ({ matches: false, addEventListener() {} }),
+  setInterval: () => 0, clearInterval() {},
+  setTimeout: (fn, ms) => { const id = nextTimer++; if (ms === 500) timeouts.set(id, fn); return id; },
+  clearTimeout: id => timeouts.delete(id),
+  console, JSON, Math, Date, Number, String, Boolean, Object, Array, Promise, Map, Set, RegExp, Error, TypeError, isNaN, parseInt, parseFloat, encodeURIComponent, decodeURIComponent, URL, Symbol, Proxy, Reflect,
+};
+sandbox.window = sandbox; sandbox.globalThis = sandbox;
+vm.createContext(sandbox);
+vm.runInContext(src, sandbox, { filename: 'app.js' });
+
+const flush = async () => { for (let i = 0; i < 30; i++) await Promise.resolve(); };
+const nextPoll = () => {
+  const [id, fn] = [...timeouts][0] || [];
+  if (!fn) throw new Error('scan poll timer not scheduled');
+  timeouts.delete(id);
+  return fn;
+};
+const running = { running: true, done: 2, total: 7, error_count: 0 };
+
+const out = {};
+(async () => {
+  // 1) 运行中：接回后按钮进入忙碌态；离页后停止续排并恢复按钮。
+  sandbox.__scan = running;
+  sandbox.go('taskscenter');
+  sandbox.startScanPolling();
+  out.progress = btn.disabled && btn.textContent === '扫描中…';
+  // 运行中再触发 reattach（模拟 5 秒队列刷新）不得重排第二个轮询。
+  sandbox.reattachScanView();
+  out.reattachNoDuplicate = timeouts.size === 1;
+  // 已渲染过的同一扫描结果，重复 reattach 不得重建列表（否则滚动位置丢失、
+  // 每 5 秒重复 toast）。
+  const doneSeq = { running: false, seq: 9, accounts: [{ uid: 'u1', nickname: 'n1', growth: [{ task_code: 't1', title: 'T', current: 0, target: 1 }] }], pending_count: 1, error_count: 0 };
+  let qcWrites = 0;
+  const qcList = { set innerHTML(v) { qcWrites++; }, get innerHTML() { return ''; } };
+  const qcEmpty = { style: {}, querySelector: () => ({ textContent: '' }) };
+  const realGet = sandbox.document.getElementById;
+  sandbox.document.getElementById = id => id === 'qcList' ? qcList : id === 'tcEmpty' ? qcEmpty : realGet(id);
+  sandbox.stopScanPolling();
+  await flush();
+  sandbox.__scan = doneSeq;
+  sandbox.go('accounts');
+  sandbox.go('taskscenter');
+  await flush();
+  const firstWrites = qcWrites;
+  sandbox.reattachScanView();
+  await flush();
+  out.sameSeqOnce = firstWrites === 1 && qcWrites === 1;
+  sandbox.__scan = { ...doneSeq, seq: 10 };
+  sandbox.reattachScanView();
+  await flush();
+  out.newSeqRenders = qcWrites === 2;
+  sandbox.document.getElementById = realGet;
+  sandbox.go('accounts');
+  await flush();
+  sandbox.go('accounts');
+  out.offView = !btn.disabled && btn.textContent === '扫描待办';
+
+  // 2) 旧响应晚到：代次过期必须丢弃，不能把按钮改回扫描中。
+  let release;
+  sandbox.__scan = running;
+  sandbox.go('taskscenter');
+  sandbox.fetch = () => new Promise(resolve => { release = () => resolve({ ok: true, status: 200, json: () => Promise.resolve(running) }); });
+  sandbox.startScanPolling();
+  const pendingFn = nextPoll();
+  const pendingPoll = pendingFn();
+  sandbox.go('accounts');
+  btn.disabled = false; btn.textContent = '扫描待办';
+  release(); await pendingPoll; await flush();
+  out.staleDropped = !btn.disabled && btn.textContent === '扫描待办';
+
+  // 3) reattach 请求晚于用户离页：不得重新起轮询。
+  let releaseRe;
+  sandbox.go('accounts');
+  await flush();
+  const oldFetch = fetchImpl;
+  sandbox.fetch = (url) => String(url).includes('tasks/queue')
+    ? Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ started: false }) })
+    : new Promise(resolve => { releaseRe = () => resolve({ ok: true, status: 200, json: () => Promise.resolve(running) }); });
+  sandbox.go('taskscenter');
+  for (let i = 0; i < 60 && !releaseRe; i++) await Promise.resolve();
+  sandbox.go('accounts');
+  releaseRe(); await flush();
+  sandbox.fetch = (...a) => oldFetch(...a);
+  out.reattachGuarded = timeouts.size === 0 && btn.textContent === '扫描待办';
+  process.stdout.write(JSON.stringify(out));
+})().catch(e => { process.stdout.write('ERR ' + (e && e.stack ? e.stack : e)); process.exitCode = 1; });`
+	f, err := os.CreateTemp(t.TempDir(), "scanpoll-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("scan polling node test failed: %v\n%s", err, out)
+	}
+	if strings.TrimSpace(string(out)) != `{"progress":true,"reattachNoDuplicate":true,"sameSeqOnce":true,"newSeqRenders":true,"offView":true,"staleDropped":true,"reattachGuarded":true}` {
+		t.Fatalf("scan polling state=%s", strings.TrimSpace(string(out)))
 	}
 }

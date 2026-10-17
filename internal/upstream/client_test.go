@@ -129,6 +129,11 @@ func TestIsModelRateLimit(t *testing.T) {
 		// 其他 code（非模型级限流）→ 不算。
 		{`{"code":11140,"msg":"The model provider is rate-limiting requests."}`, false},
 		{`{"code":1,"msg":"429 rate limit"}`, false},
+		// 正文里恰好出现 code 文本不算：只认错误信封结构。
+		{`{"id":"x","choices":[{"message":{"content":"the config has \"code\":6004 in docs"}}]}`, false},
+		// 嵌套错误信封仍是错误：error / data 下的 code 应命中。
+		{`{"error":{"code":6004,"message":"limited"}}`, true},
+		{`{"data":{"code":6004,"msg":"limited"}}`, true},
 	}
 	for _, c := range cases {
 		if got := IsModelRateLimit(c.body); got != c.want {

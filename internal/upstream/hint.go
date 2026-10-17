@@ -110,11 +110,21 @@ func FrameKind(payload string) ErrKind {
 		Error struct {
 			Message string `json:"message"`
 		} `json:"error"`
+		// 业务信封形态直接给出顶层 msg；此前只读 error.message，导致
+		// {"code":...,"msg":...} 帧落到 ErrNone，hint 与账号处置都不完整。
+		Msg string `json:"msg"`
 	}
-	if json.Unmarshal([]byte(payload), &f) != nil || f.Error.Message == "" {
+	if json.Unmarshal([]byte(payload), &f) != nil {
 		return ErrNone
 	}
-	return Classify(http.StatusBadRequest, f.Error.Message)
+	msg := f.Error.Message
+	if msg == "" {
+		msg = f.Msg
+	}
+	if msg == "" {
+		return ErrNone
+	}
+	return Classify(http.StatusBadRequest, msg)
 }
 
 // isModelParamInvalid 上游 11133 body 判定（code 11133 / extError.code=

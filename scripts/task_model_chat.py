@@ -39,13 +39,20 @@ def main():
     else:
         prefixes = [a.account]
 
+    failures = 0
     for pre in prefixes:
-        c = tc.load_auth(pre)
+        try:
+            c = tc.load_auth(pre)
+        except Exception as e:
+            print(f"[fail] {pre}: {e}")
+            failures += 1
+            continue
         print(f"== {c['uid'][:8]} ({c['nick']}) ==")
         try:
             st = tc.task_status(c, TASK_CODE)
         except Exception as e:
             print(f"  [skip] list_tasks 失败: {e}")
+            failures += 1
             continue
         if st is None:
             print(f"  [skip] 无 {TASK_CODE} 任务")
@@ -70,11 +77,15 @@ def main():
         # 2. 真实对话（GLM-5.2）
         st_chat, first = tc.chat_completion(c, model_id=MODEL_ID, prompt=a.prompt)
         print(f"  chat glm-5.2  -> {st_chat} {first[:60]!r}")
+        if st_chat != 200:
+            failures += 1
 
         # 3. 上报一条 chat_request_send（模型字段对齐 glm-5.2）
         results = tc.report_activity(c, count=1, gap=1.05,
                                      model_id=MODEL_ID, model_name=MODEL_NAME)
         print(f"  report x1     -> {results}")
+        if not tc.report_ok(results):
+            failures += 1
         time.sleep(1.0)
 
         # 4. 回读
@@ -85,6 +96,9 @@ def main():
         print(f"  回读 {TASK_CODE}: {cur2}/{prog2.get('target', target)} accept_status={ast2}")
         if ast2 not in ("claimed",) and cur2 >= target:
             print("  → 任务已满足，可手动或后续调用 claim_reward 领奖")
+    if failures:
+        print(f"[!] {failures} 个账号处理失败", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

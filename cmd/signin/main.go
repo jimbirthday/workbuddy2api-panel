@@ -4,7 +4,6 @@ package main
 
 import (
 	"fmt"
-	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -25,7 +24,10 @@ type row struct {
 }
 
 func main() {
-	dir := "auths"
+	dir := os.Getenv("WB2A_AUTH_DIR")
+	if dir == "" {
+		dir = "auths"
+	}
 	if len(os.Args) > 1 {
 		dir = os.Args[1]
 	}
@@ -73,7 +75,10 @@ func main() {
 			}
 			// refresh 后写回文件（权限问题已修复）；落盘失败必须暴露，否则重启回旧 token
 			if err := a.SaveAtomic(); err != nil {
-				log.Printf("signin %s save: %v", a.UID, err)
+				r.status, r.detail = "FAIL", "save: "+short(err.Error())
+				rows = append(rows, r)
+				failN++
+				continue
 			}
 		}
 
@@ -84,7 +89,7 @@ func main() {
 			okN++
 		default:
 			// DailyCheckin 已签到返回 code!=0 错误
-			if isAlready(err.Error()) {
+			if upstream.IsAlreadyCheckin(err) {
 				r.status = "ALREADY"
 				r.detail = short(err.Error())
 				alreadyN++
@@ -117,15 +122,6 @@ func main() {
 	if failN > 0 {
 		os.Exit(1)
 	}
-}
-
-// 已签判定：code 非 0 且含 "已签到"/"already"/"checkin" 等字样
-func isAlready(msg string) bool {
-	s := strings.ToLower(msg)
-	return strings.Contains(s, "已签到") ||
-		strings.Contains(s, "already") ||
-		strings.Contains(s, "checkin") ||
-		strings.Contains(s, "code=400")
 }
 
 func trunc(s string, n int) string {

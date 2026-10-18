@@ -2,7 +2,6 @@ package pool
 
 import (
 	"sort"
-	"strings"
 	"time"
 )
 
@@ -40,105 +39,109 @@ type ModelLockRow struct {
 	Reason string `json:"reason,omitempty"`
 }
 
-// ModelLockView 汇总当前所有「有未过期模型级限流」的 (域, 模型)，按不可用优先排序。
-//
-// 为什么需要它：选号失败时上游只回 no_healthy_account（issue #102），ModelBlocked 虽
-// 已把「号都在、只是都对这个模型关闭」从「池子真没号」里区分出来，但那是一次请求
-// 失败后的单模型回答；运维仍看不到「此刻一共哪些模型不能用、分别还要锁多久」。
-// 本视图把 (域, 模型) 维度聚合成一张清单补齐这一点。
-//
-// 口径与选号/ModelBlocked 严格一致，三处易错点：
-//   - 只看**参与选号**的账号：disabled / paused 号跳过——它们的不可用与模型无关，
-//     计进来会把「模型被锁」和「号被停了」混为一谈；
-//   - 只看**真正拦路由**的冷却：AuditOnly 台账（无重置时间的 6004）不改变选号，
-//     既不产生行也不计入 Locked；
-//   - 已过期的冷却不算锁。
-//
-// 只读：持 RLock 遍历，不改任何状态。无锁时返回 nil（JSON 里是 null，面板按空态渲染）。
-func (p *Pool) ModelLockView() []ModelLockRow {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	now := time.Now()
+// modelLockAggregate 复用一次池遍历的结果。Overview 与 ModelLockView 都从
+// 同一个聚合器输出，避免两份实现的口径漂移；调用方必须持有 p.mu 读锁。
+type modelLockAggregate struct {
+	rows         map[modelLockKey]*modelLockAcc
+	routable     map[string]int
+	base         map[string]int
+	blocked      map[modelLockKey]int
+	inFlightFull func(*entry) bool
+}
 
-	type agg struct {
-		locked   int
-		unlockAt time.Time
-		fullyAt  time.Time
-		reason   string
+// modelLockKey 是 (域, 模型) 的结构体键：热路径不再为每个账号的每个冷却模型
+// 拼接 realm+"\x1f"+model 字符串（470 账号 × 10 模型约 1000 次分配），只在最终
+// view() 为实际输出的少量行构造展示字符串。
+type modelLockKey struct {
+	realm string
+	model string
+}
+
+type modelLockAcc struct {
+	locked   int
+	unlockAt time.Time
+	fullyAt  time.Time
+	reason   string
+}
+
+func modelLockAggregateFor(inFlightFull func(*entry) bool) *modelLockAggregate {
+	return &modelLockAggregate{
+		rows: make(map[modelLockKey]*modelLockAcc),
+		// realm/被锁模型的数量远小于账号数，按账号数预分配会制造无谓的大 map
+		//（470 账号实测从 ~11 KiB 放大到 ~96 KiB）。让 map 按实际键增长。
+		routable:     make(map[string]int),
+		base:         make(map[string]int),
+		blocked:      make(map[modelLockKey]int),
+		inFlightFull: inFlightFull,
 	}
-	rows := make(map[string]*agg)
-	routable := make(map[string]int) // realm → 参与选号的账号数
-	// base 是「账号级健康且未占满」的号数；blocked 是其中被该模型独立冷却挡住的号数。
-	// servable = base - blocked，把原先每个模型行再扫一遍全池的 O(模型数×账号数)
-	// 收成一次账号遍历（每号只遍历自己的模型冷却表）。
-	base := make(map[string]int)    // realm → 账号级健康且未占满的号数
-	blocked := make(map[string]int) // realm+"\x1f"+model → 其中被该模型冷却挡住的号数
+}
 
-	for _, e := range p.byUID {
-		realm := e.a.Realm()
-		if e.disabled || e.paused {
+// addEntry 累计单账号在模型锁视图中的贡献。healthy 口径与选号一致：禁用/暂停
+// 不进入分母，账号级冷却或占满只影响 Servable，不改变 Locked。
+func (a *modelLockAggregate) addEntry(e *entry, now time.Time) {
+	realm := e.a.Realm()
+	if e.disabled || e.paused {
+		return
+	}
+	a.routable[realm]++
+	healthy := e.healthy(now) && !a.inFlightFull(e)
+	if healthy {
+		a.base[realm]++
+	}
+	for model, mc := range e.modelCooldowns {
+		if mc.AuditOnly || mc.Until.IsZero() || !now.Before(mc.Until) {
 			continue
 		}
-		routable[realm]++
-		healthy := e.healthy(now) && !p.inFlightFull(e)
+		key := modelLockKey{realm: realm, model: model}
 		if healthy {
-			base[realm]++
+			a.blocked[key]++
 		}
-		for model, mc := range e.modelCooldowns {
-			if mc.AuditOnly || mc.Until.IsZero() || !now.Before(mc.Until) {
-				continue
-			}
-			key := realm + "\x1f" + model
-			if healthy {
-				blocked[key]++
-			}
-			a := rows[key]
-			if a == nil {
-				a = &agg{}
-				rows[key] = a
-			}
-			a.locked++
-			if a.unlockAt.IsZero() || mc.Until.Before(a.unlockAt) {
-				a.unlockAt = mc.Until
-				a.reason = mc.Reason
-			}
-			if a.fullyAt.IsZero() || mc.Until.After(a.fullyAt) {
-				a.fullyAt = mc.Until
-			}
+		row := a.rows[key]
+		if row == nil {
+			row = &modelLockAcc{}
+			a.rows[key] = row
+		}
+		row.locked++
+		if row.unlockAt.IsZero() || mc.Until.Before(row.unlockAt) {
+			row.unlockAt = mc.Until
+			row.reason = mc.Reason
+		}
+		if row.fullyAt.IsZero() || mc.Until.After(row.fullyAt) {
+			row.fullyAt = mc.Until
 		}
 	}
-	if len(rows) == 0 {
+}
+
+func (a *modelLockAggregate) view() []ModelLockRow {
+	if len(a.rows) == 0 {
 		return nil
 	}
-
-	out := make([]ModelLockRow, 0, len(rows))
-	for key, a := range rows {
-		sep := strings.IndexByte(key, '\x1f')
-		realm, model := key[:sep], key[sep+1:]
-		servable := base[realm] - blocked[key]
+	out := make([]ModelLockRow, 0, len(a.rows))
+	for key, row := range a.rows {
+		realm, model := key.realm, key.model
+		servable := a.base[realm] - a.blocked[key]
 		if servable < 0 {
 			servable = 0
 		}
-		row := ModelLockRow{
+		item := ModelLockRow{
 			Model:         model,
 			Realm:         realm,
-			Total:         routable[realm],
-			Locked:        a.locked,
+			Total:         a.routable[realm],
+			Locked:        row.locked,
 			Servable:      servable,
-			UnlockAt:      a.unlockAt,
-			FullyUnlockAt: a.fullyAt,
-			Reason:        a.reason,
+			UnlockAt:      row.unlockAt,
+			FullyUnlockAt: row.fullyAt,
+			Reason:        row.reason,
 		}
 		switch {
-		case row.Servable > 0:
-			row.State = "partial"
-		case row.Locked >= row.Total:
-			// 参与选号的号全被这个模型挡住 —— 与 ModelBlocked 的 Blocked 同义。
-			row.State = "locked"
+		case item.Servable > 0:
+			item.State = "partial"
+		case item.Locked >= item.Total:
+			item.State = "locked"
 		default:
-			row.State = "starved"
+			item.State = "starved"
 		}
-		out = append(out, row)
+		out = append(out, item)
 	}
 
 	rank := func(state string) int {
@@ -161,4 +164,30 @@ func (p *Pool) ModelLockView() []ModelLockRow {
 		return out[i].Realm < out[j].Realm
 	})
 	return out
+}
+
+// ModelLockView 汇总当前所有「有未过期模型级限流」的 (域, 模型)，按不可用优先排序。
+//
+// 为什么需要它：选号失败时上游只回 no_healthy_account（issue #102），ModelBlocked 虽
+// 已把「号都在、只是都对这个模型关闭」从「池子真没号」里区分出来，但那是一次请求
+// 失败后的单模型回答；运维仍看不到「此刻一共哪些模型不能用、分别还要锁多久」。
+// 本视图把 (域, 模型) 维度聚合成一张清单补齐这一点。
+//
+// 口径与选号/ModelBlocked 严格一致，三处易错点：
+//   - 只看**参与选号**的账号：disabled / paused 号跳过——它们的不可用与模型无关，
+//     计进来会把「模型被锁」和「号被停了」混为一谈；
+//   - 只看**真正拦路由**的冷却：AuditOnly 台账（无重置时间的 6004）不改变选号，
+//     既不产生行也不计入 Locked；
+//   - 已过期的冷却不算锁。
+//
+// 只读：持 RLock 遍历，不改任何状态。无锁时返回 nil（JSON 里是 null，面板按空态渲染）。
+func (p *Pool) ModelLockView() []ModelLockRow {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	now := time.Now()
+	agg := modelLockAggregateFor(p.inFlightFull)
+	for _, e := range p.byUID {
+		agg.addEntry(e, now)
+	}
+	return agg.view()
 }

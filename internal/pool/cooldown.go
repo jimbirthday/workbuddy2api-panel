@@ -8,6 +8,8 @@ import (
 	"log"
 	"strings"
 	"time"
+
+	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
 )
 
 func (p *Pool) SetCredits(uid string, credits, total int64) {
@@ -44,7 +46,7 @@ func (p *Pool) SetNickname(uid, nickname string) bool {
 		return false
 	}
 	if err := a.SaveAtomic(); err != nil {
-		log.Printf("WARN: [pool] nickname save %s: %v", uid, err)
+		log.Printf("WARN: [pool] nickname save %s: %v", logfmt.UID8(uid), err)
 		return false
 	}
 	return true
@@ -465,8 +467,8 @@ func (p *Pool) ModelBlocked(model string) ModelBlockStatus {
 	if model == "" {
 		return ModelBlockStatus{}
 	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	now := time.Now()
 
 	var st ModelBlockStatus

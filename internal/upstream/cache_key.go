@@ -40,9 +40,22 @@ func InjectPromptCacheKey(body []byte, uid, conversationID string) []byte {
 	if err := json.Unmarshal(body, &obj); err != nil {
 		return body
 	}
+	if !injectPromptCacheKeyObject(obj, uid, conversationID) {
+		return body
+	}
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
+// injectPromptCacheKeyObject 在已解码 body 上就地注入 prompt_cache_key。
+// 返回是否写入；写入后由调用方统一序列化，避免热路径重复编解码。
+func injectPromptCacheKeyObject(obj map[string]any, uid, conversationID string) bool {
 	// 优先级 1：客户端已显式带 key → 绝不覆盖。
 	if existing, ok := obj["prompt_cache_key"].(string); ok && existing != "" {
-		return body
+		return false
 	}
 	// 优先级 2：body 里的 conversation_id / conversationId 做会话哈希源。
 	conv := conversationID
@@ -53,11 +66,7 @@ func InjectPromptCacheKey(body []byte, uid, conversationID string) []byte {
 	}
 	key := buildCacheKey(uid, conv)
 	obj["prompt_cache_key"] = key
-	out, err := json.Marshal(obj)
-	if err != nil {
-		return body
-	}
-	return out
+	return true
 }
 
 // buildCacheKey 生成 `wb2a-<uid8>-<convHex>` 格式的稳定 cache key。

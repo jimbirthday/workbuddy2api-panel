@@ -1,8 +1,10 @@
 package upstream
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -115,6 +117,40 @@ func TestAggregateSkipsNonDataLines(t *testing.T) {
 	}
 }
 
+// TestSSELineReaderOversizedFrame 单行超过 64KiB bufio 缓冲时，ReadSlice 会返回
+// ErrBufferFull 分片；必须继续拼接，否则大 delta（长文本/工具参数）会被截断，
+// Aggregate 丢正文、StreamHint 透传坏帧。
+func TestSSELineReaderOversizedFrame(t *testing.T) {
+	long := strings.Repeat("长", 40000) // UTF-8 三字节，单行 > 64KiB
+	frame := `data: {"id":"big","model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":"` + long + `"}}]}` + "\n\n"
+	raw := frame + "data: [DONE]\n\n"
+
+	resp, err := Aggregate(strings.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg := resp["choices"].([]any)[0].(map[string]any)["message"].(map[string]any)
+	if got := msg["content"].(string); got != long {
+		t.Fatalf("aggregated content len=%d want %d", len(got), len(long))
+	}
+
+	var out bytes.Buffer
+	if err := StreamHint(&bufResponseWriter{&out}, strings.NewReader(raw), nil); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), long) {
+		t.Fatal("StreamHint truncated oversized frame")
+	}
+}
+
+// bufResponseWriter 最小 http.ResponseWriter + Flusher，供 StreamHint 字节级测试。
+type bufResponseWriter struct{ *bytes.Buffer }
+
+func (b *bufResponseWriter) Header() http.Header         { return http.Header{} }
+func (b *bufResponseWriter) WriteHeader(int)             {}
+func (b *bufResponseWriter) Flush()                      {}
+func (b *bufResponseWriter) Write(p []byte) (int, error) { return b.Buffer.Write(p) }
+
 func TestAggregateToolCalls(t *testing.T) {
 	// 流式 tool_calls：首片带 id/type/name + 空 arguments，后续只带 arguments 片段
 	raw := `data: {"id":"x1","model":"deepseek-v4-pro","created":1,"choices":[{"index":0,"delta":{"role":"assistant","content":"","tool_calls":[{"id":"call_a","type":"function","function":{"name":"get_weather","arguments":""},"index":0}]}}],"usage":null}
@@ -150,6 +186,23 @@ data: [DONE]
 	}
 	if fn["arguments"] != `{"city":"北京"}` {
 		t.Errorf("fn.arguments=%q", fn["arguments"])
+	}
+}
+
+// TestSSELineReaderLongLineBoundary 验证恰好跨 bufio 缓冲边界的行（含无尾换行
+// 的 EOF 残行）仍完整输出；旧 ReadString 路径与当前 sseLineReader 字节一致。
+func TestSSELineReaderLongLineBoundary(t *testing.T) {
+	for _, tail := range []string{"\n", "", "\r\n"} {
+		payload := `{"x":"` + strings.Repeat("a", 70000) + `"}`
+		raw := "data: " + payload + tail
+		lr := newSSELineReader(strings.NewReader(raw))
+		line, err := lr.readLine()
+		if err != nil && err != io.EOF {
+			t.Fatal(err)
+		}
+		if got := string(sseDataPayload(line)); got != payload {
+			t.Fatalf("tail=%q payload len=%d want %d", tail, len(got), len(payload))
+		}
 	}
 }
 
@@ -692,6 +745,103 @@ func TestAggregateEmptyStreamCases(t *testing.T) {
 	}
 }
 
+// TestAggregateTruncatedToolCallsOnlyIsNotFakeSuccess 上游只发了一个残缺
+// tool_calls（finish_reason=length 或未发 [DONE]），聚合器会丢弃它；此时若仍
+// 返回 200 空消息，客户端会把失败当成功（非流式假成功）。必须报空流错误。
+func TestAggregateTruncatedToolCallsOnlyIsNotFakeSuccess(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+	}{
+		{
+			name: "length",
+			raw:  "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"t1\",\"type\":\"function\",\"function\":{\"name\":\"run\",\"arguments\":\"{\\\"x\\\":1\"}}]},\"finish_reason\":\"length\"}]}\n\ndata: [DONE]\n\n",
+		},
+		{
+			name: "missing done",
+			raw:  "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"t1\",\"type\":\"function\",\"function\":{\"name\":\"run\",\"arguments\":\"{\\\"x\\\":1\"}}]}}]}\n\n",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resp, err := Aggregate(strings.NewReader(tc.raw))
+			if err == nil {
+				t.Fatalf("truncated tool_calls must not be a 200 success: %#v", resp)
+			}
+			if !IsEmptyStreamError(err) {
+				t.Fatalf("err=%v want empty-stream", err)
+			}
+		})
+	}
+}
+
+// TestAggregateLegacyFunctionCallOnlyIsNotFakeSuccess 只有遗留 function_call
+// 时不能构造 content:"" 的 200；但它是客户端可消费的工具调用，必须原样透出，
+// 不能误判成空流 502。
+func TestAggregateLegacyFunctionCallOnlyIsNotFakeSuccess(t *testing.T) {
+	raw := "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"function_call\":{\"name\":\"run\",\"arguments\":\"{}\"}},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n"
+	resp, err := Aggregate(strings.NewReader(raw))
+	if err != nil {
+		t.Fatalf("legacy function_call must be delivered, got err=%v", err)
+	}
+	msg := resp["choices"].([]any)[0].(map[string]any)["message"].(map[string]any)
+	if msg["content"] != "" {
+		t.Fatalf("content=%v want empty", msg["content"])
+	}
+	fc, ok := msg["function_call"].(map[string]any)
+	if !ok || fc["name"] != "run" || fc["arguments"] != "{}" {
+		t.Fatalf("function_call lost: %#v", msg)
+	}
+}
+
+// TestAggregateEmptyShellToolCallsIsNotFakeSuccess 上游只发 {"index":0} 或只有
+// id/type、没有名称与参数的空壳 tool_calls 时，客户端无法执行任何工具；不能
+// 因为切片非空就返回 200。
+func TestAggregateEmptyShellToolCallsIsNotFakeSuccess(t *testing.T) {
+	for _, raw := range []string{
+		"data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0}]}}]}\n\ndata: [DONE]\n\n",
+		"data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"t1\",\"type\":\"function\",\"function\":{}}]}}]}\n\ndata: [DONE]\n\n",
+	} {
+		resp, err := Aggregate(strings.NewReader(raw))
+		if err == nil {
+			t.Fatalf("empty-shell tool_calls must not be a 200 success: %#v", resp)
+		}
+		if !IsEmptyStreamError(err) {
+			t.Fatalf("err=%v want empty-stream", err)
+		}
+	}
+}
+
+// TestAggregateTruncatedLegacyFunctionCallIsNotFakeSuccess 遗留 function_call 的
+// 参数在截断时同样是残缺 JSON；必须与标准 tool_calls 一样丢弃，不能 200 交付
+// 半截参数。丢光后最终闸门应返回空流错误。
+func TestAggregateTruncatedLegacyFunctionCallIsNotFakeSuccess(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+	}{
+		{
+			name: "length",
+			raw:  "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"function_call\":{\"name\":\"run\",\"arguments\":\"{\\\"x\\\":1\"}},\"finish_reason\":\"length\"}]}\n\ndata: [DONE]\n\n",
+		},
+		{
+			name: "missing done",
+			raw:  "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"function_call\":{\"name\":\"run\",\"arguments\":\"{\\\"x\\\":1\"}}}]}\n\n",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resp, err := Aggregate(strings.NewReader(tc.raw))
+			if err == nil {
+				t.Fatalf("truncated legacy function_call must not be a 200 success: %#v", resp)
+			}
+			if !IsEmptyStreamError(err) {
+				t.Fatalf("err=%v want empty-stream", err)
+			}
+		})
+	}
+}
+
 // TestAggregateEmptyStreamError 校验空流错误信息形如约定文案。
 func TestAggregateEmptyStreamError(t *testing.T) {
 	_, err := Aggregate(strings.NewReader(""))
@@ -732,29 +882,14 @@ func TestStreamEmptyFramesCase(t *testing.T) {
 			if err == nil {
 				t.Fatalf("expected error, got nil")
 			}
+			// 空流一个字节都不写：不提交 200 成功头，也不补 error 帧/[DONE]。
+			// 调用方据此回真实 502（协议入口再翻成 native JSON 错误信封）。
 			body := rec.Body.String()
-			if n := strings.Count(body, "data: [DONE]"); n != 1 {
-				t.Errorf("[DONE] count=%d want 1: %q", n, body)
+			if body != "" {
+				t.Errorf("empty stream wrote %q, want no bytes (no committed 200)", body)
 			}
-			// error 帧必须原样保留 error 字段（未被 normalizeFrame 白名单剥掉）
-			var e map[string]any
-			found := false
-			for _, ln := range strings.Split(body, "\n") {
-				ln = strings.TrimSpace(ln)
-				if strings.HasPrefix(ln, "data: ") {
-					payload := strings.TrimPrefix(ln, "data: ")
-					if payload == "[DONE]" {
-						continue
-					}
-					if json.Unmarshal([]byte(payload), &e) == nil {
-						if em, ok := e["error"].(map[string]any); ok && em["message"] == "empty upstream stream" && em["type"] == "upstream_error" {
-							found = true
-						}
-					}
-				}
-			}
-			if !found {
-				t.Errorf("error frame absent or error field stripped: %q", body)
+			if ct := rec.Header().Get("Content-Type"); ct != "" {
+				t.Errorf("empty stream committed Content-Type=%q", ct)
 			}
 		})
 	}
@@ -989,7 +1124,7 @@ func TestCreditPackagesExpiryTimestamp(t *testing.T) {
 	var found bool
 	for _, p := range packs {
 		if p.Name == "gift" {
-			found = p.ExpiresAt == end.UnixMilli()
+			found = p.ExpiresAt == end.UnixMilli() && p.ExpiryCycle
 		}
 	}
 	if !found {
@@ -1392,5 +1527,149 @@ func TestStreamHintZeroCodeEnvelopeIsNotError(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "hi") {
 		t.Fatalf("content after zero-code envelope missing: %s", rec.Body.String())
+	}
+}
+
+// SSE 规范允许 "data:" 后不带空格；部分上游还会直接输出 "data:{...}"。
+// 这两种合法形态不能被当成非 data 行，否则整条流会被误判为空流。
+func TestSSEDataPayloadAcceptsStandardForms(t *testing.T) {
+	cases := map[string]string{
+		"data: {\"a\":1}":  `{"a":1}`,
+		"data:{\"a\":1}":   `{"a":1}`,
+		"data:   [DONE]":   `[DONE]`,
+		"data:\t{\"a\":1}": `{"a":1}`,
+	}
+	for line, want := range cases {
+		got := sseDataPayload([]byte(line))
+		if string(got) != want {
+			t.Errorf("sseDataPayload(%q)=%q want %q", line, got, want)
+		}
+	}
+	if got := sseDataPayload([]byte("database: nope")); got != nil {
+		t.Errorf("non-data field parsed as payload: %q", got)
+	}
+}
+
+// streamBytesWithFast 返回同一输入在「快速路径开/关」下的出站字节。测试只
+// 在串行环境里切换开关；生产路径从不修改它。
+func streamBytesWithFast(t *testing.T, raw string, fast bool, opts ...StreamOption) (string, error) {
+	t.Helper()
+	old := fastFrameDisabled
+	fastFrameDisabled = !fast
+	defer func() { fastFrameDisabled = old }()
+	rec := httptest.NewRecorder()
+	err := StreamHint(rec, strings.NewReader(raw), nil, opts...)
+	return rec.Body.String(), err
+}
+
+// TestFastFrameMatchesLegacy 对所有必须回退与允许直出的帧形态，确认快速路径
+// 的出站字节与旧路径完全一致。快速路径只负责普通 content/role/finish 帧，
+// error/usage/tool_calls/repair/空流/截断流仍由旧路径语义决定。
+func TestFastFrameMatchesLegacy(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+	}{
+		{
+			name: "普通 content 帧（缺 usage，回退补齐）",
+			raw:  "data: {\"id\":\"x1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n",
+		},
+		{
+			name: "规范化形状的 content 帧（直出）",
+			raw:  "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":null,\"index\":0}],\"created\":1,\"id\":\"x1\",\"model\":\"m\",\"object\":\"chat.completion.chunk\",\"service_tier\":\"\",\"system_fingerprint\":\"\",\"usage\":null}\n\ndata: [DONE]\n\n",
+		},
+		{
+			name: "role 首帧 + content + finish",
+			raw:  "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null,\"index\":0}],\"created\":1,\"id\":\"x1\",\"model\":\"m\",\"object\":\"chat.completion.chunk\",\"service_tier\":\"\",\"system_fingerprint\":\"\",\"usage\":null}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":null,\"index\":0}],\"created\":1,\"id\":\"x1\",\"model\":\"m\",\"object\":\"chat.completion.chunk\",\"service_tier\":\"\",\"system_fingerprint\":\"\",\"usage\":null}\n\ndata: {\"id\":\"x1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"total_tokens\":7}}\n\ndata: [DONE]\n\n",
+		},
+		{
+			name: "缺少 id 的中间帧仍按 firstID 续传",
+			raw:  "data: {\"choices\":[{\"delta\":{\"content\":\"a\"},\"finish_reason\":null,\"index\":0}],\"created\":1,\"id\":\"x1\",\"model\":\"m\",\"object\":\"chat.completion.chunk\",\"service_tier\":\"\",\"system_fingerprint\":\"\",\"usage\":null}\n\ndata: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"b\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n",
+		},
+		{
+			name: "error 帧",
+			raw:  "data: {\"error\":{\"code\":6004,\"message\":\"limited\"}}\n\ndata: [DONE]\n\n",
+		},
+		{
+			name: "usage 对象帧",
+			raw:  "data: {\"id\":\"x1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":5,\"total_tokens\":7,\"prompt_tokens_details\":{\"cached_tokens\":3}}}\n\ndata: [DONE]\n\n",
+		},
+		{
+			name: "tool_calls 帧",
+			raw:  "data: {\"id\":\"x1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"run\",\"arguments\":\"{}\"}}]},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n",
+		},
+		{
+			name: "正文里的工具标记（repair 启用）",
+			raw:  "data: {\"id\":\"x1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"<tool_call name=\\\"run\\\">{\\\"x\\\":1}</tool_call>\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n",
+		},
+		{
+			name: "空流",
+			raw:  "data: [DONE]\n\n",
+		},
+		{
+			name: "截断流（只有 role）",
+			raw:  "data: {\"id\":\"x1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := []StreamOption(nil)
+			bodyOpts := []StreamOption(nil)
+			if strings.Contains(tc.name, "repair") {
+				// 每条流必须使用独立的修复器（其 Feed/Flush 有跨帧状态）。
+				opts = []StreamOption{WithMarkupRepair(NewMarkupRepair(map[string]bool{"run": true}, false))}
+				bodyOpts = []StreamOption{WithMarkupRepair(NewMarkupRepair(map[string]bool{"run": true}, false))}
+			}
+			fastBody, fastErr := streamBytesWithFast(t, tc.raw, true, opts...)
+			legacyBody, legacyErr := streamBytesWithFast(t, tc.raw, false, bodyOpts...)
+			if (fastErr == nil) != (legacyErr == nil) {
+				t.Fatalf("err mismatch fast=%v legacy=%v", fastErr, legacyErr)
+			}
+			if fastBody != legacyBody {
+				t.Fatalf("body mismatch\nfast:   %q\nlegacy: %q", fastBody, legacyBody)
+			}
+		})
+	}
+}
+
+// TestFastFrameFallsBackOnUnsafeShapes 直接验证判定条件：任何会被规范化改写
+// 的形态都必须返回 ok=false，而不是原样透传。
+func TestFastFrameFallsBackOnUnsafeShapes(t *testing.T) {
+	cases := map[string]string{
+		"finish_reason 空串":       `{"id":"x","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":""}]}`,
+		"content 为空":             `{"id":"x","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":""},"finish_reason":null}]}`,
+		"content 含转义":            `{"id":"x","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"a\\nb"},"finish_reason":null}]}`,
+		"content 含 HTML 字符":      `{"id":"x","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"<tag>"},"finish_reason":null}]}`,
+		"未知顶层字段":                 `{"id":"x","object":"chat.completion.chunk","junk":1,"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}`,
+		"reasoning_content":      `{"id":"x","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"hi","reasoning_content":"r"},"finish_reason":null}]}`,
+		"refusal":                `{"id":"x","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"hi","refusal":"no"},"finish_reason":null}]}`,
+		"tool_calls":             `{"id":"x","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"hi","tool_calls":[]},"finish_reason":null}]}`,
+		"error":                  `{"id":"x","object":"chat.completion.chunk","error":{"code":6004},"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}`,
+		"usage 对象":               `{"id":"x","object":"chat.completion.chunk","usage":{"total_tokens":1},"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}`,
+		"finish_reason 非 stop":   `{"id":"x","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"length"}]}`,
+		"choice 缺 finish_reason": `{"id":"x","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"hi"}}]}`,
+		"content 帧带非 null 收尾":    `{"id":"x","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":"stop"}]}`,
+		"空 choices":              `{"id":"x","object":"chat.completion.chunk","choices":[]}`,
+		"object 非 chunk":         `{"id":"x","object":"chat.completion","choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}`,
+		"缺 object":               `{"id":"x","choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}`,
+		"非法 JSON":                `{"id":"x",`,
+	}
+	for name, payload := range cases {
+		t.Run(name, func(t *testing.T) {
+			id := ""
+			if raw, kind, ok := fastFrame([]byte(payload), &id, true, nil); ok {
+				t.Fatalf("unsafe frame passed through: kind=%d raw=%s", kind, raw)
+			}
+		})
+	}
+}
+
+// TestFastFrameIDContinuity 钉死 id 续传：role 首帧也记录 firstID，缺 id 的
+// content 帧由快速路径补上与旧路径相同的 id。
+func TestFastFrameIDContinuity(t *testing.T) {
+	firstID := ""
+	role := []byte(`{"choices":[{"delta":{"role":"assistant"},"finish_reason":null,"index":0}],"created":1,"id":"real-id","model":"m","object":"chat.completion.chunk","service_tier":"","system_fingerprint":"","usage":null}`)
+	if _, kind, ok := fastFrame(role, &firstID, false, nil); !ok || kind != fastFrameNoop || firstID != "real-id" {
+		t.Fatalf("role frame must record id: ok=%v kind=%d id=%q", ok, kind, firstID)
 	}
 }

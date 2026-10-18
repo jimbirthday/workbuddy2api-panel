@@ -676,6 +676,27 @@ func TestPromptDefaultPassthrough(t *testing.T) {
 	// passthrough 不加载提示词文本（透传客户端 system）；切 custom 时 normalize 会加载。
 }
 
+func TestBackgroundModelConfigNormalize(t *testing.T) {
+	c, err := ParseConfig([]byte(`{"background_models":{"names":" GPT-5.6-TERRA, gpt-5.6-* ,gpt-5.6-terra ","target":" deepseek-v4.1-flash "}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.BackgroundModels.Names != "GPT-5.6-TERRA,gpt-5.6-*" {
+		t.Fatalf("names=%q want deduped ordered list", c.BackgroundModels.Names)
+	}
+	if c.BackgroundModels.Target != "deepseek-v4.1-flash" {
+		t.Fatalf("target=%q", c.BackgroundModels.Target)
+	}
+	// 只有一边配置 = 关闭，不能静默把请求改写成空模型。
+	c, err = ParseConfig([]byte(`{"background_models":{"names":"gpt-5.6-terra"}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.BackgroundModels.Names != "" || c.BackgroundModels.Target != "" {
+		t.Fatalf("half-configured alias must be disabled: %+v", c.BackgroundModels)
+	}
+}
+
 // TestPromptExplicitPassthrough passthrough 模式不加载文本（透传客户端原始 system）。
 func TestPromptExplicitPassthrough(t *testing.T) {
 	dir := t.TempDir()
@@ -857,5 +878,103 @@ func TestServerReadTimeout(t *testing.T) {
 	c.Server.ReadTimeout = "bogus"
 	if err := c.normalize(); err == nil {
 		t.Error("unparsable read_timeout should fail fast")
+	}
+}
+
+// 旧配置兼容：顶层 api_key 允许历史短键（如 "k"），新增 api_keys 才做最小长度校验。
+func TestLegacyAPIKeyShortValueStillLoads(t *testing.T) {
+	c, err := ParseConfig([]byte(`{"api_key":"k"}`))
+	if err != nil {
+		t.Fatalf("legacy api_key must still load: %v", err)
+	}
+	if c.APIKey != "k" {
+		t.Fatalf("api_key=%q want k", c.APIKey)
+	}
+}
+
+func TestAPIKeysValidationAndKeyring(t *testing.T) {
+	ok, err := ParseConfig([]byte(`{
+		"api_key":"legacy-key",
+		"api_keys":[
+			{"id":"cn","name":"CN","key":"cn-secret","realm":"cn","models":["glm-*"]},
+			{"id":"off","key":"off-secret","enabled":false},
+			{"id":"global","key":"global-secret","realm":"GLOBAL"}
+		]
+	}`))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	ring := ok.keyring()
+	if len(ring) != 4 {
+		t.Fatalf("keyring len=%d want 4 (legacy + 3): %+v", len(ring), ring)
+	}
+	if ring[0].ID != "legacy" || ring[0].Key != "legacy-key" {
+		t.Fatalf("legacy entry=%+v", ring[0])
+	}
+	if ring[1].Realm != "cn" || len(ring[1].Models) != 1 || ring[1].Models[0] != "glm-*" {
+		t.Fatalf("cn entry=%+v", ring[1])
+	}
+	if ring[2].Enabled {
+		t.Fatalf("explicit enabled=false ignored: %+v", ring[2])
+	}
+	if ring[3].Realm != "global" {
+		t.Fatalf("realm normalization failed: %+v", ring[3])
+	}
+
+	bad := []string{
+		`{"api_keys":[{"id":"","key":"abcd"}]}`,
+		`{"api_keys":[{"id":"a","key":"abcd"},{"id":"a","key":"efgh"}]}`,
+		`{"api_keys":[{"id":"legacy","key":"abcd"}]}`,
+		`{"api_keys":[{"id":"a","key":""}]}`,
+		`{"api_keys":[{"id":"a","key":"abc"}]}`,
+		`{"api_keys":[{"id":"a","key":"abcd","realm":"eu"}]}`,
+	}
+	for _, raw := range bad {
+		if _, err := ParseConfig([]byte(raw)); err == nil {
+			t.Errorf("want validation error for %s", raw)
+		}
+	}
+}
+
+// 白空白 legacy key 必须拒绝，但历史短键不受影响。
+func TestAPIKeysWhitespaceLegacyRejected(t *testing.T) {
+	if _, err := ParseConfig([]byte(`{"api_key":"   "}`)); err == nil {
+		t.Fatal("whitespace-only legacy api_key must be rejected")
+	}
+}
+
+// 迁移场景：旧配置只有短 api_key，用户逐步加入 api_keys 后，旧客户端仍可用
+// legacy 身份；新增条目的 key 原文（含首尾空白）不得被 Trim 改写。
+func TestLegacyShortKeyMigratesAlongsideAPIKeys(t *testing.T) {
+	c, err := ParseConfig([]byte(`{
+		"api_key":"k",
+		"api_keys":[{"id":"client","key":"  spaced-secret  ","realm":"cn"}]
+	}`))
+	if err != nil {
+		t.Fatalf("legacy migration must load: %v", err)
+	}
+	ring := c.keyring()
+	if len(ring) != 2 {
+		t.Fatalf("keyring len=%d want 2: %+v", len(ring), ring)
+	}
+	if ring[0].ID != "legacy" || ring[0].Key != "k" {
+		t.Fatalf("legacy short key changed: %+v", ring[0])
+	}
+	if ring[1].Key != "  spaced-secret  " {
+		t.Fatalf("api_keys key must preserve raw value: %q", ring[1].Key)
+	}
+}
+
+// keyring 每次返回独立切片，避免 livecfg 热更新与配置共享底层数组。
+func TestKeyringReturnsIndependentSlices(t *testing.T) {
+	c, err := ParseConfig([]byte(`{"api_keys":[{"id":"a","key":"abcd","models":["glm-*"]}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := c.keyring()
+	b := c.keyring()
+	a[0].Models[0] = "mutated"
+	if b[0].Models[0] != "glm-*" {
+		t.Fatal("keyring copies must not share Models backing array")
 	}
 }

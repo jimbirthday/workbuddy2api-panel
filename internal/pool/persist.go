@@ -9,6 +9,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
@@ -185,6 +186,8 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 			softStreak:               s.SoftStreak,
 			sessionDeadFails:         s.SessionDeadFails,
 			consecutiveFails:         s.ConsecutiveFails,
+			weight:                   stateWeight(s.Weight),
+			note:                     strings.TrimSpace(s.Note),
 		}
 		// 到期快照按当前时刻惰性清洗：已过期、零剩余或超出总余额的脏数据不恢复。
 		if e.creditsExpiring < 0 {
@@ -287,7 +290,10 @@ func (p *Pool) saveSnapshot(sf stateFile, seq uint64) {
 		// 乱序到达的旧快照（更晚采集的快照已落盘）：跳过，避免用旧状态覆盖新状态。
 		return
 	}
-	raw, err := json.MarshalIndent(sf, "", "  ")
+	// compact JSON：state.json 只供程序读取（排障用 jq 同样可读），每 5 秒
+	// 一次的全量落盘没必要为缩进付出约 2 倍字节数与额外分配；470 账号实测
+	// compact 比 MarshalIndent 少约一半 CPU/内存，磁盘写入也更短。
+	raw, err := json.Marshal(sf)
 	if err != nil {
 		p.recordPersistFail(err)
 		return
@@ -327,7 +333,7 @@ func (p *Pool) saveSnapshot(sf stateFile, seq uint64) {
 // 解析路径无需改动。若 raw 不是预期的对象形态（理论上不会发生），回退到完整
 // Marshal，绝不让镜像写出一份不可恢复的快照。
 func snapshotFromStateJSON(raw []byte, savedAt time.Time) (json.RawMessage, error) {
-	trimmed := compactJSON(raw)
+	trimmed := compactJSONInto(raw, raw)
 	if len(trimmed) >= 2 && trimmed[0] == '{' && trimmed[len(trimmed)-1] == '}' {
 		saved, err := json.Marshal(snapshotSavedAt{Time: savedAt})
 		if err != nil {
@@ -352,7 +358,17 @@ func snapshotFromStateJSON(raw []byte, savedAt time.Time) (json.RawMessage, erro
 // compactJSON 去掉 JSON 字符串外的空白，输出紧凑 JSON。只做一遍线性扫描，
 // 保留字符串内的空白（含转义引号），比 json.Compact 少一次 bytes.Buffer 的增长。
 func compactJSON(raw []byte) []byte {
-	out := make([]byte, 0, len(raw)/2)
+	return compactJSONInto(nil, raw)
+}
+
+// compactJSONInto 与 compactJSON 等价，但允许调用方提供可复用的 dst。dst 只在
+// 需要独立缓冲时传 nil；若传入 raw 本身，则原地压缩（调用方必须不再使用 raw）。
+// 快照路径的 raw 是本地写盘后即弃的副本，原地压缩可省掉一份 ~32KB 的临时缓冲。
+func compactJSONInto(dst, raw []byte) []byte {
+	out := dst[:0]
+	if cap(out) < len(raw)/2 {
+		out = make([]byte, 0, len(raw)/2)
+	}
 	inString, escaped := false, false
 	for _, c := range raw {
 		if inString {
@@ -476,6 +492,8 @@ func (p *Pool) stateOverviewLocked() stateFile {
 			CreditsExpiring:          e.creditsExpiring,
 			CreditsEarliestExpiry:    e.creditsEarliestExpiry,
 			CreditsEarliestRemaining: e.creditsEarliestRemaining,
+			Weight:                   e.weight,
+			Note:                     e.note,
 		}
 		// 熔断截止：仅未过期才落盘（指针 nil 才能被 omitempty 真省略）。
 		if !e.breakerUntil.IsZero() && now.Before(e.breakerUntil) {

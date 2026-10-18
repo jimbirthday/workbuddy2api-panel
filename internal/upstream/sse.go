@@ -3,6 +3,7 @@ package upstream
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,6 +14,51 @@ import (
 	"time"
 )
 
+const sseDataPrefix = "data:"
+
+// sseLineReader 读取一条完整 SSE 行。ReadSlice 的正常路径直接返回 bufio
+// 内部切片（零分配）；只有单行超过缓冲容量时才把分片拼进 lineBuf。
+// 返回的切片仅在下一次调用前有效，调用方必须在同一轮循环内消费完。
+type sseLineReader struct {
+	br      *bufio.Reader
+	lineBuf []byte
+}
+
+func newSSELineReader(r io.Reader) *sseLineReader {
+	return &sseLineReader{br: bufio.NewReaderSize(r, 64*1024)}
+}
+
+func (s *sseLineReader) readLine() ([]byte, error) {
+	line, err := s.br.ReadSlice('\n')
+	if err != bufio.ErrBufferFull {
+		return line, err
+	}
+	s.lineBuf = append(s.lineBuf[:0], line...)
+	for {
+		line, err = s.br.ReadSlice('\n')
+		s.lineBuf = append(s.lineBuf, line...)
+		if err != bufio.ErrBufferFull {
+			return s.lineBuf, err
+		}
+	}
+}
+
+// sseDataPayload 返回 SSE data 字段的内容（不含行尾 \r\n）。按规范接受
+// "data:" 后零个或多个空格，也接受 JSON 紧贴冒号的 "data:{...}"；上游确实
+// 存在这两种合法变体。非 data 行（含 "database:" 这类同前缀字段）返回 nil。
+func sseDataPayload(line []byte) []byte {
+	line = bytes.TrimRight(line, "\r\n")
+	if !bytes.HasPrefix(line, []byte(sseDataPrefix)) {
+		return nil
+	}
+	payload := line[len(sseDataPrefix):]
+	if len(payload) > 0 && payload[0] != ' ' && payload[0] != '\t' {
+		// "data:" 必须正好是字段名；"data:{"x"}" 合法，"datax..." 不合法。
+		return payload
+	}
+	return bytes.TrimLeft(payload, " \t")
+}
+
 // errEmptyStream 上游返回 200 但没有有效 SSE 数据帧（空流/只有注释/[DONE]）。
 // 用哨兵错误替代裸 fmt.Errorf：StreamHint 的调用方（handler 流式路径）需要区分
 // 「上游空流」与「客户端断连写失败」——空流是上游缺陷，应记 502 观测；写失败是
@@ -20,8 +66,9 @@ import (
 var errEmptyStream = errors.New("upstream stream contained no valid data events")
 
 // IsEmptyStreamError 报告错误是否为「上游空流」（无有效 SSE 帧）——供 handler
-// 在流式路径把空流记为失败观测（HTTP 头已发出只能 200，但日志/状态应收敛到
-// upstream_parse 同语义），与客户端断连类错误区分。
+// 在流式路径把空流记为失败观测并返回真实 502。StreamHint 在空流时不写任何
+// 字节（200 成功头延迟到首个正文帧），因此调用方仍可自由选择错误状态码；
+// 与客户端断连类错误区分。
 func IsEmptyStreamError(err error) bool { return errors.Is(err, errEmptyStream) }
 
 // ErrFrame 承载「上游以 SSE error 帧报错」的原始 payload（非 HTTP >=400 形态）。
@@ -61,10 +108,10 @@ func IsStreamReadError(err error) bool {
 }
 
 // Aggregate 读取完整 SSE 流，聚合 delta.content 为单个 OpenAI chat.completion 响应。
-// 分片/半行由 bufio.Reader.ReadString 处理；遇到 "data: [DONE]" 结束。
+// 分片/半行由 sseLineReader 处理；遇到 "data: [DONE]" 结束。
 // tool_calls 以流式 delta 到达（按 index 合并：首片带 id/type/name，后续只带 arguments 片段）。
 func Aggregate(r io.Reader) (map[string]any, error) {
-	br := bufio.NewReaderSize(r, 64*1024)
+	lr := newSSELineReader(r)
 	var (
 		id, model     string
 		created       float64
@@ -82,6 +129,10 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 		sawDone     bool // 上游显式发过 data: [DONE]（正常收尾）
 		toolCalls   = map[int]map[string]any{}
 		toolOrder   []int
+		// legacyFunctionCall 累积遗留 function_call（非 tool_calls 数组形态）。
+		// 上游真实流里 name 在首片、arguments 在后续分片；必须合并而不是丢弃，
+		// 否则合法的 function_call-only 回答会被最终闸门误判为空流。
+		legacyFunctionCall map[string]any
 		// toolSeq 缺 index 的 tool_call 的分配序号源：跨帧延续「最近分配」槽位，
 		// 同帧内递增（见 mergeToolCallsChunk 注释）。
 		toolSeq int
@@ -178,22 +229,23 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 		if tcs, ok := msg["tool_calls"].([]any); ok {
 			mergeToolCallsChunk(tcs)
 		}
+		if fc, ok := msg["function_call"].(map[string]any); ok {
+			mergeLegacyFunctionCall(&legacyFunctionCall, fc)
+		}
 	}
 	for {
-		line, err := br.ReadString('\n')
+		line, err := lr.readLine()
 		if err != nil && err != io.EOF {
 			return nil, err
 		}
-		line = strings.TrimRight(line, "\r\n")
-		if strings.HasPrefix(line, "data: ") {
-			payload := strings.TrimPrefix(line, "data: ")
-			if payload == "[DONE]" {
+		if payload := sseDataPayload(line); payload != nil {
+			if bytes.Equal(payload, []byte("[DONE]")) {
 				// 上游显式结束：停止读取，DONE 之后的任何数据一律忽略。
 				sawDone = true
 				break
 			} else {
 				var chunk map[string]any
-				if json.Unmarshal([]byte(payload), &chunk) == nil {
+				if json.Unmarshal(payload, &chunk) == nil {
 					// 上游 error 帧（HTTP 200 已开流 + 首帧 error，真实形态）：
 					// 不是回答正文。若继续走下面的 validEvents++，会合成出
 					// content:"" + finish_reason:"stop" 的 200 假成功，客户端误判成
@@ -201,12 +253,18 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 					// 原样带出帧原文，交给 handler 复用流式同一套 FrameKind/Classify
 					// 分类与冷却分支（6004 只锁该模型，账号对其他模型仍可选）。
 					if frameIsError(chunk) {
-						return nil, &ErrFrame{Payload: payload}
+						return nil, &ErrFrame{Payload: string(payload)}
 					}
 					// 有效事件计数：只有真正可用的回答/收尾事件才算，不能用「JSON
 					// 解析成功」代替。上游常见 {"choices":[]} 控制帧、纯元信息帧
 					// 可解析但没有回答；若计入，最终会合成 200 空内容并记账成功。
 					hasContent := frameHasUsableChoice(chunk)
+					// 遗留 function_call 也会被下面并入聚合 message；它本身是
+					// 客户端可见的工具调用，必须算有效事件，否则合法的
+					// function_call-only 流会在 validEvents==0 处被误判为空流。
+					if !hasContent && chunkHasLegacyFunctionCall(chunk) {
+						hasContent = true
+					}
 					hasFinish := frameHasFinishReason(chunk)
 					if hasContent || (hasFinish && gotAnswer) {
 						validEvents++
@@ -247,6 +305,9 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 								}
 								if tcs, ok := delta["tool_calls"].([]any); ok {
 									mergeToolCallsChunk(tcs)
+								}
+								if fc, ok := delta["function_call"].(map[string]any); ok {
+									mergeLegacyFunctionCall(&legacyFunctionCall, fc)
 								}
 							}
 							// 有的上游把完整消息放在 message 里（非 delta）：
@@ -302,6 +363,20 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 			message["tool_calls"] = calls
 		}
 	}
+	if len(legacyFunctionCall) > 0 {
+		name, _ := legacyFunctionCall["name"].(string)
+		args, _ := legacyFunctionCall["arguments"].(string)
+		// 遗留 function_call 与标准 tool_calls 同口径：截断时残缺参数不得交付。
+		// 否则 finish_reason=length / 缺 [DONE] 的半截 JSON 会以 200 返回，
+		// 客户端解析失败后卡死会话；清空后由下方最终闸门返回 errEmptyStream。
+		if (finishReason == "length" || !sawDone) && isTruncatedArguments(args) {
+			args = ""
+			name = ""
+		}
+		if name != "" || args != "" {
+			message["function_call"] = legacyFunctionCall
+		}
+	}
 	// 截断识别：上游连接中断（EOF 收尾但从未发 data: [DONE]，sawDone=false）时
 	// 正文可能被截断，而 finish_reason 仍是默认 "stop"——客户端无法察觉，会把
 	// 半句话当完整回答落库。这里把「未正常收尾」如实报出来（与上方 tool_calls
@@ -312,6 +387,14 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 	// 无正文（如仅 role 帧的收尾）不涉及截断，保留原 finish_reason。
 	if !sawDone && finishReason == "stop" && gotAnyContent {
 		finishReason = "length"
+	}
+	// 聚合后的最终有效性校验：event 层看起来「有内容」不等于能交付给客户端。
+	// 截断流里的 tool_calls 参数会被 dropTruncatedToolCalls 全部丢弃；上游也可能
+	// 只发 {"index":0} 的空壳 tool_call。此时若直接构造响应，就会得到 content:""
+	// 的空消息——正是非流式假成功。必须把「非空正文/思考/带名称或参数的
+	// tool_calls 或遗留 function_call」作为最后一道闸。
+	if !aggregateHasDeliverableAnswer(content.String(), reasoning.String(), message) {
+		return nil, errEmptyStream
 	}
 	resp := map[string]any{
 		"id":      id,
@@ -334,6 +417,66 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 		resp["usage"] = normalizeUsageCacheAliases(ensureUsageTotal(usage))
 	}
 	return resp, nil
+}
+
+// aggregateHasDeliverableAnswer 报告聚合结果是否包含客户端实际可消费的回答。
+// 非空 content/reasoning 或至少一个带名称/参数的 tool_call 才算成功；仅有
+// role/finish_reason、被截断过滤后为空的 tool_calls、或上游只发 {"index":0} /
+// 仅 id/type 的空壳调用，都不是回答。
+func aggregateHasDeliverableAnswer(content, reasoning string, message map[string]any) bool {
+	if content != "" || reasoning != "" {
+		return true
+	}
+	for _, call := range aggregateToolCalls(message) {
+		if toolCallHasPayload(call) {
+			return true
+		}
+	}
+	if fc, ok := message["function_call"].(map[string]any); ok && toolCallHasPayload(fc) {
+		return true
+	}
+	return false
+}
+
+// aggregateToolCalls 把聚合 message 中的 tool_calls 归一成 []map[string]any。
+// 正常路径写入的是 []map[string]any；保留 []any 分支兼容测试/调用方手工构造。
+func aggregateToolCalls(message map[string]any) []map[string]any {
+	switch calls := message["tool_calls"].(type) {
+	case []map[string]any:
+		return calls
+	case []any:
+		out := make([]map[string]any, 0, len(calls))
+		for _, item := range calls {
+			if call, ok := item.(map[string]any); ok {
+				out = append(out, call)
+			}
+		}
+		return out
+	}
+	return nil
+}
+
+// toolCallHasPayload 判断一个工具调用是否带可交付信息。id/type 单独存在不算
+// 回答：上游可能只发 {"index":0} 的空壳分片，客户端无法据此执行任何工具。
+// 名称或参数非空才算有效内容（空参数是合法的无参工具）。
+func toolCallHasPayload(call map[string]any) bool {
+	// 顶层 name/arguments 用于遗留 function_call；标准 tool_call 则放在
+	// nested function 对象下。两种形态都必须识别，否则合法工具调用会被误判为空壳。
+	if name, _ := call["name"].(string); name != "" {
+		return true
+	}
+	if args, _ := call["arguments"].(string); args != "" {
+		return true
+	}
+	if fn, ok := call["function"].(map[string]any); ok {
+		if name, _ := fn["name"].(string); name != "" {
+			return true
+		}
+		if args, _ := fn["arguments"].(string); args != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // ensureUsageTotal 在 usage 缺 total_tokens 但 prompt_tokens/completion_tokens 都在时
@@ -399,6 +542,27 @@ func mergeToolCallDelta(merged, delta map[string]any) {
 			mf["arguments"] = prev + v
 		} else {
 			mf["arguments"] = v
+		}
+	}
+}
+
+// mergeLegacyFunctionCall 合并遗留 function_call 分片：name 直覆盖（后续片通常
+// 缺省），arguments 拼接（与 tool_calls 的 function.arguments 同语义）。
+func mergeLegacyFunctionCall(dst *map[string]any, fc map[string]any) {
+	if len(fc) == 0 {
+		return
+	}
+	if *dst == nil {
+		*dst = map[string]any{}
+	}
+	if v, ok := fc["name"].(string); ok && v != "" {
+		(*dst)["name"] = v
+	}
+	if v, ok := fc["arguments"].(string); ok && v != "" {
+		if prev, _ := (*dst)["arguments"].(string); prev != "" {
+			(*dst)["arguments"] = prev + v
+		} else {
+			(*dst)["arguments"] = v
 		}
 	}
 }
@@ -536,7 +700,8 @@ func normalizeFrame(obj map[string]any) map[string]any {
 }
 
 // Stream 透传上游 SSE 到 w（逐帧规范化后 flush），保证至少写一个 [DONE]。
-// 调用方必须先设置过 status 200；本函数自设 SSE headers。
+// 成功头与 SSE headers 在首个有效内容帧写出时才提交；空流返回 errEmptyStream
+// 且不写任何字节，调用方仍可返回真实错误状态码。
 // 流式策略：逐帧透传（规范化已剥空 content 噪声），恢复与上游一致的平滑流式。
 //
 // StreamHint 变体（gateway_hint 任务）：上游 error 帧透传时附加
@@ -545,6 +710,11 @@ func normalizeFrame(obj map[string]any) map[string]any {
 func Stream(w http.ResponseWriter, r io.Reader) error {
 	return StreamHint(w, r, nil)
 }
+
+// fastFrameDisabled 仅供测试强制关闭快速路径，用同一输入对比新旧出站字节。
+// 生产默认开启；fastFrame 只直出与 normalizeFrame+json.Marshal 逐字节等价的
+// 规范键序帧，其余形态（含上游常见非规范键序）全部回退旧路径。
+var fastFrameDisabled bool
 
 // StreamOption StreamHint 的可选行为开关。
 // WithErrorFrameObserver 只做旁路观测、不改透传字节；WithMarkupRepair 会改写出站
@@ -591,10 +761,14 @@ func WithErrorFrameObserver(fn func(payload string)) StreamOption {
 	return func(o *streamOptions) { o.onErrorFrame = fn }
 }
 
+// maxHeldStreamBytes 是「首个正文帧之前」允许缓冲的上游帧字节上限。缓冲的帧
+// 不含正文（role-only/心跳/注释），1 MiB 足够容纳正常流的元信息，超出即丢弃。
+const maxHeldStreamBytes = 1 << 20
+
 // StreamHint 同 Stream，但上游 error 帧透出前把 hintFn(payload) 的返回值写入
 // error.gateway_hint。hintFn 为 nil 或返回空串 → 原样透传（零改写）。
-// 空流兜底 error 帧（"empty upstream stream"）不带 hint（网关本地故障形态
-// 未覆盖，不编造）。
+// 空流不写任何字节并返回 errEmptyStream：成功头只在首个有效内容写出时提交，
+// 调用方因此可以返回真实 502/native 错误信封，而不是 200 + 空回答。
 // opts：旁路观测开关（见 WithErrorFrameObserver），不改变任何透传字节。
 func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, opts ...StreamOption) error {
 	var o streamOptions
@@ -603,12 +777,24 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 			f(&o)
 		}
 	}
-	h := w.Header()
-	h.Set("Content-Type", "text/event-stream")
-	h.Set("Cache-Control", "no-cache")
-	h.Set("Connection", "keep-alive")
-	h.Set("X-Accel-Buffering", "no")
 	fl, _ := w.(http.Flusher)
+	// 成功头（200 + SSE）延迟到第一个真正写给客户端的字节。上游 200 但只有
+	// role-only/心跳/空 choices 时一个字节都不写，调用方才能回真实 502（协议层
+	// 还要能返回 JSON native 错误信封）；一旦写出正文，后续 error 帧必须原样
+	// 透传，不能再换号拼流。
+	started := false
+	ensureStarted := func() {
+		if started {
+			return
+		}
+		started = true
+		h := w.Header()
+		h.Set("Content-Type", "text/event-stream")
+		h.Set("Cache-Control", "no-cache")
+		h.Set("Connection", "keep-alive")
+		h.Set("X-Accel-Buffering", "no")
+		w.WriteHeader(http.StatusOK)
+	}
 
 	// toolCallSeen 跨帧记录 delta.tool_calls 里已发过首片的 index，
 	// 供逐 chunk 透传时收敛 name 为「每 index 一次」（对齐 OpenAI 官方流）。
@@ -619,9 +805,12 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 	// gotAnswer 跨帧记录本流是否出现过可用回答内容（正文/思考/tool_calls）。
 	// 收尾帧只有在此为 true 时才计入有效帧，避免 role-only + stop 空流假成功。
 	gotAnswer := false
-	// pending 扣住正文之前的帧（role-only 首帧、注释）。限流 error 帧若出现在
-	// 正文之前，这些字节也不能写出去——一写就提交了 200，换号会拼进同一条流。
+	// pending 扣住正文之前的帧（role-only 首帧、心跳、注释）。这些帧都不是可用
+	// 回答，先写出去只会提交 200 成功头，让空流/正文前错误无法回真实状态码。
+	// 有界：只保留最早的 maxHeldStreamBytes 字节，超出部分丢弃——被缓冲的帧按
+	// 定义不含正文，丢弃不影响回答正确性，可防止恶意上游用无限心跳撑爆内存。
 	var pending []string
+	pendingBytes := 0
 
 	// firstID 透传流的消息级 id 基准：缓存首个非空上游 id，后续帧缺失/空串时复用
 	// （issue #35：同一条 SSE 消息所有帧共用一个真实 id，后台按 id 归并；此前中间帧
@@ -640,6 +829,7 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 
 	// writeDirect 原样写出一行并 flush（低层写出；调用方负责补 "data: " 前缀与帧分隔）。
 	writeDirect := func(line string) error {
+		ensureStarted()
 		if _, werr := io.WriteString(w, line); werr != nil {
 			return werr
 		}
@@ -648,10 +838,15 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 		}
 		return nil
 	}
-	// emit 在「正文未写出且要求扣住 error」时只缓冲。否则立即写给客户端。
+	// emit 在客户端可见正文出现前只缓冲：role-only 首帧、心跳、空 choices 控制帧
+	// 都不能证明这是一次有效回答，先写出去就会提交 200 成功头，空流/正文前 error
+	// 帧便无法再回真实错误码。首个正文帧到达时按原顺序 flush。
 	emit := func(line string) error {
-		if o.holdErrorUntilContent && !clientSawContent {
-			pending = append(pending, line)
+		if !clientSawContent {
+			if pendingBytes+len(line) <= maxHeldStreamBytes {
+				pending = append(pending, line)
+				pendingBytes += len(line)
+			}
 			return nil
 		}
 		return writeDirect(line)
@@ -666,6 +861,7 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 		}
 		buf := pending
 		pending = nil
+		pendingBytes = 0
 		for _, line := range buf {
 			if werr := writeDirect(line); werr != nil {
 				return werr
@@ -734,7 +930,7 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 	// 后的可见文本）+ N 个 delta.tool_calls 帧 + 收尾 finish_reason 帧。没有命中标记
 	// 时原样返回入参帧（单元素），与修复前逐字节一致。
 	repairFrame := func(obj map[string]any) []map[string]any {
-		if !repair.Enabled() {
+		if !fastFrameDisabled && !repair.Enabled() {
 			return []map[string]any{obj}
 		}
 		chs, ok := obj["choices"].([]any)
@@ -795,6 +991,33 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 	// writeFrame 把 payload 按规范白名单重建后以 data: 帧写出并 flush。
 	// 只有真正可用的回答/收尾帧才计数（JSON 解析失败照常降级原样写出，但不计数）。
 	writeFrame := func(payload string) (int, error) {
+		if !repair.Enabled() {
+			payloadBytes := []byte(payload)
+			if raw, kind, ok := fastFrame(payloadBytes, &firstID, gotAnswer, nil); ok {
+				switch kind {
+				case fastFrameContent:
+					if werr := flushPending(); werr != nil {
+						return 0, werr
+					}
+					clientSawContent = true
+					gotAnswer = true
+					if werr := writeSSE(string(raw)); werr != nil {
+						return 0, werr
+					}
+					return 1, nil
+				case fastFrameFinish:
+					if werr := writeSSE(string(raw)); werr != nil {
+						return 0, werr
+					}
+					return 1, nil
+				default:
+					if werr := writeSSE(string(raw)); werr != nil {
+						return 0, werr
+					}
+					return 0, nil
+				}
+			}
+		}
 		var obj map[string]any
 		if json.Unmarshal([]byte(payload), &obj) != nil {
 			// 非 JSON 帧：原样降级写出，不计数（与修复前一致）。扣住态下同样缓冲。
@@ -814,6 +1037,10 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 			// 都算；choices 里夹带的 error 不在此列。
 			if o.holdErrorUntilContent && !clientSawContent {
 				return 0, &ErrStreamHeld{Payload: payload}
+			}
+			// 非扣住态：先按原顺序写出此前缓冲的 role-only/注释，再透传 error 帧。
+			if werr := flushPending(); werr != nil {
+				return 0, werr
 			}
 			// 旁路通知（账号处置用）：原始 payload 交给观察者，透传字节不变。
 			if o.onErrorFrame != nil {
@@ -849,26 +1076,28 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 		return 0, nil
 	}
 
-	br := bufio.NewReaderSize(r, 64*1024)
+	lr := newSSELineReader(r)
 	validFrames := 0
 readLoop:
 	for {
-		line, err := br.ReadString('\n')
-		trimmed := strings.TrimRight(line, "\r\n")
-		switch {
-		case strings.HasPrefix(trimmed, "data: [DONE]"):
-			// 上游显式结束：停止读取，DONE 之后的任何数据（含垃圾帧）一律不再透传。
-			// [DONE] 统一在循环结束后写出，保证恰好一个。
-			break readLoop
-		case strings.HasPrefix(trimmed, "data: "):
-			n, werr := writeFrame(strings.TrimPrefix(trimmed, "data: "))
+		line, err := lr.readLine()
+		trimmed := bytes.TrimRight(line, "\r\n")
+		if payload := sseDataPayload(trimmed); payload != nil {
+			if bytes.Equal(payload, []byte("[DONE]")) {
+				// 上游显式结束：停止读取，DONE 之后的任何数据（含垃圾帧）一律不再透传。
+				// [DONE] 统一在循环结束后写出，保证恰好一个。
+				break readLoop
+			}
+			n, werr := writeFrame(string(payload))
 			validFrames += n
 			if werr != nil {
 				return werr
 			}
-		case trimmed != "":
+			continue
+		}
+		if len(trimmed) != 0 {
 			// 注释/其他行：正文前与 role 帧一起缓冲，避免限流帧出现前已提交响应。
-			if werr := emit(line); werr != nil {
+			if werr := emit(string(line)); werr != nil {
 				return werr
 			}
 		}
@@ -881,6 +1110,12 @@ readLoop:
 			// 包一层，与写客户端失败区分——handler 据此不把该次尝试记成账号成功。
 			return &StreamReadError{Err: err}
 		}
+	}
+	// 空流（0 有效帧）：一个字节都不写——不提交 200 SSE，也不补 error 帧/[DONE]。
+	// 调用方据此回真实 502（协议层还要转成 native 错误信封）。此前先写 error 帧
+	// 会提交 200，客户端把上游缺陷误读成一次成功的空回答。
+	if validFrames == 0 {
+		return errEmptyStream
 	}
 	if werr := flushPending(); werr != nil {
 		return werr
@@ -908,22 +1143,12 @@ readLoop:
 			}
 		}
 	}
-	// 空流（0 有效帧）：先写一帧 error（绕过 normalizeFrame 原样保留 error 字段），
-	// 再补 [DONE] 保证客户端能正常收尾，并返回非 nil error 供调用方记录。
-	// 网关本地空流兜底帧走 hintFn=nil 的直写路径：该形态未覆盖（不编造 hint），
-	// 且 writeRaw 的 hintFn 闭包在空流路径下可能携带上一帧的上下文造成误配。
-	if validFrames == 0 {
-		_ = writeRaw(`{"error":{"message":"empty upstream stream","type":"upstream_error","code":"upstream_parse"}}`)
-	}
 	// 保证恰好写一个 [DONE]（上游漏发时兜底补上）。
 	if _, err := io.WriteString(w, "data: [DONE]\n\n"); err != nil {
 		return err
 	}
 	if fl != nil {
 		fl.Flush()
-	}
-	if validFrames == 0 {
-		return errEmptyStream
 	}
 	return nil
 }
@@ -970,6 +1195,29 @@ func frameIsError(obj map[string]any) bool {
 	}
 	trimmed := strings.TrimSpace(fmt.Sprint(code))
 	return trimmed != "" && trimmed != "0"
+}
+
+// chunkHasLegacyFunctionCall 报告帧的 delta/message 是否带非空遗留
+// function_call。聚合器现在会合并该形态，因此它也必须计入有效事件。
+func chunkHasLegacyFunctionCall(obj map[string]any) bool {
+	choices, _ := obj["choices"].([]any)
+	for _, ci := range choices {
+		c, _ := ci.(map[string]any)
+		if c == nil {
+			continue
+		}
+		if delta, ok := c["delta"].(map[string]any); ok {
+			if fc, ok := delta["function_call"].(map[string]any); ok && len(fc) > 0 {
+				return true
+			}
+		}
+		if msg, ok := c["message"].(map[string]any); ok {
+			if fc, ok := msg["function_call"].(map[string]any); ok && len(fc) > 0 {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // frameHasUsableChoice 报告帧是否包含真正可用的 choice（正文、思考、

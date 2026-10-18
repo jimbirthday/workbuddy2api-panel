@@ -111,6 +111,84 @@ func TestChatStatsReaderBytesPassthrough(t *testing.T) {
 	}
 }
 
+// Read 必须把上游字节原样透传，包括超长行需要暂存、末行没有换行、以及
+// 数据与 EOF 同批返回的边界；统计不能在优化读取路径时丢字节。
+func TestChatStatsReaderPassthroughEdgeCases(t *testing.T) {
+	long := strings.Repeat("x", 70*1024)
+	sse := "data: {\"choices\":[{\"delta\":{\"content\":\"" + long + "\"}}]}\n\n" +
+		"data: {\"usage\":{\"completion_tokens\":7}}\n\n" +
+		"data: [DONE]"
+	r := newChatStatsReaderSince(strings.NewReader(sse), time.Now())
+	buf := make([]byte, 1024)
+	var got strings.Builder
+	for {
+		n, err := r.Read(buf)
+		got.Write(buf[:n])
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("read: %v", err)
+		}
+	}
+	if got.String() != sse {
+		t.Fatalf("passthrough mismatch: got %d bytes want %d", got.Len(), len(sse))
+	}
+	if toks, ok := r.Tokens(); !ok || toks != 7 {
+		t.Fatalf("tokens=%d ok=%v, want 7/true", toks, ok)
+	}
+}
+
+// SSE 单行超过 bufio 默认 64KB 缓冲时，ReadSlice 会返回 ErrBufferFull。该错误
+// 只表示本行已被切段，绝不能当成流结束；完整行仍需原样透传并在下一轮继续读。
+func TestChatStatsReaderPassthroughLineOverBuffer(t *testing.T) {
+	long := strings.Repeat("y", 130*1024)
+	sse := "data: {\"choices\":[{\"delta\":{\"content\":\"" + long + "\"}}]}\n\n" +
+		"data: {\"usage\":{\"completion_tokens\":3}}\n\ndata: [DONE]\n\n"
+	r := newChatStatsReaderSince(strings.NewReader(sse), time.Now())
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if string(out) != sse {
+		t.Fatalf("passthrough mismatch: got %d bytes want %d", len(out), len(sse))
+	}
+	if toks, ok := r.Tokens(); !ok || toks != 3 {
+		t.Fatalf("tokens=%d ok=%v, want 3/true", toks, ok)
+	}
+}
+
+// parseSSELine 是保留给单测/调用方的 string 入口，必须与字节入口逐字段一致；
+// 两边共享同一实现，这里钉住转接层没有引入 TTFB 或 usage 语义漂移。
+func TestChatStatsReaderStringAndBytesEntryEquivalent(t *testing.T) {
+	lines := []string{
+		`data: {"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12,"credit":0.5,"prompt_cache_hit_tokens":7,"prompt_cache_miss_tokens":3}}`,
+		`data: {"error":{"code":6004,"message":"limited"}}`,
+		`data: {"error":null}`,
+		`data: {"error":{}}`,
+		`data: [DONE]`,
+		`event: ping`,
+	}
+	var fromString, fromBytes chatStatsReader
+	fromString.start = time.Now().Add(-time.Second)
+	fromBytes.start = fromString.start
+	for _, line := range lines {
+		fromString.parseSSELine(line)
+		fromBytes.parseSSELineBytes([]byte(line))
+	}
+	sc, scOK := fromString.Credit()
+	bc, bcOK := fromBytes.Credit()
+	if fromString.Usage() != fromBytes.Usage() || sc != bc || scOK != bcOK ||
+		fromString.SawErrorFrame() != fromBytes.SawErrorFrame() {
+		t.Fatalf("string=%+v/%v,%v/%v bytes=%+v/%v,%v/%v", fromString.Usage(), sc, scOK, fromString.SawErrorFrame(),
+			fromBytes.Usage(), bc, bcOK, fromBytes.SawErrorFrame())
+	}
+	// TTFB 是墙钟观测，两次调用之间必然有微小差异；这里只要求两边都记录到了首帧。
+	if fromString.TTFB() <= 0 || fromBytes.TTFB() <= 0 {
+		t.Fatalf("ttfb string=%v bytes=%v", fromString.TTFB(), fromBytes.TTFB())
+	}
+}
+
 func TestRequestMetricsRecordsStream(t *testing.T) {
 	up := newFakeUpstream(t, func(string) (int, string, bool) {
 		return 200, sseOK, true
@@ -327,7 +405,7 @@ func TestLogChatRowExtendedFields(t *testing.T) {
 	withChatLog(t)
 	out := captureStdout(t, func() {
 		logChatRowEx(10*time.Millisecond, 2*time.Second, "glm-5.3", "stream", "u123456789", "示例号",
-			http.StatusOK, 42, "req-abc123", reqlog.OutcomeSuccess, 2, 1.25, true, "", "")
+			http.StatusOK, 42, "req-abc123", reqlog.OutcomeSuccess, 2, 1.25, true, "", "", "")
 	})
 	for _, want := range []string{"rid=req-abc123", "out=success", "try=2", "credit=1.2500"} {
 		if !strings.Contains(out, want) {
@@ -346,7 +424,7 @@ func TestLogChatRowSourceFields(t *testing.T) {
 	out := captureStdout(t, func() {
 		logChatRowEx(10*time.Millisecond, 2*time.Second, "glm-5.3", "stream", "u123456789", "示例号",
 			http.StatusOK, 42, "req-abc123", reqlog.OutcomeSuccess, 1, 0, false,
-			"203.0.113.7", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+			"203.0.113.7", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36", "")
 	})
 	for _, want := range []string{`src=203.0.113.7`, `ua="Chrome/120.0.0.0"`} {
 		if !strings.Contains(out, want) {
@@ -482,5 +560,80 @@ func TestHealthzDoesNotLogTableRow(t *testing.T) {
 	})
 	if strings.Contains(out, "| #") {
 		t.Errorf("healthz/models/status must not emit table rows:\n%s", out)
+	}
+}
+
+// BenchmarkChatStatsReaderSSE 统计层只应在 usage/error 帧完整解码。常见的
+// content/tool_calls delta 帧通过字节预过滤直接跳过；基准用于防止回退到
+// “每帧 json.Unmarshal 两次”。
+func BenchmarkChatStatsReaderSSE(b *testing.B) {
+	const frames = 500
+	payloads := make([]string, frames)
+	total := 0
+	for i := range payloads {
+		payloads[i] = `{"id":"x","choices":[{"delta":{"content":"hello"}}]}`
+		total += len(payloads[i])
+	}
+	b.SetBytes(int64(total))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		s := newChatStatsReaderSince(strings.NewReader(""), time.Now())
+		for _, payload := range payloads {
+			s.parseSSELine("data: " + payload)
+		}
+	}
+}
+
+// 流式统计的 error 帧判定必须区分 null/空对象与真实错误：error:null 是常见
+// 心跳/元信息占位，不能被记成上游错误；真实错误帧仍必须标记。
+func TestChatStatsErrorFrameNullAndEmpty(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+		want bool
+	}{
+		{"null", "data: {\"choices\":[],\"error\":null}\n\n", false},
+		{"empty object", "data: {\"choices\":[],\"error\":{}}\n\n", false},
+		{"spaced empty object", "data: {\"choices\":[],\"error\":{ \n }}\n\n", false},
+		{"business envelope", "data: {\"code\":6004,\"msg\":\"model usage limit exceeded\"}\n\n", true},
+		{"business envelope zero", "data: {\"code\":0,\"msg\":\"heartbeat\"}\n\n", false},
+		{"real error", "data: {\"error\":{\"code\":6004,\"message\":\"limited\"}}\n\n", true},
+		{"no error key", "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newChatStatsReaderSince(strings.NewReader(tc.raw), time.Now())
+			if _, err := io.Copy(io.Discard, r); err != nil {
+				t.Fatal(err)
+			}
+			if got := r.SawErrorFrame(); got != tc.want {
+				t.Fatalf("SawErrorFrame=%v want %v (raw=%s)", got, tc.want, tc.raw)
+			}
+		})
+	}
+}
+
+// TestChatStatsReaderPassesThroughLongSSELine 钉死 bufio.ErrBufferFull 回归：
+// 单个 SSE 帧超过 64 KiB 时必须完整透传，并且行尾 usage/error 仍要参与统计。
+func TestChatStatsReaderPassesThroughLongSSELine(t *testing.T) {
+	long := strings.Repeat("x", 96*1024)
+	raw := "data: {\"id\":\"long\",\"choices\":[{\"delta\":{\"content\":\"" + long +
+		"\"}}],\"usage\":{\"prompt_tokens\":123,\"completion_tokens\":45,\"total_tokens\":168}}\n\n" +
+		"data: {\"error\":{\"code\":6004,\"message\":\"limited\"}}\n\n"
+
+	r := newChatStatsReaderSince(strings.NewReader(raw), time.Now())
+	got, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != raw {
+		t.Fatalf("透传内容被截断/篡改：got %d bytes want %d", len(got), len(raw))
+	}
+	if n, ok := r.Tokens(); !ok || n != 45 {
+		t.Fatalf("Tokens=(%d,%v) want (45,true)", n, ok)
+	}
+	if !r.SawErrorFrame() {
+		t.Fatal("超长帧之后的真实 error 帧未被识别")
 	}
 }

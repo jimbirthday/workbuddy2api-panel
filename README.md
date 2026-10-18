@@ -211,6 +211,8 @@ flowchart LR
 
 上游请求在出站前经历统一的改写管线（`internal/upstream/payload.go`）：强制 `stream:true`、`developer` 角色归一、tool_choice 归一、`image_url` 字符串兼容为 OpenAI 对象形态、DeepSeek 思维链注入、`reasoning_effort` 档位降级、`reasoning_content` 回填、指纹脱敏。
 
+`background_models.names` / `.target` 可在不改客户端的前提下，把后台类模型名（支持 `*` 通配，如 `gpt-5.6-*`）重定向到指定目标模型；两份配置任一为空即关闭。Key 的模型白名单在重定向前按原始模型名校验，不能借重定向绕过。
+
 ## 快速开始
 
 ### 环境要求
@@ -358,6 +360,7 @@ curl -s http://localhost:7863/v1/chat/completions \
 |---|---|---|
 | `listen` | `:7863` | HTTP 监听地址 |
 | `api_key` | 空 | 网关鉴权密钥；**空 = 不鉴权直接放行**（公网必须设置） |
+| `api_keys[]` | 空 | 多客户端密钥：`{id,name,key,realm,models,enabled}`。`id` 唯一且不能是 `legacy`；`realm` 只能为空 / `cn` / `global`；`models` 为空表示不限，支持 `glm-*` 通配；`enabled=false` 立即拒绝该 Key。面板「配置 → 客户端 API 密钥」可增删改 |
 | `auth_dir` | `./auths` | 账号凭证目录 |
 | `state_file` | `./data/state.json` | 账号池状态持久化文件 |
 | `server.read_timeout` | `300s` | 入站请求读取（含 body 上传）总时长上限；大上下文/文件块经反代转发超时会 400 `read body: i/o timeout`；`0` = 不限制；改动需重启（#100） |
@@ -392,6 +395,8 @@ curl -s http://localhost:7863/v1/chat/completions \
 | `pool.degrade_cooldown` / `pool.degrade_cooldown_max` | `10m` / `2h` | 连败降权时长与上限钳制 |
 | `pool.cost_explore_interval` | `30m` | costTier 条件探索窗口：免费层垄断且存在未知号时，每窗口把一个真实请求搭车改道给未知号（零新增上游请求；成功即毕业，失败走既有错误策略）。`0` = 关停 |
 | `pool.credit_floor` | `0`（结构体默认，即关闭）；`config.example.json` 示例值 `100` | **积分保底**：账号余额低于该值时，对**实测收费**模型（tier 2，账本 6h 内有效观测）不再参与选号——防止收费模型把余额打穿、连免费模型都 402 冷却到次日签到（最坏约 11.5 小时不可用）。tier 0（实测免费）/ tier 1（无观测）**不受限**：保底保的是「留余额给免费模型用」，且 tier 1 若拦会让账本过期 / 重启清零的触底号死锁在「学不回来」。含会话粘性路径（粘性号触底则解绑换号）。全池触底且全 tier 2 时选号返回空（网关回 503），**不放行**。签到回血越过 floor 即刻自动恢复。`0` = 关闭 |
+| `pool.daily_token_limit` | `0`（关闭） | **账号级日 Token 护栏**：账号自本地零点起累计 token 达到该值后，今日不再被选号；只做 pick 前过滤，不冷却/不暂停/不改权重，次日零点自动恢复。覆盖普通轮换、全冷却兜底、会话粘性直取、可用账号列表与探活。用量读取失败时 fail-open（不因未知计数停号）。`0` = 关闭 |
+| `pool.model_daily_token_limit` | `0`（关闭） | **按模型的账号级日 Token 护栏**：某账号在某模型上今日 token 达到该值后，仅该模型不再选中该账号，同一账号的其他模型照常可用；重置/失败语义同上。`0` = 关闭 |
 | `pool.breaker_threshold` | `3` | 连续失败触发熔断阈值 |
 | `pool.breaker_cooldown` | `30m` | 熔断基础退避时长 |
 | `pool.breaker_cooldown_max` | `6h` | 熔断指数退避封顶 |
@@ -633,18 +638,19 @@ WARN: [server] stream ...: saw M native tool call block(s) but repaired none (to
 http://127.0.0.1:7863/panel/
 ```
 
-鉴权与 API 同口径：`api_key` 非空时面板要求输入一次密钥（浏览器 localStorage 记住）；为空则直接可用。
-界面支持**明暗主题切换**（首次跟随系统偏好，点击按钮两态翻转并记住选择），左侧导航七个视图：
+鉴权与 API 同口径：`api_key` 非空时面板要求输入一次密钥；为降低共用浏览器与 XSS 的风险，管理密钥只保存在当前页面内存，刷新或关闭标签页后需要重新输入。为空则直接可用。**面板管理接口只认顶层 `api_key`**；`api_keys[]` 是给 `/v1/*` 客户端的业务身份，不能查看账号、导出数据或修改配置。
+界面支持**明暗主题切换**（首次跟随系统偏好，点击按钮两态翻转并记住选择），左侧导航按监控 / 运营 / 系统分组；长页另有可吸顶的页内区块导航：
 
 | 视图 | 功能 |
 |---|---|
-| **账号池** | 统计条（账号总数 / 可用 / 冷却中 / 已禁用 / 积分剩余·总额 / 粘性会话）+ 账号表：健康色条与状态标签（可用 / 限流冷却 / 积分冷却 / 熔断 / 连败降权 / 已禁用）、积分量条、成功·失败计数、在途、最近一次用量（次数 / token / 延迟 / 速率）、最近成功时间；单号操作 签到 / 余额 / 任务 / 解冻 / 禁用 / 移除；批量「全部签到」「旅行巡检」「活跃上报」「全部保活」；下方**模型锁池**表列出被上游按模型限流的模型（整池不可用 / 没号可用 / 部分限流）、可选与总数、锁定账号数、最早解锁与全池解锁倒计时、限流原因，无锁定时显示「所有模型均可选」 |
-| **用量** | 指标卡（请求数 / 总 token / prompt / completion / 失败尝试 / 平均延迟，含占比与吐字速率）+ **Token 时序图**（渐变堆叠柱、均值参考线、峰值标注、悬停看单桶明细）+ **用量明细**（按账号 / 按模型 / 按域切换，可按合计 Token / 请求数 / 失败数 / 平均延迟排序，含 prompt·completion 占比条）+ **积分扣除历史**（按账号 / 按模型，折算「积分 / 1M Token」） |
+| **账号池** | 统计条（账号总数 / 可用 / 冷却中 / 已禁用 / 积分剩余·总额 / 粘性会话）+ 账号表：健康色条与状态标签（可用 / 限流冷却 / 积分冷却 / 熔断 / 连败降权 / 已禁用）、积分量条、成功·失败计数、在途、最近一次用量（次数 / token / 延迟 / 速率）、最近成功时间；单号操作 签到 / 余额 / 任务 / 设置（备注与调度权重）/ 解冻 / 禁用 / 移除；批量「全部启用」「全部禁用」「全部签到」「旅行巡检」「活跃上报」「全部保活」；支持按昵称 / uid / 备注搜索与按权重排序，缺少 accessToken 或 refreshToken 的账号标「凭证不全」。备注最多 200 字符、只做展示；权重 1 = 不干预，2-100 按比例优先接单，均随 auth 文件持久化。下方**模型锁池**表列出被上游按模型限流的模型（整池不可用 / 没号可用 / 部分限流）、可选与总数、锁定账号数、最早解锁与全池解锁倒计时、限流原因，无锁定时显示「所有模型均可选」 |
+| **用量** | 指标卡（请求数 / 总 token / prompt / completion / 失败尝试 / 平均延迟，含占比与吐字速率）+ **Token 时序图**（渐变堆叠柱、均值参考线、峰值标注、悬停看单桶明细）+ **今日剩余额度**（账号 / 模型两维，按本地自然日零点重置；限额 0 显示「未启用」，快照缺失显示「用量未知」，不伪造 0）+ **用量明细**（按账号 / 按模型 / 按域切换，可按合计 Token / 请求数 / 失败数 / 平均延迟排序，含 prompt·completion 占比条）+ **积分扣除历史**（按账号 / 按模型，折算「积分 / 1M Token」） |
 | **积分构成** | **积分到期分布**（按批次到期日聚合，颜色区分账号）+ **账号对比**（按来源归并的面额 / 余额 / 包数卡片与混合构成条）+ 逐包明细（按到期日排序，默认展开最近到期的 `panel.package_detail_limit` 个，其余与已用完的包折叠） |
 | **任务中心** | 成长任务队列：一键扫描全部账号待办 → 按账号排队执行（账号内串行，账号间可选并发 1-3），进度实时更新；另含开学季券码查询。详见 [任务中心](#-任务中心面板新视图) |
 | **模型与档位** | 实时查询上游：每模型的积分倍率（含限时免费 / 夜间折扣等**生效价**与划线牌价）、默认思考档、支持的档位（含「off（可关）」）、上下文长度与最大输出；存在探测数据时最大输出列显示**实测上限与钳制告警**（见「探测模型真实输出上限」）。支持**按条件查询**：关键词（ID / 名称 / 描述 / 厂商 / 标签，空格分词 AND）、域（CN / Global）、能力（工具 / 视觉 / 思考 / 默认）、思考档位、价格（折扣 / 限时免费 / 打折），以及按倍率 / 上下文 / 最大输出 / ID 排序 |
-| **配置** | 在线编辑 config.json：服务（监听地址 / API 密钥 / 单账号明细条数）、定时任务（签到 / 保活 / 旅行 / 活跃 / 成长任务五类时点与开关 + 余额刷新间隔）、账号池与流量治理、上游与高级（超时 / 出站 UA / 提示词模式 / 指纹脱敏 / 粘性路由）、日志（调用来源记录开关） |
-| **运行日志** | **请求记录表**（时间 / 结果 / 模型 / 账号 / **来源 IP** / **User-Agent** / 耗时 / Token / 积分 / 请求 ID），支持按 IP·UA·模型·账号·请求 ID 与结果筛选、读取条数、时间范围；下方 **运行日志** 按「任务 / 对话 / 系统」分频道，可开关自动滚动 |
+| **配置** | 在线编辑 config.json：服务（监听地址 / 管理密钥 / 单账号明细条数）、**客户端 API 密钥**（多 Key 的 ID / 名称 / 域 / 模型白名单 / 启停，密钥留空保持原值）、定时任务（签到 / 保活 / 旅行 / 活跃 / 成长任务五类时点与开关 + 余额刷新间隔）、账号池与流量治理、上游与高级（超时 / 出站 UA / 提示词模式 / 指纹脱敏 / 粘性路由）、日志（调用来源记录开关）；顶部支持按字段名 / 提示文案快速查找并标亮，保存栏实时提示未保存修改、已立即生效或仍需重启的字段 |
+| **运行日志** | **请求记录表**（时间 / 结果 / **Key ID** / 模型 / 账号 / **来源 IP** / **User-Agent** / 耗时 / Token / 积分 / 请求 ID），支持按 Key·IP·UA·模型·账号·请求 ID 与结果筛选、读取条数、时间范围；下方 **运行日志** 按「任务 / 对话 / 系统」分频道，可开关自动滚动 |
+| **接入** | 展示网关地址与可用模型（优先本机观测，失败回退内置建议），提供 OpenAI SDK / curl、Claude Code（Anthropic Messages 环境变量与 curl）、OpenAI Responses 三套示例与复制按钮；示例统一使用 `$WB_API_KEY` 占位，页面与接口**绝不回显真实密钥、access/refresh/device token 或 URL userinfo** |
 
 顶部另有「刷新」（向上游全量查询真实余额并回写；5 秒自动轮询只读内存，不打上游）与「添加账号」（浏览器内完成 OAuth 设备授权：显示授权链接 + 自动轮询，登录后凭证落盘并**热加载进池，免重启**，也支持导入 cockpit tools 导出的 JSON）。
 
@@ -675,13 +681,23 @@ http://127.0.0.1:7863/panel/
 
 | 分组 | 端点 |
 |---|---|
-| 只读 | `GET overview` · `GET usage`（`hours` 或 `from`/`to`）· `GET packages` · `GET models` · `GET model_probes` · `GET logs` · `GET request_metrics` · `GET request_logs`（`limit` / `outcome` / `account` / `model` / `client_ip` / `user_agent` / `from` / `to`）· `GET config` · `GET tasks/queue` · `GET school/vouchers` |
-| 账号运维 | `POST accounts/{uid}/checkin` · `balance` · `revive` · `disable` · `remove`；`POST checkin_all` · `travel_all` · `activity_all` · `keepalive_all` · `balance_all` |
+| 只读 | `GET overview` · `GET usage`（`hours` 或 `from`/`to`）· `GET usage/remaining`（本地自然日账号/模型额度）· `GET connect`（接入地址与脱敏示例）· `GET packages` · `GET credits/history`（扣减聚合）· `GET credits/grants`（积分包只读快照）· `GET models` · `GET model_probes` · `GET logs` · `GET request_metrics` · `GET request_logs`（`limit` / `outcome` / `account` / `model` / `client_ip` / `user_agent` / `from` / `to`）· `GET activity/history`（`uid` / `task` / `result` / `q` / `from` / `to` / `limit`）· `GET config` · `GET tasks/queue` · `GET school/vouchers` |
+| 账号运维 | `POST accounts/{uid}/checkin` · `balance` · `revive` · `disable` · `remove` · `profile`（`{weight:1-100,note}`，两个字段可只传其一）；`POST accounts/set_all`（`{enabled:true|false,uids:[...]}`，必须显式给出 UID，批量启用/禁用只作用于所选账号）；`POST checkin_all` · `travel_all` · `activity_all` · `keepalive_all` · `balance_all`；`GET accounts/export`（脱敏 CSV） |
 | 任务 | `GET accounts/{uid}/tasks`；`POST accounts/{uid}/tasks/accept` · `accept_all` · `claim` · `auto` · `auto_all`；`POST tasks/scan_all` · `tasks/run_queue` |
 | 添加账号 | `POST login/start` · `GET login/poll` · `GET login/regions` · `POST import/cockpit` |
 | 写入 | `POST config`（校验 → 落盘 → 热应用，返回需重启字段清单）· `POST usage/save`（立即把内存用量落盘） |
 
 账号运维操作均落到池既有入口（`Revive`/`Disable`/`Remove` 等），与 `/status` 观测口径一致。
+
+**活动记录**：签到、活跃、旅行、保活每次真实执行都会写入 `data/activity_history.jsonl`
+（与 `state.json` 同目录），面板「活动记录」页可查看。文件默认保留 90 个自然日、上限
+16 MiB；只记录时间、账号标签、域、任务、触发来源、成功/失败和脱敏截断后的说明，
+不写 token、Cookie、API Key 或提示词。写失败只影响该条记录，不影响任务本身。
+
+**积分获取历史**：`GET credits/grants` 只读「积分构成」最近一次成功查询留下的内存快照，
+不会为了打开发放记录而逐账号回源；快照为空时返回 200 空数组并提示先刷新积分包。
+响应只含昵称、域、包名/来源、面额与状态，`uid` 只保留前 8 位，绝不包含 token、Cookie、
+配置路径或完整账号标识；结果按时间倒序，默认 200 条、最多 1000 条。
 
 **安全响应头**：面板页面与全部 `/panel/api/*` 响应统一带 `Content-Security-Policy`（`default-src 'none'`，脚本仅同源，`frame-ancestors 'none'` 禁嵌套）、`X-Content-Type-Options: nosniff`、`X-Frame-Options: DENY`、`Referrer-Policy: no-referrer` 等；前端脚本独立为同源 `app.js`，不含内联脚本与内联事件处理器。
 
@@ -695,7 +711,7 @@ http://127.0.0.1:7863/panel/
 |---|---|---|
 | `POST /v1/chat/completions` | Bearer（`api_key` 非空时） | OpenAI 兼容补全；流式/非流式；**无网关侧请求体上限**（见「[多图会话请求体超限怎么办？](#多图会话请求体超限怎么办)」） |
 | `GET /v1/models` | Bearer（`api_key` 非空时） | 模型列表（纯动态拉取，缓存 1h；失败返回空列表 + 5min 负缓存）；每模型带 `context_length`/`max_output_tokens`（四级查找链：上游目录 → 内置知识表 → model.json 缓存 → models.dev）、`reasoning_supported_efforts`/`reasoning_default_effort` 思考档位及描述/标签/倍率等全字段（上游有返回时） |
-| `GET /status` | Bearer（`api_key` 非空时） | 账号状态汇总 + 每账号详情（积分/冷却/熔断/在途/粘性）+ `model_locks`（按「域 + 模型」聚合的限流视图：可选 / 总数、锁定账号数、`state`、最早解锁与全池解锁时间、限流原因；无锁定为空） |
+| `GET /status` | Bearer（`api_key` 非空时） | 管理密钥：账号状态汇总 + 每账号详情（积分/冷却/熔断/在途/粘性）+ `model_locks`（按「域 + 模型」聚合的限流视图：可选 / 总数、锁定账号数、`state`、最早解锁与全池解锁时间、限流原因；无锁定为空）。客户端业务 Key：只返回聚合计数与脱敏后的 `model_locks`，并带 `accounts_visible:false`，不返回账号池详情 |
 | `GET /healthz` | 无 | 健康检查：有 healthy 且未占满账号返回 200，否则 503；响应带身份标识（见下） |
 
 > 鉴权规则：仅当 `api_key` 非空才校验 `Authorization: Bearer <api_key>`；**`api_key` 为空时上述端点直接放行**；`/healthz` 恒无鉴权。

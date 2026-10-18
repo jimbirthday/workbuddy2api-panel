@@ -30,6 +30,15 @@ func ResolveConversationID(body []byte) string {
 	if err := json.Unmarshal(body, &obj); err != nil {
 		return ""
 	}
+	return ResolveConversationIDFromObject(obj)
+}
+
+// ResolveConversationIDFromObject 是 ResolveConversationID 的已解析版本：
+// 只认 conversationId（snake/camel，metadata 优先），绝不回落 user_id。
+func ResolveConversationIDFromObject(obj map[string]any) string {
+	if obj == nil {
+		return ""
+	}
 	if meta, ok := obj["metadata"].(map[string]any); ok {
 		if v := strOrEmpty(meta["conversation_id"]); v != "" {
 			return v
@@ -99,15 +108,25 @@ func TurnKey(body []byte) string {
 	if len(body) == 0 {
 		return ""
 	}
-	var obj struct {
-		Messages []struct {
-			Role    string          `json:"role"`
-			Content json.RawMessage `json:"content"`
-		} `json:"messages"`
-	}
+	var obj TurnKeyRequest
 	if err := json.Unmarshal(body, &obj); err != nil {
 		return ""
 	}
+	return TurnKeyFromRequest(obj)
+}
+
+// TurnKeyRequest 是轮级键提取所需的最小请求视图。handler 入口已解析 body 时
+// 复用同一结构，避免为 TurnKey 再做一次全量 JSON 解码。
+type TurnKeyRequest struct {
+	Messages []struct {
+		Role    string          `json:"role"`
+		Content json.RawMessage `json:"content"`
+	} `json:"messages"`
+}
+
+// TurnKeyFromRequest 是 TurnKey 的已解析版本，语义逐字一致：取最后一条 user
+// 消息的「序号+内容签名」；无 user/无可签名内容返回空串。
+func TurnKeyFromRequest(obj TurnKeyRequest) string {
 	for i := len(obj.Messages) - 1; i >= 0; i-- {
 		if obj.Messages[i].Role != "user" {
 			continue
@@ -181,6 +200,23 @@ func contentSignature(raw json.RawMessage) string {
 		return out
 	}
 	return strings.TrimSpace(out)
+}
+
+// TurnKeyFromFields 是 TurnKey 的已解码版本：取最后一条 user 消息的
+// 「序号+内容签名」。KeyMessage 与本文件 contentSignature 使用同一份原始字节，
+// 因此多模态签名、空内容回落与原始 body 入口逐字一致。
+func TurnKeyFromFields(msgs []KeyMessage) string {
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Role != "user" {
+			continue
+		}
+		sig := contentSignature(msgs[i].Content)
+		if sig == "" {
+			return ""
+		}
+		return fmt.Sprintf("u%d:%s", i, sig)
+	}
+	return ""
 }
 
 // TurnRequestID 返回轮级键对应的聚合 ID：sha256(盐|键) 前 16 字节的 hex（32 位，

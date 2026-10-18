@@ -2,6 +2,7 @@ package panel
 
 import (
 	"bytes"
+	"encoding/json"
 	"net/http/httptest"
 	"os"
 	"os/exec"
@@ -136,7 +137,7 @@ try {
 		t.Fatal(err)
 	}
 	hf.Close()
-	for _, hash := range []string{"#taskscenter", "#accounts", "#usage", "#models", "#config", "#logs", "#packages"} {
+	for _, hash := range []string{"#taskscenter", "#accounts", "#activity", "#usage", "#models", "#config", "#logs", "#packages", "#connect"} {
 		cmd := exec.Command(node, hf.Name(), "app.js")
 		cmd.Dir = "." // 测试工作目录 = internal/panel
 		cmd.Env = append(os.Environ(), "SMOKE_HASH="+hash)
@@ -306,10 +307,10 @@ const src = fs.readFileSync(process.argv[2], 'utf8');
 const start = src.indexOf('function reqMatch');
 const end = src.indexOf('function reqOutcomeTag');
 if (start < 0 || end < 0) throw new Error('reqMatch not found');
-const ctx = {};
+const ctx = { String };
 vm.createContext(ctx);
 vm.runInContext(src.slice(start, end) + '\nthis.reqMatch=reqMatch;', ctx);
-const base = { outcome: 'success', client_ip: '203.0.113.7', user_agent: 'python-requests/2.31.0', model: 'cn:glm-5.3', account: '示例(uid8)', request_id: 'req-1' };
+const base = { outcome: 'success', key_id: 'team-a', client_ip: '203.0.113.7', user_agent: 'python-requests/2.31.0', model: 'cn:glm-5.3', account: '示例(uid8)', request_id: 'req-1' };
 const other = { outcome: 'http_error', client_ip: '198.51.100.4', user_agent: 'Mozilla/5.0 Chrome/120', model: 'global:hy3', account: '甲(uid9)', request_id: 'req-2' };
 const rows = [base, other];
 const pick = f => rows.filter(e => ctx.reqMatch(e, f)).map(e => e.request_id);
@@ -322,6 +323,8 @@ process.stdout.write(JSON.stringify({
   multiMiss: pick({ q: 'glm chrome', outcome: '' }),
   byOutcome: pick({ q: '', outcome: 'http_error' }),
   combined: pick({ q: '198.51', outcome: 'http_error' }),
+  byKey: pick({ q: '', outcome: '', key: 'team-a' }),
+  byEmptyKey: pick({ q: '', outcome: '', key: '__empty__' }),
 }));`
 	f, err := os.CreateTemp(t.TempDir(), "request-filter-*.cjs")
 	if err != nil {
@@ -336,7 +339,7 @@ process.stdout.write(JSON.stringify({
 		t.Fatalf("request filter node test failed: %v\n%s", err, out)
 	}
 	// q 对 outcome 不参与匹配（outcome 有独立下拉），multiKw 里的 success 命中不了任何字段。
-	const want = `{"all":["req-1","req-2"],"byIP":["req-1"],"byUA":["req-2"],"byModel":["req-1"],"multiKw":[],"multiMiss":[],"byOutcome":["req-2"],"combined":["req-2"]}`
+	const want = `{"all":["req-1","req-2"],"byIP":["req-1"],"byUA":["req-2"],"byModel":["req-1"],"multiKw":[],"multiMiss":[],"byOutcome":["req-2"],"combined":["req-2"],"byKey":["req-1"],"byEmptyKey":["req-2"]}`
 	if strings.TrimSpace(string(out)) != want {
 		t.Fatalf("request filter=%s want %s", out, want)
 	}
@@ -518,9 +521,22 @@ const approx = (qs, wantSec) => {
 };
 const now = Date.now();
 const todayQ = q('today', true);
+const calStart = preset => {
+  const d = ctx.trangeMidnight();
+  if (preset === 'week') d.setDate(d.getDate() - ((d.getDay() + 6) % 7));
+  else d.setDate(1);
+  return String(Math.floor(d.getTime() / 1000));
+};
+const weekStart = calStart('week'), monthStart = calStart('month');
 process.stdout.write(JSON.stringify({
   todayIsMidnight: todayQ === 'from=' + secOf(ctx.trangeMidnight()),
   todayNoTo: !/to=/.test(todayQ),
+  weekStart: q('week', true) === 'from=' + weekStart,
+  weekNoTo: !/to=/.test(q('week', true)),
+  monthStart: q('month', false) === 'from=' + monthStart,
+  monthNoTo: !/to=/.test(q('month', false)),
+  labelWeek: (function () { ctx.trangeState('t').preset = 'week'; return ctx.trangeLabel('t'); })(),
+  labelMonth: (function () { ctx.trangeState('t').preset = 'month'; return ctx.trangeLabel('t'); })(),
   rolling24: q('24', true),
   rolling72: q('72', true),
   rolling0: q('0', true),
@@ -553,7 +569,8 @@ process.stdout.write(JSON.stringify({
 	local := func(h, m int) string {
 		return strconv.FormatInt(time.Date(2026, 9, 30, h, m, 0, 0, time.Local).Unix(), 10)
 	}
-	want := `{"todayIsMidnight":true,"todayNoTo":true,` +
+	want := `{"todayIsMidnight":true,"todayNoTo":true,"weekStart":true,"weekNoTo":true,` +
+		`"monthStart":true,"monthNoTo":true,"labelWeek":"本周","labelMonth":"本月",` +
 		// rolling0 必须是 "hours=0"（显式全部历史）。此前期望值是空串——那恰好把
 		// issue #121 的错误行为固化成了断言：空 query 会被后端的 72 小时缺省接管，
 		// 于是「全部历史」显示成「近 3 天」。
@@ -751,7 +768,7 @@ func TestAppJSCollectConfigClearable(t *testing.T) {
 const vm = require('vm');
 const src = fs.readFileSync(process.argv[2], 'utf8');
 const start = src.indexOf('const CFG_MAP');
-const end = src.indexOf('/* Go 时长字段即时校验');
+const end = src.indexOf('/* 小时列表字段');
 if (start < 0 || end < 0 || end < start) throw new Error('collectConfig region not found');
 const mk = v => ({ type: 'text', value: v });
 const cfgForm = { elements: {
@@ -762,7 +779,7 @@ const cfgForm = { elements: {
   checkin_hours: mk(''),
 }};
 const ctx = {
-  Date, Number, String, Math, Map, Array, Object, isNaN, URLSearchParams, Set,
+  Date, Number, String, Math, Map, Array, Object, isNaN, URLSearchParams, Set, TextEncoder,
   document: { getElementById: id => (id === 'cfgForm' ? cfgForm : null) },
   $: id => (id === 'cfgForm' ? cfgForm : null),
 };
@@ -775,7 +792,8 @@ process.stdout.write(JSON.stringify([
   has(out.prompt, 'file'), (out.prompt || {}).file,
   has(out, 'listen'),
   has(out.schedule, 'checkin_hours'),
-  out.api_key
+  out.api_key,
+  out.api_keys
 ]));`
 	f, err := os.CreateTemp(t.TempDir(), "cfgc-*.cjs")
 	if err != nil {
@@ -790,7 +808,9 @@ process.stdout.write(JSON.stringify([
 		t.Fatalf("collectConfig node test failed: %v\n%s", err, out)
 	}
 	// [user_agent 已发, 其值, prompt.file 已发, 其值, listen 未发, checkin_hours 未发, api_key]
-	const want = `[true,"",true,"",false,false,"secret"]`
+	// 第 8 项固定为空数组：即使表格没有行，也必须显式提交 api_keys，才能删除
+	// 最后一条客户端 Key（深合并对数组是整体替换；漏发会让旧条目复活）。
+	const want = `[true,"",true,"",false,false,"secret",[]]`
 	if strings.TrimSpace(string(out)) != want {
 		t.Fatalf("collectConfig=%s want %s", strings.TrimSpace(string(out)), want)
 	}
@@ -815,11 +835,11 @@ const src = fs.readFileSync(process.argv[2], 'utf8');
 const start = src.indexOf('function expBatches');
 const end = src.indexOf('async function loadExpiry');
 if (start < 0 || end < 0 || end < start) throw new Error('expiry region not found');
-const sink = { innerHTML: '', textContent: '', hidden: true };
+const sinks = { expList: { innerHTML: '', textContent: '', hidden: true }, expSummaryLine: { innerHTML: '', textContent: '', hidden: false }, btnExpToggle: { hidden: true, textContent: '', setAttribute() {} } };
 const ctx = {
   esc: s => String(s == null ? '' : s),
   fmtTok: v => String(v == null ? 0 : v),
-  $: () => sink,
+  $: id => sinks[id] || { innerHTML: '', textContent: '', hidden: true },
   Date, Math, Number, String, Map, Array, Object, isNaN,
   lastPackages: null, lastPackagesAt: 0,
 };
@@ -842,11 +862,14 @@ const d = { accounts: [
   { uid: 'e', nickname: 'broken',   realm: 'cn',     error: 'offline' },
 ] };
 ctx.renderExpiry(d);
-const names = [...sink.innerHTML.matchAll(/<span class="exp-nm">([^<]*)<\/span>/g)].map(m => m[1]);
+const html = sinks.expList.innerHTML;
+const names = [...html.matchAll(/<span class="exp-nm">([^<]*)<\/span>/g)].map(m => m[1]);
 process.stdout.write(JSON.stringify({
   names,
-  quiet: /其余 <b>3<\/b> 个账号 7 天内无到期积分/.test(sink.innerHTML),
-  failed: /1 个账号查询失败/.test(sink.innerHTML),
+  quiet: /其余 <b>3<\/b> 个账号 7 天内无到期积分/.test(html),
+  failed: /1 个账号查询失败/.test(html),
+  collapsed: sinks.expList.hidden === true,
+  headline: /due-today/.test(sinks.expSummaryLine.innerHTML) === false && /3 天内到期/.test(sinks.expSummaryLine.innerHTML),
 }));`
 	f, err := os.CreateTemp(t.TempDir(), "expsort-*.cjs")
 	if err != nil {
@@ -861,7 +884,7 @@ process.stdout.write(JSON.stringify({
 		t.Fatalf("expiry sort node test failed: %v\n%s", err, out)
 	}
 	// 今天到期排最前，2 天后其次；7 天外与查询失败的账号不再逐行展示。
-	const want = `{"names":["due-today","gl-soon"],"quiet":true,"failed":true}`
+	const want = `{"names":["due-today","gl-soon"],"quiet":true,"failed":true,"collapsed":true,"headline":true}`
 	if strings.TrimSpace(string(out)) != want {
 		t.Fatalf("expiry order=%s\nwant %s", strings.TrimSpace(string(out)), want)
 	}
@@ -895,7 +918,7 @@ const ptStart = src.indexOf('function parseAPITime');
 const ptEnd = src.indexOf('function fmtLocalDateTime');
 if (ptStart < 0 || ptEnd < 0 || ptEnd < ptStart) throw new Error('parseAPITime not found');
 const sinks = {};
-const mk = id => (sinks[id] = { innerHTML: '', textContent: '', hidden: true });
+const mk = id => (sinks[id] = { innerHTML: '', textContent: '', hidden: true, setAttribute() {}, focus() {} });
 const ctx = {
   esc: s => String(s == null ? '' : s),
   fmtTok: v => String(v == null ? 0 : v),
@@ -929,6 +952,8 @@ process.stdout.write(JSON.stringify({
   rows: names.length,
   order: gotNames === wantNames,
   summary: /其余 <b>2<\/b> 个账号 7 天内无到期积分/.test(html),
+  collapsed: sinks['expList'] ? sinks['expList'].hidden === true : false,
+  headline: sinks['expSummaryLine'] ? /3 天内到期/.test(sinks['expSummaryLine'].innerHTML) : false,
   got: gotNames,
   want: wantNames,
 }));`
@@ -944,7 +969,7 @@ process.stdout.write(JSON.stringify({
 	if err != nil {
 		t.Fatalf("expiry snapshot node test failed: %v\n%s", err, out)
 	}
-	const want = `{"visible":true,"rows":1,"order":true,"summary":true,"got":"[\"秋\"]","want":"[\"秋\"]"}`
+	const want = `{"visible":true,"rows":1,"order":true,"summary":true,"collapsed":true,"headline":true,"got":"[\"秋\"]","want":"[\"秋\"]"}`
 	if strings.TrimSpace(string(out)) != want {
 		t.Fatalf("expiry snapshot=%s\nwant %s（visible 必须为 true；7 天外账号应折叠成汇总）",
 			strings.TrimSpace(string(out)), want)
@@ -982,7 +1007,7 @@ const ptStart = src.indexOf('function parseAPITime');
 const ptEnd = src.indexOf('function fmtLocalDateTime');
 if (ptStart < 0 || ptEnd < 0 || ptEnd < ptStart) throw new Error('parseAPITime not found');
 const sinks = {};
-const mk = id => (sinks[id] = { innerHTML: '', textContent: '', hidden: true });
+const mk = id => (sinks[id] = { innerHTML: '', textContent: '', hidden: true, attrs: {}, setAttribute(k, v) { this.attrs[k] = v; } });
 const ctx = {
   esc: s => String(s == null ? '' : s),
   fmtTok: v => String(v == null ? 0 : v),
@@ -1495,5 +1520,83 @@ const out = {};
 	}
 	if strings.TrimSpace(string(out)) != `{"progress":true,"reattachNoDuplicate":true,"sameSeqOnce":true,"newSeqRenders":true,"offView":true,"staleDropped":true,"reattachGuarded":true}` {
 		t.Fatalf("scan polling state=%s", strings.TrimSpace(string(out)))
+	}
+}
+
+// TestAppJSPollingSingleFlight 后台轮询必须单飞：慢请求未完成时，下一次 tick
+// 不能叠加第二个 /overview；请求结束后再恢复轮询。
+func TestAppJSPollingSingleFlight(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; polling test skipped")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const inert = new Proxy(function () {}, {
+  get(t, k) { if (k === Symbol.toPrimitive) return () => ''; return inert; },
+  set() { return true; }, apply() { return inert; }, construct() { return inert; },
+});
+let calls = 0;
+let release;
+const sandbox = {
+  location: { hash: '#accounts' },
+  history: { replaceState() {} },
+  localStorage: { getItem: () => null, setItem() {} },
+  navigator: { clipboard: { writeText: () => Promise.resolve() } },
+  document: { querySelectorAll: () => [], querySelector: () => inert, getElementById: () => inert, addEventListener() {}, documentElement: inert, head: inert, body: inert, createElement: () => ({ style: {}, classList: { add() {}, remove() {} }, appendChild() {}, remove() {} }), cookie: '', activeElement: null },
+  fetch: url => {
+    calls++;
+    if (String(url).includes('/panel/api/overview')) {
+      return new Promise(resolve => { release = () => resolve({ ok: true, status: 200, json: () => Promise.resolve({ accounts: [] }) }); });
+    }
+    return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({}) });
+  },
+  addEventListener() {}, removeEventListener() {},
+  matchMedia: () => ({ matches: false, addEventListener() {} }),
+  setInterval: () => 1, clearInterval() {},
+  setTimeout: () => 0, clearTimeout() {},
+  console, JSON, Math, Date, Number, String, Boolean, Object, Array, Promise, Map, Set, RegExp, Error, TypeError, isNaN, parseInt, parseFloat, encodeURIComponent, decodeURIComponent, URL, Symbol, Proxy, Reflect,
+};
+sandbox.window = sandbox; sandbox.globalThis = sandbox;
+vm.createContext(sandbox);
+vm.runInContext(src, sandbox, { filename: 'app.js' });
+const flush = async () => { for (let i = 0; i < 30; i++) await Promise.resolve(); };
+(async () => {
+  const before = calls;
+  sandbox.refreshVisible();
+  await flush();
+  const first = calls - before;
+  sandbox.refreshVisible();
+  await flush();
+  const second = calls - before;
+  release();
+  await flush();
+  sandbox.refreshVisible();
+  await flush();
+  const third = calls - before;
+  sandbox.refreshVisible();
+  await flush();
+  const fourth = calls - before;
+  process.stdout.write(JSON.stringify({ first, second, third, fourth }));
+})().catch(e => { process.stdout.write('ERR ' + (e && e.stack || e)); process.exitCode = 1; });`
+	f, err := os.CreateTemp(t.TempDir(), "poll-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("polling node test failed: %v\n%s", err, out)
+	}
+	var got struct{ First, Second, Third, Fourth int }
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("invalid polling output %q: %v", out, err)
+	}
+	if got.First != 1 || got.Second != 1 || got.Third != 2 || got.Fourth != 2 {
+		t.Fatalf("polling calls = %+v, want 1/1/2/2", got)
 	}
 }

@@ -49,7 +49,7 @@ func TestPersistFailureStaysDirtyAndRetries(t *testing.T) {
 		t.Fatal("成功后 dirty 应为 false")
 	}
 	raw, err := os.ReadFile(good)
-	if err != nil || !strings.Contains(string(raw), `"credits": 42`) {
+	if err != nil || !strings.Contains(string(raw), `"credits":42`) {
 		t.Fatalf("重试落盘内容不正确: %v %s", err, raw)
 	}
 

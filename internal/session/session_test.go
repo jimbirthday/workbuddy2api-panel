@@ -1,6 +1,9 @@
 package session
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"sync"
@@ -375,5 +378,74 @@ func TestExtractKeyMultimodalContent(t *testing.T) {
 	imgOnly2 := `{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"http://x/z.png"}}]}]}`
 	if ExtractKey([]byte(imgOnly2)) != k2 {
 		t.Error("pure-image url changes must keep same derived key")
+	}
+}
+
+// deriveKeyFields 的读取路径必须与旧实现逐字节一致：system 与 user 同时存在时
+// 派生键由 system + 首条 user 签名组成，不能因为只解析一次就漏掉任一侧。
+func TestDeriveKeyFieldsMatchesLegacy(t *testing.T) {
+	cases := []struct {
+		name string
+		msgs []KeyMessage
+	}{
+		{"system+text user", []KeyMessage{
+			{Role: "system", Content: json.RawMessage(`"sys"`)},
+			{Role: "user", Content: json.RawMessage(`"hello"`)},
+		}},
+		{"developer+multimodal user", []KeyMessage{
+			{Role: "developer", Content: json.RawMessage(`"sys"`)},
+			{Role: "user", Content: json.RawMessage(`[{"type":"text","text":"look"},{"type":"image_url","image_url":{"url":"x"}}]`)},
+		}},
+		{"user before system", []KeyMessage{
+			{Role: "user", Content: json.RawMessage(`[{"type":"text","text":"look"}]`)},
+			{Role: "system", Content: json.RawMessage(`"sys"`)},
+		}},
+		{"no system", []KeyMessage{
+			{Role: "user", Content: json.RawMessage(`"hello"`)},
+		}},
+		{"empty content", []KeyMessage{
+			{Role: "system", Content: json.RawMessage(`"sys"`)},
+			{Role: "user", Content: json.RawMessage(`[]`)},
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := deriveKeyFields(tc.msgs)
+			if tc.name == "empty content" {
+				if got != "" {
+					t.Fatalf("empty content derive=%q want empty", got)
+				}
+				return
+			}
+			sum := sha256.Sum256([]byte(legacyDeriveKeyFields(tc.msgs)))
+			want := derivedKeyPrefix + hex.EncodeToString(sum[:16])
+			if got != want {
+				t.Fatalf("derive=%q legacy=%q", got, want)
+			}
+		})
+	}
+}
+
+// TestExtractKeyFromObjectMatchesBody 钉住已解析 map 入口与 ExtractKey 的等价性。
+// 显式会话 ID、prompt_cache_key、user_id 抑制、内容派生与多模态都要一致。
+func TestExtractKeyFromObjectMatchesBody(t *testing.T) {
+	bodies := []string{
+		`{"conversation_id":"my-session","messages":[{"role":"user","content":"x"}]}`,
+		`{"metadata":{"conversationId":"meta-session"}}`,
+		`{"prompt_cache_key":"cache-session"}`,
+		`{"user_id":"u1","messages":[{"role":"user","content":"x"}]}`,
+		`{"metadata":{"user_id":"u1"},"messages":[{"role":"user","content":"x"}]}`,
+		`{"messages":[{"role":"system","content":"sys"},{"role":"user","content":"hello"}]}`,
+		`{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"http://x/y.png"}}]}]}`,
+		`{"model":"x","messages":[]}`,
+	}
+	for _, body := range bodies {
+		var obj map[string]any
+		if json.Unmarshal([]byte(body), &obj) != nil {
+			continue
+		}
+		if got, want := ExtractKeyFromObject(obj), ExtractKey([]byte(body)); got != want {
+			t.Errorf("ExtractKeyFromObject(%s)=%q want %q", body, got, want)
+		}
 	}
 }

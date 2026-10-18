@@ -3,6 +3,7 @@ package server
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -52,6 +53,7 @@ type chatStat struct {
 	toks             int // <0 表示 usage 缺失 → 显示 "-"
 	status           int
 	requestID        string
+	keyID            string // 命中的 API key id（不含密钥）；空 = 未鉴权/旧兼容
 	outcome          string
 	attempts         int
 	credit           float64
@@ -82,6 +84,19 @@ func newChatStat(now time.Time, body []byte, stream bool) *chatStat {
 	return &chatStat{start: now, model: parseModelFromBody(body), mode: mode, toks: -1}
 }
 
+// newChatStatWithModel 用入口已解析出的 model 构造统计对象，避免为日志再完整
+// 解析一遍 body。model 为空时与 parseModelFromBody 的缺省口径一致显示 "-"。
+func newChatStatWithModel(now time.Time, model string, stream bool) *chatStat {
+	mode := "sync"
+	if stream {
+		mode = "stream"
+	}
+	if model == "" {
+		model = "-"
+	}
+	return &chatStat{start: now, model: model, mode: mode, toks: -1}
+}
+
 // done 幂等落一行表格日志。
 func (s *chatStat) done() {
 	if s.logged {
@@ -89,7 +104,7 @@ func (s *chatStat) done() {
 	}
 	s.logged = true
 	logChatRowEx(s.ttfb, time.Since(s.start), s.model, s.mode, s.uid, s.nick, s.status, s.toks,
-		s.requestID, s.outcome, s.attempts, s.credit, s.hasCredit, s.clientIP, s.userAgent)
+		s.requestID, s.outcome, s.attempts, s.credit, s.hasCredit, s.clientIP, s.userAgent, s.keyID)
 }
 
 // chatStatsReader 在流式透传时抓取 SSE 末帧的 usage.completion_tokens 精确值，
@@ -117,6 +132,8 @@ type chatStatsReader struct {
 	cacheMiss    int
 	hasCacheMiss bool
 	pend         []byte // 已读未返回的行缓存
+	lineBuf      []byte // 超长 SSE 行的拼接缓冲（仅 ErrBufferFull 时复用）
+	readBuf      []byte // 批量 Read 的暂存缓冲（仅单次无法填满调用方 p 时使用）
 }
 
 // newChatStatsReaderSince 以 since 为 TTFB 计时起点（通常是请求进入 handler 的时刻）。
@@ -150,21 +167,43 @@ func (s *chatStatsReader) Usage() pool.TokenUsageDelta {
 
 // parseSSELine 解析一行 "data: {...}"：首帧记 TTFB，含 usage 时采信精确 completion_tokens。
 func (s *chatStatsReader) parseSSELine(line string) {
-	line = strings.TrimRight(line, "\r\n")
-	if !strings.HasPrefix(line, "data: ") {
+	s.parseSSELineBytes([]byte(line))
+}
+
+// parseSSELineBytes 与 parseSSELine 语义一致，但直接消费 bufio 的临时缓冲，
+// 避免流式透传时每行都把 []byte 转成 string（ReadString）再转回 []byte（解码）。
+func (s *chatStatsReader) parseSSELineBytes(line []byte) {
+	line = bytes.TrimRight(line, "\r\n")
+	if !bytes.HasPrefix(line, []byte("data: ")) {
 		return
 	}
-	payload := strings.TrimPrefix(line, "data: ")
-	if payload == "[DONE]" {
+	payload := line[len("data: "):]
+	if bytes.Equal(payload, []byte("[DONE]")) {
 		return
 	}
 	if !s.seen {
 		s.seen = true
 		s.ttfb = time.Since(s.start)
 	}
+	// 绝大多数 delta 帧只有 content/tool_calls，完整解码整帧只为找 usage/error
+	// 是流式路径上的固定浪费。先做字节预过滤：只有出现这两个键才解码。
+	// 键名在 JSON 里仍可能出现在字符串内容中（如用户消息包含 "usage"），
+	// 因此预过滤只作为“快速跳过”，命中后仍走完整解码并按结构判字段。
+	// 本轮同时把「末帧 usage」和「error 帧」的识别合并，避免为同一 payload
+	// 分别判断两次；坏帧保持静默跳过。
+	// 两个键共用一次扫描；绝大多数 delta 帧在这里直接返回。
+	hasUsage := bytes.Contains(payload, []byte(`"usage"`))
+	// 错误既可能是 OpenAI 的顶层 error，也可能是上游业务信封
+	// {"code":6004,"msg":...}。后者没有 error 键，只看 error 会漏记限流帧。
+	hasError := bytes.Contains(payload, []byte(`"error"`)) || bytes.Contains(payload, []byte(`"code"`))
+	if !hasUsage && !hasError {
+		return
+	}
 	var chunk struct {
-		Error json.RawMessage `json:"error"`
-		Usage *struct {
+		Code    json.RawMessage   `json:"code"`
+		Error   json.RawMessage   `json:"error"`
+		Choices []json.RawMessage `json:"choices"`
+		Usage   *struct {
 			PromptTokens         *int     `json:"prompt_tokens"`
 			CompletionTokens     *int     `json:"completion_tokens"`
 			TotalTokens          *int     `json:"total_tokens"`
@@ -173,14 +212,41 @@ func (s *chatStatsReader) parseSSELine(line string) {
 			PromptCacheMissTok   *int     `json:"prompt_cache_miss_tokens"`
 		} `json:"usage"`
 	}
-	if json.Unmarshal([]byte(payload), &chunk) != nil || chunk.Usage == nil {
-		if json.Unmarshal([]byte(payload), &chunk) == nil && len(chunk.Error) > 0 {
-			s.errorFrame = true
-		}
+	if json.Unmarshal(payload, &chunk) != nil {
 		return
 	}
+	// error:null / error:{} 不是错误帧：前者是正常心跳/元信息占位，后者为空对象
+	// 也无任何错误信息。与 upstream.frameIsError 同口径，避免流尾统计把 null 当
+	// 成上游错误、误触发账号处置或错误指标。
 	if len(chunk.Error) > 0 {
-		s.errorFrame = true
+		var errValue any
+		if json.Unmarshal(chunk.Error, &errValue) == nil {
+			switch v := errValue.(type) {
+			case nil:
+				// error:null 是正常收尾/元信息占位。
+			case map[string]any:
+				// error:{} 没有任何错误信息；与 upstream.frameIsError 同口径。
+				if len(v) > 0 {
+					s.errorFrame = true
+				}
+			default:
+				s.errorFrame = true
+			}
+		}
+	}
+	// 业务信封与 upstream.frameIsError 同口径：code 存在且非 0，同时没有可用
+	// choices。带 choices 的帧即便夹带 code 仍是回答正文。错误标记只置位、不回落，
+	// 避免真实错误帧后再来 error:{} 把整条流误判为成功。
+	if !s.errorFrame && len(chunk.Code) > 0 && len(chunk.Choices) == 0 {
+		var code any
+		if json.Unmarshal(chunk.Code, &code) == nil && code != nil {
+			if strings.TrimSpace(fmt.Sprint(code)) != "0" {
+				s.errorFrame = true
+			}
+		}
+	}
+	if chunk.Usage == nil {
+		return
 	}
 	if chunk.Usage.PromptTokens != nil {
 		s.hasPromptTokens = true
@@ -228,6 +294,24 @@ func (s *chatStatsReader) CacheTokens() (hit, miss int64, ok bool) {
 // SawErrorFrame 报告流中是否透传过 SSE error 帧。
 func (s *chatStatsReader) SawErrorFrame() bool { return s.errorFrame }
 
+// readLine 读取一条完整 SSE 行。ReadSlice 在单行超过 bufio 缓冲时返回
+// bufio.ErrBufferFull 和半行；必须继续拼接，否则 usage/error 位于行尾时会被
+// 截断，且透传给客户端的内容也会被拆错。普通短行仍走零分配路径。
+func (s *chatStatsReader) readLine() ([]byte, error) {
+	line, err := s.br.ReadSlice('\n')
+	if err != bufio.ErrBufferFull {
+		return line, err
+	}
+	s.lineBuf = append(s.lineBuf[:0], line...)
+	for {
+		line, err = s.br.ReadSlice('\n')
+		s.lineBuf = append(s.lineBuf, line...)
+		if err != bufio.ErrBufferFull {
+			return s.lineBuf, err
+		}
+	}
+}
+
 // Read 返回原始数据，同时解析统计 TTFB/token。
 func (s *chatStatsReader) Read(p []byte) (int, error) {
 	if len(s.pend) > 0 {
@@ -235,15 +319,48 @@ func (s *chatStatsReader) Read(p []byte) (int, error) {
 		s.pend = s.pend[n:]
 		return n, nil
 	}
-	line, err := s.br.ReadString('\n')
-	if line != "" {
-		s.parseSSELine(line)
-		s.pend = []byte(line)
-		n := copy(p, s.pend)
-		s.pend = s.pend[n:]
-		return n, nil
+	// io.Copy 给的是 32KB 级缓冲；逐行返回会让 500 帧的流产生 500 次 Read。
+	// 这里把连续完整行一次性填进 p：bufio.ReadSlice 的切片在下一次读取前有效，
+	// 因此必须在同一轮循环内既解析该行、又把它复制到 p（不能先缓存切片再统一解析）。
+	// 任何跨 Read 的残行才落到 readBuf/pend，语义与逐行实现逐字节一致。
+	n := 0
+	for {
+		line, err := s.readLine()
+		if len(line) > 0 {
+			s.parseSSELineBytes(line)
+			if n+len(line) <= len(p) {
+				copy(p[n:], line)
+				n += len(line)
+				if err != nil {
+					return n, err
+				}
+				continue
+			}
+			// 剩余空间不足一行：先把这一行完整复制到自有缓冲，再按 p 的容量返回，
+			// 剩余部分由下一次 Read 从 pend 续传，绝不截断行内的 usage/error。
+			s.stashPending(line, p[n:], &n)
+			return n, nil
+		}
+		if n > 0 {
+			return n, err
+		}
+		return 0, err
 	}
-	return 0, err
+}
+
+// stashPending 把一行写入调用方剩余空间，并把未返回部分保存到 pend。
+// readBuf 独立于 bufio 内部缓冲：ReadSlice 返回的切片在下一次读取后失效。
+func (s *chatStatsReader) stashPending(line, dst []byte, n *int) {
+	need := len(line)
+	if cap(s.readBuf) < need {
+		s.readBuf = make([]byte, need)
+	} else {
+		s.readBuf = s.readBuf[:need]
+	}
+	copy(s.readBuf, line)
+	c := copy(dst, s.readBuf)
+	*n += c
+	s.pend = append(s.pend[:0], s.readBuf[c:]...)
 }
 
 // rewriteModel 把 outbound chat body 的 model 字段替换为 bare（保留其余字段原样）。
@@ -343,6 +460,7 @@ type requestTraceKey struct{}
 // requestTrace 在一次 chat 请求内共享标识与最终统计，ServeHTTP 出口统一记账。
 type requestTrace struct {
 	id    string
+	path  string
 	start time.Time
 	stat  *chatStat
 	// 调用来源，进入 handler 时一次性采集（见 ServeHTTP / captureClientInfo）。
@@ -397,10 +515,14 @@ func requestTraceFrom(r *http.Request) *requestTrace {
 }
 
 func (t *requestTrace) event(status int) reqlog.Event {
+	path := t.path
+	if path == "" {
+		path = "/v1/chat/completions"
+	}
 	e := reqlog.Event{
 		Time:      t.start,
 		RequestID: t.id,
-		Path:      "/v1/chat/completions",
+		Path:      path,
 		Status:    status,
 	}
 	duration := time.Since(t.start)
@@ -410,6 +532,7 @@ func (t *requestTrace) event(status int) reqlog.Event {
 	}
 	if t.stat != nil {
 		s := t.stat
+		e.KeyID = s.keyID
 		e.Account = logfmt.Label(s.uid, s.nick)
 		e.Model = s.model
 		e.Outcome = s.outcome
@@ -487,14 +610,14 @@ const (
 //     uid8 时人眼无法判断是哪个号，要辨认必须再查 auths/，排障多一跳；
 //   - toks<0 表示 usage 缺失，显示 "-"。
 func logChatRow(ttfb, total time.Duration, model, mode, uid, nick string, status int, toks int) {
-	logChatRowEx(ttfb, total, model, mode, uid, nick, status, toks, "", "", 0, 0, false, "", "")
+	logChatRowEx(ttfb, total, model, mode, uid, nick, status, toks, "", "", 0, 0, false, "", "", "")
 }
 
 // logChatRowEx 是带请求 ID、结果、重试、积分与调用来源字段的扩展流水行。旧调用保持
 // 原格式；requestID 非空时才追加扩展字段；来源两参均为空时不追加来源段。
 func logChatRowEx(ttfb, total time.Duration, model, mode, uid, nick string, status int, toks int,
 	requestID, outcome string, attempts int, credit float64, hasCredit bool,
-	clientIP, userAgent string) {
+	clientIP, userAgent, keyID string) {
 	if !chatLogEnabled {
 		return
 	}
@@ -532,6 +655,9 @@ func logChatRowEx(ttfb, total time.Duration, model, mode, uid, nick string, stat
 			creditField = fmt.Sprintf("%.4f", credit)
 		}
 		extra = fmt.Sprintf(" rid=%s | out=%s | try=%d | credit=%s |", requestID, outcome, attempts, creditField)
+		if keyID != "" {
+			extra += fmt.Sprintf(" key=%s |", keyID)
+		}
 	}
 	// 调用来源：IP 用可解析的裸值（便于 grep），UA 用 ShortUA 压缩后的客户端标签
 	// 并加引号（标签内可能含空格，如 `OpenAI/Python 1.30.0` 只会取到 OpenAI/Python）。

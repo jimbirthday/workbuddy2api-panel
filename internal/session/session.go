@@ -14,6 +14,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"log"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -25,7 +26,21 @@ import (
 type entry struct {
 	uid        string
 	lastActive time.Time
+	// lastMirror 是最近一次镜像到 redisstore 的时刻。命中路径按 touchInterval
+	// 节流续期，避免每个请求都抢全局写锁并把同一 key 的 SetBind 重复排进 Redis
+	// 写队列；未到期的快速命中只读内存，不再产生写放大。
+	lastMirror time.Time
 }
+
+const (
+	// defaultMaxBindings 内存粘性绑定的默认上限。会话键可来自客户端任意输入，
+	// 没有上限时长期运行会被无限增长的对话撑爆内存；达到上限后按最久未活跃
+	// 的绑定批量淘汰（Redis 镜像同步删除）。
+	defaultMaxBindings = 50000
+	// maxTouchInterval 命中续期的上限。TTL 很短时按 TTL/10 收紧，确保活跃会话
+	// 在过期前至少续期一次；TTL 较长时最多每分钟写一次 Redis。
+	maxTouchInterval = time.Minute
+)
 
 // Config 路由依赖；Available 返回"可用账号"（healthy 且未占满在途）的有序 uid 列表，
 // 由 pool.AvailableUIDs 提供。Store 可为 redisstore.Noop（纯内存）。
@@ -41,14 +56,24 @@ type Config struct {
 	// 模型级限额后对**其他模型**仍可用（issue #31 豁免），此时若只按账号级可用性
 	// 校验，会话会被钉在这个号上反复失败——正是"限额后换不动号"的观感来源。
 	AvailableForModel func(model string) []string
+	// CanRoute 是快路径的按账号判定（可选）：给定 (model, realm, uid) 回答绑定号
+	// 现在是否仍可路由。生产装配注入 pool.UIDAvailableForModel 后，命中路径不再
+	// 为校验而整池扫描/排序；nil 时回落 AvailableForModel 的线性 Contains。
+	CanRoute func(model, realm, uid string) bool
 }
 
 // Router 会话粘性路由器。
 type Router struct {
 	mu      sync.RWMutex
 	entries map[string]entry
-	cfg     Config
-	stop    chan struct{}
+	// boundUIDs 只记录 uid -> 绑定数，用来回答「哪些账号当前空闲」。新会话分配
+	// 时不应遍历最多 5 万条绑定构造 Set；命中副本/并发 re-check 都通过
+	// adjustBoundLocked 维护计数，保证与 entries 同步。
+	boundUIDs   map[string]int
+	cfg         Config
+	stop        chan struct{}
+	touchEvery  time.Duration
+	maxBindings int
 }
 
 // New 构建路由器。若 cfg.Store 为 nil 则用 Noop（纯内存）；cfg.Available 为 nil 视为空池。
@@ -63,7 +88,20 @@ func New(cfg Config) *Router {
 	if cfg.GCInterval <= 0 {
 		cfg.GCInterval = 5 * time.Minute
 	}
-	return &Router{entries: map[string]entry{}, cfg: cfg}
+	touchEvery := cfg.TTL / 10
+	if touchEvery > maxTouchInterval {
+		touchEvery = maxTouchInterval
+	}
+	if touchEvery < time.Millisecond {
+		touchEvery = time.Millisecond
+	}
+	return &Router{
+		entries:     map[string]entry{},
+		boundUIDs:   map[string]int{},
+		cfg:         cfg,
+		touchEvery:  touchEvery,
+		maxBindings: defaultMaxBindings,
+	}
 }
 
 // StartGC 启动后台 GC goroutine（幂等）。进程退出时调 StopGC。
@@ -117,17 +155,30 @@ func (r *Router) LoadFromStore() {
 	}
 	now := time.Now()
 	r.mu.Lock()
-	loaded := 0
+	limit := r.bindLimitLocked()
+	loaded, skipped := 0, 0
 	for key, uid := range binds {
 		if _, exists := r.entries[key]; exists {
 			continue
 		}
-		r.entries[key] = entry{uid: uid, lastActive: now}
+		if len(r.entries) >= limit {
+			skipped++
+			continue
+		}
+		r.entries[key] = entry{uid: uid, lastActive: now, lastMirror: now}
+		r.adjustBoundLocked(uid, 1)
 		loaded++
 	}
+	evicted := r.evictOverflowLocked(now)
 	r.mu.Unlock()
+	for _, key := range evicted {
+		r.cfg.Store.DelBind(key)
+	}
 	if loaded > 0 {
 		log.Printf("[session] 从 Redis 恢复 %d 条粘性会话绑定", loaded)
+	}
+	if skipped > 0 {
+		log.Printf("[session] WARN: Redis 粘性绑定超过内存上限 %d，已忽略 %d 条旧绑定", limit, skipped)
 	}
 }
 
@@ -146,14 +197,17 @@ func (r *Router) Resolve(key string) (string, bool) {
 // 可用性校验，会话会被钉在一个"对当前模型不可用"的号上反复失败。
 func (r *Router) ResolveForModel(key, model string) (string, bool) {
 	now := time.Now()
-	available := r.availableSet(model)
 
 	// ── Fast path: RLock 快查 ──────────────────────────────
+	// 已绑定的请求占绝大多数。旧实现无论是否命中都会先 availableSet(model)
+	// 复制整池可用账号成 map：470 号时每次请求 ~21KB 分配、约 10µs，命中路径
+	// 也被这层分配拖慢。现在先读绑定，再只在需要校验时线性扫描候选列表；
+	// 未命中才构建集合（重新分配本来就要遍历候选）。
 	r.mu.RLock()
 	e, found := r.entries[key]
 	r.mu.RUnlock()
 	if found && !expired(e, now, r.cfg.TTL) {
-		if available[e.uid] {
+		if r.availableContains(model, e.uid) {
 			r.touch(key, e.uid, now)
 			return e.uid, true
 		}
@@ -162,30 +216,30 @@ func (r *Router) ResolveForModel(key, model string) (string, bool) {
 
 	// ── Slow path: 写锁 re-check 后分配 ────────────────────
 	r.mu.Lock()
-	defer r.mu.Unlock()
 
 	// re-check：并发同 key 可能已被其他 goroutine 分配好。
 	if e2, found2 := r.entries[key]; found2 && !expired(e2, now, r.cfg.TTL) {
-		if available[e2.uid] {
-			r.entries[key] = entry{uid: e2.uid, lastActive: now}
+		if r.availableContains(model, e2.uid) {
+			e2.lastActive = now
+			r.entries[key] = e2
+			r.mu.Unlock()
 			return e2.uid, true
 		}
-		delete(r.entries, key) // 失效：清掉再分配
+		r.dropEntryLocked(key) // 失效：清掉再分配
 	}
 
 	uids := r.availableSlice(model)
 	if len(uids) == 0 {
+		r.mu.Unlock()
 		return "", false
 	}
 
 	// 双段策略：优先"空闲账号"（未被任何会话绑定的可用号），其次全池。
-	bound := map[string]bool{}
-	for _, v := range r.entries {
-		bound[v.uid] = true
-	}
+	// boundUIDs 是增量维护的 uid 绑定数，避免每次新会话在写锁内 O(绑定数)
+	// 复制整张表（5 万上限时是明显的长尾）。
 	var idle []string
 	for _, u := range uids {
-		if !bound[u] {
+		if r.boundUIDs[u] == 0 {
 			idle = append(idle, u)
 		}
 	}
@@ -196,20 +250,58 @@ func (r *Router) ResolveForModel(key, model string) (string, bool) {
 	uid := pool2[hashIndex(key, len(pool2))]
 
 	prev, existed := r.entries[key]
-	r.entries[key] = entry{uid: uid, lastActive: now}
+	r.adjustBoundLocked(prev.uid, -1)
+	r.entries[key] = entry{uid: uid, lastActive: now, lastMirror: now}
+	r.adjustBoundLocked(uid, 1)
+	evicted := r.evictOverflowLocked(now)
+	r.mu.Unlock()
+
+	// Redis 写入是异步的，但不能在持内存写锁时提交一长串任务：淘汰一批绑定后
+	// 这里可能连续 DelBind 多条，放到锁外可避免其他会话命中排队。
 	if existed && prev.uid != uid {
 		r.cfg.Store.DelBind(key)
+	}
+	for _, stale := range evicted {
+		r.cfg.Store.DelBind(stale)
 	}
 	r.cfg.Store.SetBind(key, uid, r.cfg.TTL)
 	return uid, true
 }
 
-// touch 滚动 lastActive 并异步镜像（只在快路径命中时写最后一次）。
+// touch 滚动 lastActive 并异步镜像，但按 touchEvery 节流写路径。
+// 高频命中（同一会话连续多轮）在窗口内只做 RLock 读，不抢全局写锁、不重复
+// SetBind；窗口到期后写锁 re-check 再用内存中的最新值续期 Redis TTL。
 func (r *Router) touch(key, uid string, now time.Time) {
+	if r.touchEvery > 0 && now.Sub(r.entriesMirrorAt(key, uid)) < r.touchEvery {
+		return
+	}
 	r.mu.Lock()
-	r.entries[key] = entry{uid: uid, lastActive: now}
+	e, ok := r.entries[key]
+	if !ok || e.uid != uid {
+		r.mu.Unlock()
+		return
+	}
+	if r.touchEvery > 0 && now.Sub(e.lastMirror) < r.touchEvery {
+		r.mu.Unlock()
+		return
+	}
+	e.lastActive = now
+	e.lastMirror = now
+	r.entries[key] = e
 	r.mu.Unlock()
 	r.cfg.Store.SetBind(key, uid, r.cfg.TTL)
+}
+
+// entriesMirrorAt 是 touch 快路径的只读探针；返回零值表示未找到/不匹配，
+// 调用方会自然进入写锁 re-check。它不返回 entry 本体，避免把内部结构复制出去。
+func (r *Router) entriesMirrorAt(key, uid string) time.Time {
+	r.mu.RLock()
+	e, ok := r.entries[key]
+	r.mu.RUnlock()
+	if !ok || e.uid != uid {
+		return time.Time{}
+	}
+	return e.lastMirror
 }
 
 // Bind 显式把会话 key 绑定到 uid（幂等覆盖旧值），并异步镜像到 redisstore。
@@ -221,8 +313,36 @@ func (r *Router) Bind(key, uid string) {
 	}
 	now := time.Now()
 	r.mu.Lock()
-	r.entries[key] = entry{uid: uid, lastActive: now}
+	prev, existed := r.entries[key]
+	if existed && prev.uid == uid {
+		// 成功路径每次请求都会 Bind 最终成功号。同一账号且镜像窗口未到时不重复写
+		// Redis，只滚动内存活跃时间；账号变化或窗口到期才续期/覆盖。
+		if r.touchEvery <= 0 || now.Sub(prev.lastMirror) >= r.touchEvery {
+			prev.lastActive = now
+			prev.lastMirror = now
+			r.entries[key] = prev
+			r.mu.Unlock()
+			r.cfg.Store.SetBind(key, uid, r.cfg.TTL)
+			return
+		}
+		prev.lastActive = now
+		r.entries[key] = prev
+		r.mu.Unlock()
+		return
+	}
+	if existed {
+		r.adjustBoundLocked(prev.uid, -1)
+	}
+	r.entries[key] = entry{uid: uid, lastActive: now, lastMirror: now}
+	r.adjustBoundLocked(uid, 1)
+	evicted := r.evictOverflowLocked(now)
 	r.mu.Unlock()
+	if existed && prev.uid != uid {
+		r.cfg.Store.DelBind(key)
+	}
+	for _, stale := range evicted {
+		r.cfg.Store.DelBind(stale)
+	}
 	r.cfg.Store.SetBind(key, uid, r.cfg.TTL)
 }
 
@@ -231,13 +351,80 @@ func (r *Router) Unbind(key string) bool {
 	r.mu.Lock()
 	_, found := r.entries[key]
 	if found {
-		delete(r.entries, key)
+		r.dropEntryLocked(key)
 	}
 	r.mu.Unlock()
 	if found {
 		r.cfg.Store.DelBind(key)
 	}
 	return found
+}
+
+// bindLimitLocked 返回当前内存绑定上限（测试可调小）。
+func (r *Router) bindLimitLocked() int {
+	if r.maxBindings <= 0 {
+		return defaultMaxBindings
+	}
+	return r.maxBindings
+}
+
+// adjustBoundLocked 维护 uid 绑定计数。调用方必须持有 r.mu 写锁。
+func (r *Router) adjustBoundLocked(uid string, delta int) {
+	if uid == "" || delta == 0 {
+		return
+	}
+	if r.boundUIDs == nil {
+		r.boundUIDs = make(map[string]int)
+	}
+	n := r.boundUIDs[uid] + delta
+	if n <= 0 {
+		delete(r.boundUIDs, uid)
+		return
+	}
+	r.boundUIDs[uid] = n
+}
+
+// dropEntryLocked 删除绑定并同步空闲索引。调用方必须持有 r.mu 写锁。
+func (r *Router) dropEntryLocked(key string) {
+	if e, ok := r.entries[key]; ok {
+		r.adjustBoundLocked(e.uid, -1)
+		delete(r.entries, key)
+	}
+}
+
+// evictOverflowLocked 在超过上限时按 lastActive 从旧到新批量淘汰。
+// 批量淘汰避免“每来一个新会话就全表扫一次找最旧”的 O(n) 抖动；返回的 key
+// 必须在锁外由调用方镜像 DelBind（Redis 网络调用不能占内存写锁）。
+func (r *Router) evictOverflowLocked(now time.Time) []string {
+	limit := r.bindLimitLocked()
+	if len(r.entries) <= limit {
+		return nil
+	}
+	overflow := len(r.entries) - limit
+	target := overflow
+	if batch := limit / 20; batch > target {
+		target = batch
+	}
+	if target > len(r.entries) {
+		target = len(r.entries)
+	}
+	type keyedEntry struct {
+		key string
+		e   entry
+	}
+	items := make([]keyedEntry, 0, len(r.entries))
+	for key, e := range r.entries {
+		items = append(items, keyedEntry{key: key, e: e})
+	}
+	sort.Slice(items, func(i, j int) bool {
+		return items[i].e.lastActive.Before(items[j].e.lastActive)
+	})
+	evicted := make([]string, 0, target)
+	for i := 0; i < target; i++ {
+		r.dropEntryLocked(items[i].key)
+		evicted = append(evicted, items[i].key)
+	}
+	return evicted
 }
 
 // Count 返回当前绑定数（供 /status 观测）。
@@ -257,7 +444,7 @@ func (r *Router) gcOnce(now time.Time) int {
 		}
 	}
 	for _, key := range expiredKeys {
-		delete(r.entries, key)
+		r.dropEntryLocked(key)
 	}
 	r.mu.Unlock()
 	for _, key := range expiredKeys {
@@ -266,14 +453,38 @@ func (r *Router) gcOnce(now time.Time) int {
 	return len(expiredKeys)
 }
 
-// availableSet 把 AvailableForModel(model) 的有序列表转集合（快路径命中校验用）。
-func (r *Router) availableSet(model string) map[string]bool {
-	uids := r.availableSlice(model)
-	set := make(map[string]bool, len(uids))
-	for _, u := range uids {
-		set[u] = true
+// availableContains 报告 uid 是否在当前模型的可用候选列表里。
+//
+// 快路径只需回答“绑定号还能不能路由”，不需要为整池建 map。线性 Contains 的
+// 开销随候选数增长，但命中请求不再分配 470 项的 map；重新分配（未命中/失效）
+// 仍在下方的 slow path 按原双段策略处理。候选列表含虚拟实例重复项，Contains
+// 的结果与集合语义一致。
+func (r *Router) availableContains(model, uid string) bool {
+	if r.cfg.CanRoute != nil {
+		realm, bare := splitModelRealm(model)
+		return r.cfg.CanRoute(bare, realm, uid)
 	}
-	return set
+	for _, candidate := range r.availableSlice(model) {
+		if candidate == uid {
+			return true
+		}
+	}
+	return false
+}
+
+// splitModelRealm 把网关模型名拆成 realm 与裸模型。CanRoute 需要 realm 才能与
+// 分池选号严格同口径；裸名按现有协议归 cn（与 server.ResolveModel 一致）。
+// 这里只做前缀判定，不引入 server/pool 依赖，保持 session 包可独立测试。
+func splitModelRealm(model string) (realm, bare string) {
+	// 热路径：只识别开头的 "cn:" / "global:"，避免为每次粘性命中构造
+	// strings.IndexByte 之外的临时值。裸名与未知前缀保持归 cn 的现状语义。
+	if strings.HasPrefix(model, "cn:") {
+		return "cn", model[3:]
+	}
+	if strings.HasPrefix(model, "global:") {
+		return "global", model[7:]
+	}
+	return "cn", model
 }
 
 // availableSlice 安全调用 AvailableForModel；未注入时回落 Available（nil 视空池）。
@@ -340,6 +551,16 @@ func ExtractKey(body []byte) string {
 	if err := json.Unmarshal(body, &obj); err != nil {
 		return ""
 	}
+	return ExtractKeyFromObject(obj)
+}
+
+// ExtractKeyFromObject 是 ExtractKey 的已解析版本：handler 在请求入口已把 body
+// 解码为 map 后直接复用，不再为会话键做第二次全量解码。obj 必须是成功
+// json.Unmarshal 到 map[string]any 的结果（与 ExtractKey 内解析同构）；nil 返回空串。
+func ExtractKeyFromObject(obj map[string]any) string {
+	if obj == nil {
+		return ""
+	}
 	if meta, ok := obj["metadata"].(map[string]any); ok {
 		if v := strOrEmpty(meta["conversation_id"]); v != "" {
 			return v
@@ -364,6 +585,39 @@ func ExtractKey(body []byte) string {
 		return ""
 	}
 	return deriveKey(obj)
+}
+
+// ConversationIDFields 是 ResolveConversationID 所需的显式会话 ID 字段。
+type ConversationIDFields struct {
+	Metadata                    map[string]any
+	MetadataConversationID      string
+	MetadataConversationIDCamel string
+	ConversationID              string
+	ConversationIDCamel         string
+}
+
+// ResolveConversationIDFromFields 是 ResolveConversationID 的已解码版本：
+// metadata 优先、snake 优先于 camel，且绝不回落 user_id。
+func ResolveConversationIDFromFields(f ConversationIDFields) string {
+	metaConversation, metaConversationCamel := f.MetadataConversationID, f.MetadataConversationIDCamel
+	if f.Metadata != nil {
+		if v := strOrEmpty(f.Metadata["conversation_id"]); v != "" {
+			metaConversation = v
+		}
+		if v := strOrEmpty(f.Metadata["conversationId"]); v != "" {
+			metaConversationCamel = v
+		}
+	}
+	if metaConversation != "" {
+		return metaConversation
+	}
+	if metaConversationCamel != "" {
+		return metaConversationCamel
+	}
+	if f.ConversationID != "" {
+		return f.ConversationID
+	}
+	return f.ConversationIDCamel
 }
 
 // hasUserIDKey 报告已解析 body 是否携带 user 维度标识（metadata.user_id 或顶层
@@ -450,6 +704,169 @@ func userContentSignature(content any) string {
 		return str
 	}
 	if st[0] != '[' {
+		return ""
+	}
+	var parts []json.RawMessage
+	if json.Unmarshal(raw, &parts) != nil {
+		return ""
+	}
+	var b strings.Builder
+	hasNonText := false
+	for _, pr := range parts {
+		var p struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		}
+		if json.Unmarshal(pr, &p) != nil {
+			return ""
+		}
+		if p.Type == "" || p.Type == "text" {
+			b.WriteString(p.Text)
+			continue
+		}
+		hasNonText = true
+		b.WriteString("\n[" + p.Type + "]\n")
+	}
+	out := b.String()
+	if !hasNonText {
+		return out
+	}
+	return strings.TrimSpace(out)
+}
+
+// KeyMessage 是会话键派生所需的单条消息视图。Content 保留原始 JSON 字节，
+// 多模态 part 的签名与 TurnKey 使用完全相同的字节口径。
+type KeyMessage struct {
+	Role    string
+	Content json.RawMessage
+}
+
+// KeyFields 是 ExtractKey 所需的已解码字段。handler 入口解码一次请求后直接
+// 构造它，避免会话键、轮级键和工具名单各自重新解析 JSON。
+type KeyFields struct {
+	// Metadata 是原始的 metadata 对象；handler 只解析一次请求后直接传入，由
+	// ExtractKeyFromFields 在内存里读取会话 ID/user_id。nil 表示无 metadata。
+	Metadata                    map[string]any
+	MetadataConversationID      string
+	MetadataConversationIDCamel string
+	ConversationID              string
+	ConversationIDCamel         string
+	PromptCacheKey              string
+	MetadataUserID              string
+	UserID                      string
+	Messages                    []KeyMessage
+}
+
+// ExtractKeyFromFields 是 ExtractKey 的已解码版本，优先级与派生规则逐字一致：
+// metadata 显式 ID → 顶层显式 ID → prompt_cache_key → user_id 抑制 → 内容派生。
+func ExtractKeyFromFields(f KeyFields) string {
+	metaConversation, metaConversationCamel, metaUserID := f.MetadataConversationID, f.MetadataConversationIDCamel, f.MetadataUserID
+	if f.Metadata != nil {
+		if v := strOrEmpty(f.Metadata["conversation_id"]); v != "" {
+			metaConversation = v
+		}
+		if v := strOrEmpty(f.Metadata["conversationId"]); v != "" {
+			metaConversationCamel = v
+		}
+		if v := strOrEmpty(f.Metadata["user_id"]); v != "" {
+			metaUserID = v
+		}
+	}
+	if metaConversation != "" {
+		return metaConversation
+	}
+	if metaConversationCamel != "" {
+		return metaConversationCamel
+	}
+	if f.ConversationID != "" {
+		return f.ConversationID
+	}
+	if f.ConversationIDCamel != "" {
+		return f.ConversationIDCamel
+	}
+	if f.PromptCacheKey != "" {
+		return f.PromptCacheKey
+	}
+	if metaUserID != "" || f.UserID != "" {
+		return ""
+	}
+	return deriveKeyFields(f.Messages)
+}
+
+// deriveKeyFields 与 deriveKey 同口径，但直接消费原始 content 字节：
+// system 取首条文本，user 取首条内容签名，二者都齐后提前停止扫描。
+func deriveKeyFields(msgs []KeyMessage) string {
+	systemText, firstUserText := "", ""
+	for _, m := range msgs {
+		switch m.Role {
+		case "system", "developer":
+			if systemText == "" {
+				systemText = messageTextRaw(m.Content)
+			}
+		case "user":
+			if firstUserText == "" {
+				firstUserText = userContentSignatureRaw(m.Content)
+			}
+		}
+		if firstUserText != "" && systemText != "" {
+			break
+		}
+	}
+	if firstUserText == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(systemText + "\x00" + firstUserText))
+	return derivedKeyPrefix + hex.EncodeToString(sum[:16])
+}
+
+// messageTextRaw 是 messageText 的原始字节版本：字符串原样返回；parts 数组
+// 只拼接 text 字段（与 messageText 对已解析 map 的口径一致），其他形态为空。
+func messageTextRaw(raw json.RawMessage) string {
+	s := strings.TrimSpace(string(raw))
+	if s == "" || s == "null" {
+		return ""
+	}
+	if s[0] == '"' {
+		var str string
+		if json.Unmarshal(raw, &str) == nil {
+			return str
+		}
+		return ""
+	}
+	if s[0] != '[' {
+		return ""
+	}
+	var parts []json.RawMessage
+	if json.Unmarshal(raw, &parts) != nil {
+		return ""
+	}
+	var b strings.Builder
+	for _, pr := range parts {
+		var p struct {
+			Text string `json:"text"`
+		}
+		if json.Unmarshal(pr, &p) == nil {
+			b.WriteString(p.Text)
+		}
+	}
+	return b.String()
+}
+
+// userContentSignatureRaw 是 userContentSignature 的原始字节版本：文本 part
+// 拼接原文，非文本 part 只入 [type] 占位（图片 URL 变化不破坏会话粘性）。
+func userContentSignatureRaw(raw json.RawMessage) string {
+	s := strings.TrimSpace(string(raw))
+	if s == "" || s == "null" {
+		return ""
+	}
+	if s[0] == '"' {
+		var str string
+		if json.Unmarshal(raw, &str) != nil {
+			return ""
+		}
+		return str
+	}
+	if s[0] != '[' {
 		return ""
 	}
 	var parts []json.RawMessage

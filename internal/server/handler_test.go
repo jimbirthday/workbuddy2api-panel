@@ -16,9 +16,12 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/prompt"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/redisstore"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/usage"
@@ -61,6 +64,20 @@ func newFakeUpstream(t *testing.T, behavior func(auth string) (status int, body 
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+// failingResponseWriter 模拟客户端已断开：响应头可写，但任何正文写入都返回
+// io.ErrClosedPipe（net/http 在连接关闭后写 socket 的典型错误）。
+type failingResponseWriter struct{ header http.Header }
+
+func newFailingResponseWriter() *failingResponseWriter {
+	return &failingResponseWriter{header: make(http.Header)}
+}
+
+func (w *failingResponseWriter) Header() http.Header { return w.header }
+func (w *failingResponseWriter) WriteHeader(int)     {}
+func (w *failingResponseWriter) Write([]byte) (int, error) {
+	return 0, io.ErrClosedPipe
+}
 
 // bindStore 记录粘性绑定镜像调用（不联网），供 D4 端到端断言绑定收敛到最终成功号。
 type bindStore struct {
@@ -350,6 +367,93 @@ func TestChatStreamClientGoneUsageNotFailed(t *testing.T) {
 	totals := usageRec.Snapshot(0, nil).Totals
 	if totals.Requests != 1 || totals.Errors != 0 {
 		t.Fatalf("client-gone usage totals=%+v want requests=1 errors=0", totals)
+	}
+}
+
+// TestChatStreamClientWriteErrorDoesNotWashAccount 客户端写失败（连接断开）时，
+// 上游可能只发了一半就停止；没有完整读完就不能证明账号成功。此前该分支会
+// NoteSuccess + 清 11102 + 绑粘性，于是用户点停止即可把限流号洗成健康号。
+func TestChatStreamClientWriteErrorDoesNotWashAccount(t *testing.T) {
+	up := newFakeUpstream(t, func(string) (int, string, bool) { return 200, sseOK, true })
+	store := newBindStore()
+	sess := session.New(session.Config{
+		TTL: time.Minute,
+		// 故意把过期绑定 old 报告为可用：Resolve 会先选中它，PickByUIDForModel(old)
+		// 找不到账号后解绑并回落轮换到 u1。若写失败分支错误地 Bind，会把 conv-1
+		// 重新绑到 u1；修复后应保持解绑（存储中无 conv-1）。
+		Store:     store,
+		Available: func() []string { return []string{"old", "u1"} },
+	})
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	usageRec := usage.New("")
+	h := NewHandler(Config{Pool: p, Upstream: up, Session: sess, Usage: usageRec})
+	sess.Bind("conv-1", "old")
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[{"role":"user","content":"hi"}],"metadata":{"conversation_id":"conv-1"}}`))
+	h.ServeHTTP(newFailingResponseWriter(), req)
+
+	st, ok := p.Status("u1")
+	if !ok {
+		t.Fatal("account status missing")
+	}
+	if st.SuccessCount != 0 {
+		t.Fatalf("client write error must not be recorded as success: %+v", st.TokenUsage)
+	}
+	if !st.LastSuccessTime.IsZero() {
+		t.Fatalf("client write error must not set last_success: %v", st.LastSuccessTime)
+	}
+	if uid, bound := store.lastUID("conv-1"); bound {
+		t.Fatalf("client write error must not bind sticky session, got uid=%s", uid)
+	}
+	totals := usageRec.Snapshot(0, nil).Totals
+	if totals.Requests != 1 || totals.Errors != 0 {
+		t.Fatalf("client-gone usage totals=%+v want requests=1 errors=0", totals)
+	}
+}
+
+// TestChatStreamErrorFrameAfterContentUnbindsSticky 正文之后收到 6004 error 帧：
+// 必须释放租约并解绑当前粘性号（账号对其他模型仍可用），同时只锁该模型、
+// 不记成功。否则下一轮会话仍会被钉在这个限流号上。
+func TestChatStreamErrorFrameAfterContentUnbindsSticky(t *testing.T) {
+	const halfErr = "data: {\"id\":\"x\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hi\"}}]}\n\n" +
+		"data: {\"error\":{\"code\":6004,\"message\":\"model rate limit\"}}\n\ndata: [DONE]\n\n"
+	up := newFakeUpstream(t, func(string) (int, string, bool) { return 200, halfErr, true })
+	store := newBindStore()
+	sess := session.New(session.Config{
+		TTL:       time.Minute,
+		Store:     store,
+		Available: func() []string { return []string{"u1"} },
+	})
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up, Session: sess})
+	sess.Bind("conv-1", "u1")
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[{"role":"user","content":"hi"}],"metadata":{"conversation_id":"conv-1"}}`))
+	h.ServeHTTP(httptest.NewRecorder(), req)
+
+	if uid, bound := store.lastUID("conv-1"); bound {
+		t.Fatalf("error frame after content must unbind sticky session, got uid=%s", uid)
+	}
+	st, ok := p.Status("u1")
+	if !ok {
+		t.Fatal("account status missing")
+	}
+	if st.SuccessCount != 0 {
+		t.Fatalf("error frame must not count as success: success_count=%d", st.SuccessCount)
+	}
+	if st.Cooling {
+		t.Fatalf("6004 must only lock the model, not the whole account: %+v", st)
+	}
+	found := false
+	for _, m := range st.RateLimitedModels {
+		if m.Model == "glm-5.2" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("glm-5.2 should remain model-rate-limited: %+v", st.RateLimitedModels)
 	}
 }
 
@@ -1190,6 +1294,46 @@ func TestModelsEndpoint(t *testing.T) {
 	}
 }
 
+// /v1/models 对受限 key 只返回其 realm/models 允许的条目；上游目录本身不变。
+func TestModelsFilteredByAPIKeyRestrictions(t *testing.T) {
+	dynamicModelsCache.Lock()
+	dynamicModelsCache.ids = []upstream.ModelInfo{{ID: "glm-5.3"}, {ID: "kimi-k3"}}
+	dynamicModelsCache.fetched = time.Now()
+	dynamicModelsCache.lastFail = time.Time{}
+	dynamicModelsCache.Unlock()
+	defer func() {
+		dynamicModelsCache.Lock()
+		dynamicModelsCache.ids = nil
+		dynamicModelsCache.fetched = time.Time{}
+		dynamicModelsCache.Unlock()
+	}()
+
+	up := newFakeUpstream(t, func(string) (int, string, bool) { return 200, `{"code":0,"data":{"models":[]}}`, false })
+	live := livecfg.New(livecfg.Snapshot{Keys: []httpauth.Key{{
+		ID: "restricted", Key: "key-restricted", Enabled: true, Realm: "cn", Models: []string{"glm-*"},
+	}}})
+	h := NewHandler(Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream: up, Live: live,
+	})
+	req := httptest.NewRequest("GET", "/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer key-restricted")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	var resp struct {
+		Data []map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Data) != 1 || resp.Data[0]["id"] != "cn:glm-5.3" {
+		t.Fatalf("filtered models=%+v", resp.Data)
+	}
+}
+
 func TestModelsDynamic(t *testing.T) {
 	// 清缓存
 	dynamicModelsCache.Lock()
@@ -1664,6 +1808,68 @@ func TestStatusRequiresAuth(t *testing.T) {
 	h.ServeHTTP(rec, httptest.NewRequest("GET", "/healthz", nil))
 	if rec.Code != 200 {
 		t.Errorf("healthz: code=%d", rec.Code)
+	}
+}
+
+// 多 key：命中条目、禁用条目与 realm/models 限制必须在请求前生效；跨域明确 400，
+// 不静默改走另一个域。
+func TestMultiAPIKeyIdentityRealmAndModels(t *testing.T) {
+	up := newFakeUpstream(t, func(string) (int, string, bool) { return 200, sseOK, true })
+	p := testPoolWith(&auth.Auth{UID: "cn1", AccessToken: "at-cn", ExpiresAt: 9999999999})
+	live := livecfg.New(livecfg.Snapshot{Keys: []httpauth.Key{
+		{ID: "cn", Key: "key-cn", Enabled: true, Realm: "cn"},
+		{ID: "global", Key: "key-global", Enabled: true, Realm: "global"},
+		{ID: "models", Key: "key-models", Enabled: true, Models: []string{"glm-*"}},
+		{ID: "off", Key: "key-off", Enabled: false},
+	}})
+	h := NewHandler(Config{Pool: p, Upstream: up, Live: live})
+	cases := []struct {
+		name, token, body string
+		want              int
+		errCode           string
+	}{
+		{"realm match", "key-cn", `{"model":"cn:glm-5.3","messages":[]}`, 200, ""},
+		{"realm mismatch", "key-cn", `{"model":"global:kimi-k3","messages":[]}`, 400, "realm_not_allowed"},
+		{"global key cannot cn", "key-global", `{"model":"glm-5.3","messages":[]}`, 400, "realm_not_allowed"},
+		{"model allowed", "key-models", `{"model":"glm-5.3","messages":[]}`, 200, ""},
+		{"model denied", "key-models", `{"model":"kimi-k3","messages":[]}`, 400, "model_not_allowed"},
+		{"disabled key", "key-off", `{"model":"glm-5.3","messages":[]}`, 401, "invalid_api_key"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(c.body))
+			req.Header.Set("Authorization", "Bearer "+c.token)
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			if rec.Code != c.want {
+				t.Fatalf("code=%d body=%s want %d", rec.Code, rec.Body, c.want)
+			}
+			if c.errCode != "" && !strings.Contains(rec.Body.String(), c.errCode) {
+				t.Fatalf("body=%s want %s", rec.Body, c.errCode)
+			}
+		})
+	}
+}
+
+// 命中 key 的身份必须进入请求归档（key_id），且归档/响应绝不能出现密钥原文。
+func TestRequestLogRecordsKeyIDWithoutSecret(t *testing.T) {
+	up := newFakeUpstream(t, func(string) (int, string, bool) { return 200, sseOK, true })
+	rec := reqlog.New(reqlog.Config{})
+	live := livecfg.New(livecfg.Snapshot{Keys: []httpauth.Key{{ID: "team-a", Key: "super-secret-token", Enabled: true}}})
+	h := NewHandler(Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream: up, RequestLog: rec, Live: live,
+	})
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.3","messages":[]}`))
+	req.Header.Set("Authorization", "Bearer super-secret-token")
+	h.ServeHTTP(httptest.NewRecorder(), req)
+	snap := rec.Snapshot()
+	if len(snap.Recent) != 1 || snap.Recent[0].KeyID != "team-a" {
+		t.Fatalf("recent=%+v", snap.Recent)
+	}
+	raw, _ := json.Marshal(snap.Recent[0])
+	if strings.Contains(string(raw), "super-secret-token") {
+		t.Fatalf("secret leaked into archive event: %s", raw)
 	}
 }
 
@@ -2188,6 +2394,72 @@ func TestChatNonStreamModelRateLimitLocksModelOnly(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("glm-5.2 should be recorded as model-rate-limited: %+v", st.RateLimitedModels)
+	}
+	// 终态必须明确是 429（可重试），不能落回 503/200：唯一账号撞 6004 时
+	// 没有可轮转对象，lastErr 在末端统一映射；同时不得增加成功计数。
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("single-account model limit code=%d want 429 body=%s", rec.Code, rec.Body)
+	}
+	if st.SuccessCount != 0 {
+		t.Fatalf("model limit must not count as success: success_count=%d", st.SuccessCount)
+	}
+	if a := p.PickExcludingForRealm(nil, "other-model", ""); a == nil || a.UID != "u1" {
+		t.Fatalf("other model must remain routable after model-level limit: %+v", a)
+	}
+}
+
+// TestChatNonStreamModelRateLimitRotatesToHealthyAccount 钉死红线：单模型限流
+// 只能淘汰当前账号的该模型，不能中断整个账单/账号池调度。首个账号返回 6004，
+// 第二个账号必须被继续选中并完成请求；限流号的其他模型仍可路由。
+func TestChatNonStreamModelRateLimitRotatesToHealthyAccount(t *testing.T) {
+	reset := time.Now().In(upstream.SoftRateResetLoc()).Add(10 * time.Minute).Format("2006-01-02 15:04:05")
+	errBody := "data: {\"code\":6004,\"msg\":\"model usage limit exceeded, will reset at " + reset + " UTC+8\"}\n\ndata: [DONE]\n\n"
+	const okBody = "data: {\"id\":\"ok\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
+	var calls atomic.Int32
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		calls.Add(1)
+		if authz == "Bearer at1" {
+			return 200, errBody, true
+		}
+		return 200, okBody, true
+	})
+	// 固定随机源优先选积分最高号；u1 先被选，命中 6004 后只能轮到 u2。
+	p := testPoolWith(
+		&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "u2", AccessToken: "at2", ExpiresAt: 9999999999},
+	)
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`)))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("model limit must rotate to healthy account, code=%d body=%s", rec.Code, rec.Body)
+	}
+	if calls.Load() < 2 {
+		t.Fatalf("expected rotate to second account, calls=%d", calls.Load())
+	}
+	st1, ok := p.Status("u1")
+	if !ok {
+		t.Fatal("u1 status missing")
+	}
+	if st1.Cooling {
+		t.Fatalf("u1 must not be account-level cooled: until=%v", st1.Until)
+	}
+	found := false
+	for _, m := range st1.RateLimitedModels {
+		if m.Model == "glm-5.2" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("u1 glm-5.2 should be model-rate-limited: %+v", st1.RateLimitedModels)
+	}
+	if st2, ok := p.Status("u2"); !ok || st2.Cooling || st2.SuccessCount == 0 {
+		t.Fatalf("u2 should serve the rotated request: %+v ok=%v", st2, ok)
+	}
+	if a := p.PickExcludingForRealm(nil, "other-model", ""); a == nil || a.UID != "u1" {
+		t.Fatalf("u1 must remain routable for other models: %+v", a)
 	}
 }
 

@@ -27,6 +27,15 @@ const (
 	defaultQueue    = 1024
 	defaultReadMax  = 1000
 	archiveFileGlob = "requests-*.jsonl"
+	// pruneInterval 是归档保留策略的检查周期。此前随 1 秒 flush ticker 每次都
+	// ReadDir + Stat + 排序，即使没有任何新事件也会持续扫目录；保留/容量都是以
+	// 天/百 MiB 为尺度的策略，没必要时时检查。新事件写入会触发一次到期检查，
+	// 因此流量到来时清理仍然及时。
+	pruneInterval = time.Minute
+	// archiveStatsTTL 是面板「归档文件数/占用」统计的缓存窗口。归档策略以天/百
+	// MiB 为尺度，5 秒的统计延迟不影响运维判断；而每 5 秒对全部归档文件
+	// ReadDir + Stat 会在 100 MiB / 多个轮转文件时形成固定 I/O 成本。
+	archiveStatsTTL = 5 * time.Second
 )
 
 // NewRequestID 生成不含用户信息的本地请求 ID。
@@ -62,22 +71,25 @@ type Config struct {
 // 归档里不会出现来源字段）——来源信息比 token 计数敏感，运营可自行决定是否落盘。
 // 仍然不写提示词、响应正文、Authorization 或其它凭证。
 type Event struct {
-	Time             time.Time `json:"time"`
-	RequestID        string    `json:"request_id"`
-	Path             string    `json:"path"`
-	Account          string    `json:"account,omitempty"`
-	Model            string    `json:"model,omitempty"`
-	Status           int       `json:"status"`
-	OK               bool      `json:"ok"`
-	Outcome          string    `json:"outcome"`
-	DurationMs       int64     `json:"duration_ms"`
-	TTFBMs           int64     `json:"ttfb_ms,omitempty"`
-	Attempts         int       `json:"attempts,omitempty"`
-	PromptTokens     int64     `json:"prompt_tokens,omitempty"`
-	CompletionTokens int64     `json:"completion_tokens,omitempty"`
-	TotalTokens      int64     `json:"total_tokens,omitempty"`
-	Credit           float64   `json:"credit,omitempty"`
-	HasCredit        bool      `json:"credit_known"`
+	Time      time.Time `json:"time"`
+	RequestID string    `json:"request_id"`
+	Path      string    `json:"path"`
+	// KeyID 是调用方命中的 API key 条目 id（不含密钥本身）。未鉴权/旧单 key
+	// 兼容路径为空；归档、指标与导出只允许出现这个 id。
+	KeyID            string  `json:"key_id,omitempty"`
+	Account          string  `json:"account,omitempty"`
+	Model            string  `json:"model,omitempty"`
+	Status           int     `json:"status"`
+	OK               bool    `json:"ok"`
+	Outcome          string  `json:"outcome"`
+	DurationMs       int64   `json:"duration_ms"`
+	TTFBMs           int64   `json:"ttfb_ms,omitempty"`
+	Attempts         int     `json:"attempts,omitempty"`
+	PromptTokens     int64   `json:"prompt_tokens,omitempty"`
+	CompletionTokens int64   `json:"completion_tokens,omitempty"`
+	TotalTokens      int64   `json:"total_tokens,omitempty"`
+	Credit           float64 `json:"credit,omitempty"`
+	HasCredit        bool    `json:"credit_known"`
 	// CacheHitTokens / CacheMissTokens 上游前缀缓存命中/未命中 token（issue #92）。
 	// 上游未回该维度时两者皆零值省略；hit=0 + miss>0 即整段未命中。
 	CacheHitTokens  int64  `json:"cache_hit_tokens,omitempty"`
@@ -91,12 +103,26 @@ type Event struct {
 // 供「今天 / 近 7 天 / 自定义区间」这类时间查询使用。
 type Filter struct {
 	Outcome   string
+	KeyID     string
 	Account   string
 	Model     string
 	ClientIP  string
 	UserAgent string
 	From      time.Time
 	To        time.Time
+}
+
+// asciiFastPath 判断过滤条件能否走按字节预筛。strings.ToLower 对非 ASCII
+// 字符做 Unicode 映射（长度可能变化），此时必须回退完整解码后比较。
+func (f Filter) asciiFastPath() bool {
+	for _, s := range []string{f.KeyID, f.Account, f.Model, f.ClientIP, f.UserAgent} {
+		for i := 0; i < len(s); i++ {
+			if s[i] >= 0x80 {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // ArchiveStats 归档存储状态。
@@ -125,7 +151,11 @@ type Snapshot struct {
 
 // Recorder 并发安全的有界请求指标与归档记录器。
 type Recorder struct {
-	mu          sync.Mutex
+	mu sync.Mutex
+	// readMu 串行化归档窗口缓存的计算与校验。面板 5 秒轮询、手动刷新与导出
+	// 可能并发进来；只缓存「结果 + 目录签名」，命中时完全不读 JSONL。
+	readMu      sync.Mutex
+	readCache   readCacheEntry
 	started     time.Time
 	inFlight    int64
 	completed   int64
@@ -139,6 +169,39 @@ type Recorder struct {
 	recentHead int
 	recentLen  int
 	archive    *archiveWriter
+
+	// perfCache 缓存性能分位的最近一次结果。归档查询要遍历全部 JSONL，
+	// 面板刷新/切维度时会重复做同一件事；按查询键 + 目录签名在 2 秒内复用。
+	perfMu    sync.Mutex
+	perfCache perfCacheEntry
+}
+
+const perfCacheTTL = 2 * time.Second
+
+// readCacheEntry 缓存最近一次 ReadArchive 的窗口结果与目录签名。目录签名由
+// 文件名/大小/mtime 组成；签名不变说明没有新事件、轮转或清理，直接复用结果。
+// 缓存仅保存脱敏 Event，不保存请求正文或凭证。
+type readCacheEntry struct {
+	key    string
+	sig    string
+	hit    bool
+	events []Event
+	limit  int
+}
+
+type perfCacheEntry struct {
+	key   string
+	sig   string
+	at    time.Time
+	stats PerfStats
+	hit   bool
+}
+
+// perfDirSignature 用文件名/大小/mtime 表示归档目录版本。归档只在写入、
+// 轮转、清理时变化；签名一致即可复用聚合结果，避免每次面板刷新全量重扫。
+type perfDirSignature struct {
+	sig     string
+	entries []os.DirEntry
 }
 
 // New 创建记录器；Dir 为空或 Enabled=false 时只启用内存指标。
@@ -251,10 +314,114 @@ func (r *Recorder) recentSnapshotLocked() []Event {
 
 // ReadArchive 返回最近的归档事件（按时间倒序）。limit<=0 时回落 200，最大 1000。
 func (r *Recorder) ReadArchive(limit int, filter Filter) ([]Event, error) {
+	events, _, err := r.ReadArchiveChanged(limit, filter)
+	return events, err
+}
+
+// ReadArchiveChanged 与 ReadArchive 同语义，额外返回窗口是否发生了变化。
+// 面板轮询用它跳过无变化时的整表重绘；事件内容逐条一致，只是复用了上一次
+// 的只读结果快照。changed=false 时调用方应直接保留当前 DOM。
+func (r *Recorder) ReadArchiveChanged(limit int, filter Filter) (events []Event, changed bool, err error) {
+	return r.readArchiveChanged(limit, filter, true)
+}
+
+// ReadArchiveChangedIfChanged 与 ReadArchiveChanged 相同，但窗口未变化时
+// 返回 nil 而不是复制整窗事件。面板 5 秒轮询只关心 changed 标志，用它可把
+// 稳态分配从 O(窗口行数) 降到 O(1)；需要完整窗口的导出/include_entries=1
+// 仍调用 ReadArchiveChanged。
+func (r *Recorder) ReadArchiveChangedIfChanged(limit int, filter Filter) (events []Event, changed bool, err error) {
+	return r.readArchiveChanged(limit, filter, false)
+}
+
+func (r *Recorder) readArchiveChanged(limit int, filter Filter, copyUnchanged bool) (events []Event, changed bool, err error) {
 	if r == nil || r.archive == nil {
-		return nil, nil
+		return nil, false, nil
 	}
-	return r.archive.read(limit, filter)
+	r.readMu.Lock()
+	defer r.readMu.Unlock()
+	entries, err := os.ReadDir(r.archive.cfg.Dir)
+	if err != nil {
+		return nil, false, err
+	}
+	sig := archiveDirSignature(entries)
+	key := archiveReadCacheKey(limit, filter)
+	if r.readCache.hit && r.readCache.key == key && r.readCache.sig == sig {
+		if !copyUnchanged {
+			return nil, false, nil
+		}
+		// 返回副本，避免调用方追加/截断污染下一次命中。面板默认轮询虽会
+		// 丢弃 entries，但导出与 include_entries=1 依赖这里的完整窗口，
+		// 省流由 handler 在写响应前统一处理。
+		out := append([]Event(nil), r.readCache.events...)
+		return out, false, nil
+	}
+	out, err := r.archive.readEntries(entries, limit, filter)
+	if err != nil {
+		return out, true, err
+	}
+	r.readCache = readCacheEntry{key: key, sig: sig, hit: true, events: append([]Event(nil), out...)}
+	return out, true, nil
+}
+
+// archiveDirSignature 用文件名/大小/mtime 生成目录版本签名。读取窗口只关心
+// 归档文件本身；非 requests-*.jsonl 的变化不影响结果。
+func archiveDirSignature(entries []os.DirEntry) string {
+	files := make([]struct {
+		name  string
+		size  int64
+		mtime int64
+	}, 0, len(entries))
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasPrefix(name, "requests-") || !strings.HasSuffix(name, ".jsonl") {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		files = append(files, struct {
+			name  string
+			size  int64
+			mtime int64
+		}{name, info.Size(), info.ModTime().UnixNano()})
+	}
+	sort.Slice(files, func(i, j int) bool { return files[i].name < files[j].name })
+	var b strings.Builder
+	for _, f := range files {
+		b.WriteString(f.name)
+		b.WriteByte('|')
+		b.WriteString(strconv.FormatInt(f.size, 10))
+		b.WriteByte('|')
+		b.WriteString(strconv.FormatInt(f.mtime, 10))
+		b.WriteByte('\n')
+	}
+	return b.String()
+}
+
+// archiveReadCacheKey 只包含影响结果集的参数；字符串字段用规范化后的值，
+// 与 readFileLimit 的匹配口径一致。
+func archiveReadCacheKey(limit int, filter Filter) string {
+	f := filter.normalized()
+	var b strings.Builder
+	b.WriteString(strconv.Itoa(limit))
+	b.WriteByte('|')
+	b.WriteString(f.Outcome)
+	b.WriteByte('|')
+	b.WriteString(f.KeyID)
+	b.WriteByte('|')
+	b.WriteString(f.Account)
+	b.WriteByte('|')
+	b.WriteString(f.Model)
+	b.WriteByte('|')
+	b.WriteString(f.ClientIP)
+	b.WriteByte('|')
+	b.WriteString(f.UserAgent)
+	b.WriteByte('|')
+	b.WriteString(f.From.UTC().Format(time.RFC3339Nano))
+	b.WriteByte('|')
+	b.WriteString(f.To.UTC().Format(time.RFC3339Nano))
+	return b.String()
 }
 
 // Close 刷盘并停止后台归档。
@@ -284,6 +451,11 @@ type archiveWriter struct {
 	path string
 	day  string
 	size int64
+
+	statsMu    sync.Mutex
+	statsAt    time.Time
+	statsFiles int
+	statsBytes int64
 }
 
 func newArchiveWriter(cfg Config) *archiveWriter {
@@ -337,13 +509,21 @@ func (w *archiveWriter) run() {
 	defer close(w.done)
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
+	lastPrune := time.Now()
 	for {
 		select {
 		case e := <-w.ch:
 			w.writeEvent(e)
+			if time.Since(lastPrune) >= pruneInterval {
+				w.prune()
+				lastPrune = time.Now()
+			}
 		case <-ticker.C:
 			w.flush()
-			w.prune()
+			if time.Since(lastPrune) >= pruneInterval {
+				w.prune()
+				lastPrune = time.Now()
+			}
 		case <-w.stop:
 			for {
 				select {
@@ -530,12 +710,19 @@ func (w *archiveWriter) prune() {
 		}
 		return items[i].mtime.Before(items[j].mtime)
 	})
+	removed := false
 	for _, it := range items {
 		if it.path != w.path && (it.mtime.Before(cutoff) || total > w.cfg.MaxBytes) {
 			if err := os.Remove(it.path); err == nil {
 				total -= it.size
+				removed = true
 			}
 		}
+	}
+	if removed {
+		// stats 缓存可能在 prune 前刚统计过；删除文件后必须失效，否则面板会
+		// 在 TTL 内继续显示已不存在的归档文件。
+		w.invalidateStats()
 	}
 }
 
@@ -543,37 +730,57 @@ func (w *archiveWriter) read(limit int, filter Filter) ([]Event, error) {
 	if !w.enabled() {
 		return nil, nil
 	}
+	entries, err := os.ReadDir(w.cfg.Dir)
+	if err != nil {
+		return nil, err
+	}
+	return w.readEntries(entries, limit, filter)
+}
+
+// readEntries 在已取得目录条目的前提下读取窗口结果，供缓存命中路径复用
+// 同一次 ReadDir 结果。
+func (w *archiveWriter) readEntries(entries []os.DirEntry, limit int, filter Filter) ([]Event, error) {
 	if limit <= 0 {
 		limit = 200
 	}
 	if limit > defaultReadMax {
 		limit = defaultReadMax
 	}
-	entries, err := os.ReadDir(w.cfg.Dir)
-	if err != nil {
-		return nil, err
-	}
 	// 归档文件名固定为 requests-<day>.jsonl / requests-<day>.N.jsonl，N 是当天内的
-	// 轮转序号。按「日期倒序、同日序号倒序」排列即从新到旧，能保证在读取到足够条数
-	// 后剩余旧文件无需再读。不依赖 mtime：同一秒内连续轮转写出的多个文件 mtime 经常
+	// 轮转序号。按「日期倒序、同日序号倒序」排列只是常见的读取优先级，不能据此
+	// 推断事件时间后提前停止。不依赖 mtime：同一秒内连续轮转写出的多个文件 mtime 经常
 	// 完全相同（Linux 文件时间戳粒度粗），字典序又会把装着最早事件的基准文件
 	// requests-<day>.jsonl 排到 requests-<day>.N.jsonl 之后；目录被整体拷贝 / 恢复
 	// 备份后 mtime 更不可信（见 TestReadArchiveOrdersByEventTimeNotFileMtime）。
 	names := archiveFileNamesNewestFirst(entries)
-	var out []Event
-	// 从新到旧逐文件读取，累积到 limit 即停：每 5s 轮询只需最近 limit 条，
-	// 无可避免读遍全量旧归档。读取总量有界（limit*单文件）后仍按事件时间倒序
-	// 排序并截断，排序与过滤语义不变（见下方注释）。
+	out := make([]Event, 0, limit)
+	// 按文件名从新到旧读取只是让常见情况下先拿到较新数据；不能因此提前停止。
+	// 文件名中的日期是「写入当天」，不保证等于事件时间：恢复备份、补写历史事件、
+	// 手工归档都会让旧文件名里出现更新的事件。若读到 limit 条就 break，
+	// 会返回较旧记录并漏掉后面文件里的真正最新记录（见跨文件名乱序测试）。
+	// 因此每个文件仍只保留局部最新窗口（内存有界），但必须遍历全部文件；
+	// 最终按事件时间倒序取全局最新 limit 条。
 	for _, name := range names {
-		rows, err := readFile(filepath.Join(w.cfg.Dir, name), filter)
+		// 单个文件可能远大于 limit（轮转文件最大 8 MiB）；只需要保留本文件内最新的
+		// limit 条即可。文件的物理顺序不保证等于事件时间顺序（见下面的倒序测试），
+		// 因此不能读到第一条命中就停，但可以把内存窗口固定为 limit 条。
+		//
+		// 每个文件固定只取局部最新 limit 条，不能按「还能贡献多少」缩小：
+		// 已累计满 limit 时 remaining 为 0，而 readFileLimit(keep=0) 表示不限量，
+		// 会让后续大文件把整份命中集读进内存。全局拼接前始终裁到 limit，
+		// 因此峰值仍是有界的 2×limit + 单文件读缓冲。
+		rows, err := readFileLimit(filepath.Join(w.cfg.Dir, name), filter, limit)
 		if err != nil {
 			// 与旧实现一致：出错时返回已累积结果 + 错误，不静默吞掉。
 			sortArchiveNewestFirst(out)
 			return out, err
 		}
 		out = append(out, rows...)
-		if len(out) >= limit {
-			break
+		if len(out) > limit {
+			// 跨文件窗口同样不能增长到 文件数 × limit：保留全局最新 limit 条，
+			// 后续文件仍可贡献更晚的事件。
+			sortArchiveNewestFirst(out)
+			out = out[:limit]
 		}
 	}
 	// 契约：按事件时间倒序返回最近 limit 条（同一时刻用 Stable 保留落盘先后）。
@@ -633,21 +840,518 @@ func sortArchiveNewestFirst(events []Event) {
 }
 
 func readFile(path string, filter Filter) ([]Event, error) {
+	return readFileLimit(path, filter, 0)
+}
+
+// readFileLimit 读取一个归档文件，只保留按事件时间最新的 keep 条。
+// keep<=0 表示不限制（仅供 readFile 兼容调用）；ReadArchive 热路径始终传入正数。
+// 事件时间倒序；同一时刻按落盘顺序（行号）正序输出。实现与「全量 Stable 排序后
+// 截断前 keep 条」逐位一致，但只保留 2*keep 的候选窗口，不随文件行数增长。
+func readFileLimit(path string, filter Filter, keep int) ([]Event, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
+	filter = filter.normalized()
+	if !filter.asciiFastPath() {
+		return readFileLimitSlow(f, filter, keep)
+	}
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 64<<10), 1<<20)
-	filter = filter.normalized()
-	var out []Event
+	type seqEvent struct {
+		e      Event
+		rawOff int
+		rawLen int
+		seq    int64
+	}
+	capacity := 16
+	if keep > 0 {
+		capacity = 2 * keep
+		if capacity > 4096 {
+			capacity = 4096
+		}
+	}
+	window := make([]seqEvent, 0, capacity)
+	// arena 保存尚未解码的原始行。每批窗口裁剪后只把仍存活的行压紧，
+	// 已在窗口外淘汰的历史行不需要复制或解码。
+	var arena, scratch []byte
+	var line int64
+	// 每个候选窗口只排序一次即可：本函数只要求按「时间倒序、同刻行号正序」
+	// 返回，截断后不需要恢复另一种顺序供后续批次使用，因为 seq 始终保留原始行号。
+	sortWindow := func() {
+		sort.SliceStable(window, func(i, j int) bool {
+			if !window[i].e.Time.Equal(window[j].e.Time) {
+				return window[i].e.Time.After(window[j].e.Time)
+			}
+			return window[i].seq < window[j].seq
+		})
+	}
+	compactWindow := func() {
+		sortWindow()
+		window = window[:keep]
+		need := 0
+		for i := range window {
+			if window[i].rawLen > 0 {
+				need += window[i].rawLen
+			}
+		}
+		if cap(scratch) < need {
+			scratch = make([]byte, 0, need)
+		} else {
+			scratch = scratch[:0]
+		}
+		for i := range window {
+			if window[i].rawLen <= 0 {
+				continue
+			}
+			off := len(scratch)
+			scratch = append(scratch, arena[window[i].rawOff:window[i].rawOff+window[i].rawLen]...)
+			window[i].rawOff = off
+		}
+		arena, scratch = scratch, arena[:0]
+	}
+	// 回退行直接解码到窗口末尾，避免每行都有一个 Event 逃逸到堆上。
+	appendDecoded := func(raw []byte, line int64) {
+		window = append(window, seqEvent{rawLen: -1, seq: line})
+		if json.Unmarshal(raw, &window[len(window)-1].e) != nil {
+			window = window[:len(window)-1]
+			return
+		}
+		if !filter.matchNormalized(window[len(window)-1].e) {
+			window = window[:len(window)-1]
+		}
+	}
 	for scanner.Scan() {
+		line++
+		raw := scanner.Bytes()
+		fields, ok := parseArchiveLineFields(raw)
+		if ok {
+			switch filter.matchArchiveFields(fields) {
+			case archiveMatchNo:
+				continue
+			case archiveMatchFallback:
+				ok = false
+			}
+			if ok {
+				// 只暂存字节偏移；完整解码推迟到窗口裁剪之后，避免为不会再
+				// 返回的历史行分配字符串与时间对象。
+				off := len(arena)
+				arena = append(arena, raw...)
+				window = append(window, seqEvent{rawOff: off, rawLen: len(raw), seq: line, e: Event{Time: fields.at}})
+			}
+		}
+		if !ok {
+			appendDecoded(raw, line)
+		}
+		if keep > 0 && len(window) >= 2*keep {
+			compactWindow()
+		}
+	}
+	sortWindow()
+	if keep > 0 && len(window) > keep {
+		window = window[:keep]
+	}
+	out := make([]Event, 0, len(window))
+	for i := range window {
+		if window[i].rawLen < 0 {
+			out = append(out, window[i].e)
+			continue
+		}
+		var e Event
+		raw := arena[window[i].rawOff : window[i].rawOff+window[i].rawLen]
+		if json.Unmarshal(raw, &e) != nil {
+			// 预筛接受的行必须与完整解码同样成功；出现意外时回退旧路径，
+			// 宁可慢也不能返回与全量语义不一致的结果。
+			return readFileLimitSlow(f, filter, keep)
+		}
+		out = append(out, e)
+	}
+	return out, scanner.Err()
+}
+
+// archiveLineFields 是归档 JSONL 行中参与「时间窗口 + 过滤」的顶层字段。
+// at 是零拷贝解析出的时间；set 标记该字段是否可控地解析成功。
+type archiveLineFields struct {
+	at        time.Time
+	outcome   []byte
+	keyID     []byte
+	account   []byte
+	model     []byte
+	clientIP  []byte
+	userAgent []byte
+
+	atSet       bool
+	outcomeSet  bool
+	keyIDSet    bool
+	accountSet  bool
+	modelSet    bool
+	clientIPSet bool
+	uaSet       bool
+}
+
+// archiveMatch 表示预筛结果。fallback 意味着该行必须交给 encoding/json
+// 完整解码，不能按字节字段直接判定。
+type archiveMatch uint8
+
+const (
+	archiveMatchNo archiveMatch = iota
+	archiveMatchYes
+	archiveMatchFallback
+)
+
+// parseArchiveLineFields 解析归档行的顶层字段，返回的切片与 raw 共享底层字节。
+// 只用于当前行的预筛，不把结果返回给调用方。
+// 只接受单行、无转义字符串与标准 RFC3339 时间；其余情况返回 !ok，由调用方
+// 回退到完整 json.Unmarshal。这样性能路径不会扩大原有语义。
+func parseArchiveLineFields(raw []byte) (archiveLineFields, bool) {
+	raw = bytesTrimSpace(raw)
+	if len(raw) < 2 || raw[0] != '{' || raw[len(raw)-1] != '}' {
+		return archiveLineFields{}, false
+	}
+	var out archiveLineFields
+	seen := uint32(0)
+	rest := raw[1 : len(raw)-1]
+	for len(rest) > 0 {
+		rest = bytesTrimSpace(rest)
+		if len(rest) == 0 {
+			break
+		}
+		if rest[0] != '"' {
+			return archiveLineFields{}, false
+		}
+		key, n, ok := scanJSONStringNoEscape(rest)
+		if !ok {
+			return archiveLineFields{}, false
+		}
+		rest = bytesTrimSpace(rest[n:])
+		if len(rest) == 0 || rest[0] != ':' {
+			return archiveLineFields{}, false
+		}
+		rest = bytesTrimSpace(rest[1:])
+		val, n, ok := scanJSONValue(rest)
+		if !ok {
+			return archiveLineFields{}, false
+		}
+		switch string(key) {
+		case "time":
+			t, ok := parseRFC3339Bytes(val)
+			if !ok {
+				return archiveLineFields{}, false
+			}
+			out.at, out.atSet = t, true
+			seen |= 1 << 0
+		case "outcome":
+			s, ok := unquoteSimple(val)
+			if !ok {
+				return archiveLineFields{}, false
+			}
+			out.outcome, out.outcomeSet = s, true
+			seen |= 1 << 1
+		case "key_id":
+			s, ok := unquoteSimple(val)
+			if !ok {
+				return archiveLineFields{}, false
+			}
+			out.keyID, out.keyIDSet = s, true
+			seen |= 1 << 2
+		case "account":
+			s, ok := unquoteSimple(val)
+			if !ok {
+				return archiveLineFields{}, false
+			}
+			out.account, out.accountSet = s, true
+			seen |= 1 << 3
+		case "model":
+			s, ok := unquoteSimple(val)
+			if !ok {
+				return archiveLineFields{}, false
+			}
+			out.model, out.modelSet = s, true
+			seen |= 1 << 4
+		case "client_ip":
+			s, ok := unquoteSimple(val)
+			if !ok {
+				return archiveLineFields{}, false
+			}
+			out.clientIP, out.clientIPSet = s, true
+			seen |= 1 << 5
+		case "user_agent":
+			s, ok := unquoteSimple(val)
+			if !ok {
+				return archiveLineFields{}, false
+			}
+			out.userAgent, out.uaSet = s, true
+			seen |= 1 << 6
+		}
+		rest = bytesTrimSpace(rest[n:])
+		if len(rest) == 0 {
+			break
+		}
+		if rest[0] != ',' {
+			return archiveLineFields{}, false
+		}
+		rest = rest[1:]
+		if len(bytesTrimSpace(rest)) == 0 {
+			// 尾逗号不是合法 JSON；旧路径会跳过该行，快速路径也不能接受。
+			return archiveLineFields{}, false
+		}
+	}
+	// 必须包含 Event.Time/json 的必选字段；其余字段缺失等价于零值。
+	if seen&(1<<0) == 0 || seen&(1<<1) == 0 {
+		return archiveLineFields{}, false
+	}
+	return out, true
+}
+
+// matchArchiveFields 用预解析字段执行与 matchNormalized 相同的筛选。
+// 返回 fallback 表示该行含缺失/异常字段，必须完整解码以确保与旧语义一致。
+func (f Filter) matchArchiveFields(v archiveLineFields) archiveMatch {
+	if f.Outcome != "" {
+		if !v.outcomeSet {
+			return archiveMatchNo
+		}
+		if !isASCII(v.outcome) {
+			return archiveMatchFallback
+		}
+		if string(v.outcome) != f.Outcome {
+			return archiveMatchNo
+		}
+	}
+	if f.KeyID != "" {
+		if !v.keyIDSet {
+			return archiveMatchNo
+		}
+		if !isASCII(v.keyID) {
+			return archiveMatchFallback
+		}
+		if !containsFoldLowerASCII(v.keyID, f.KeyID) {
+			return archiveMatchNo
+		}
+	}
+	if f.Account != "" {
+		if !v.accountSet {
+			return archiveMatchNo
+		}
+		if !isASCII(v.account) {
+			return archiveMatchFallback
+		}
+		if !containsFoldLowerASCII(v.account, f.Account) {
+			return archiveMatchNo
+		}
+	}
+	if f.Model != "" {
+		if !v.modelSet {
+			return archiveMatchNo
+		}
+		if !isASCII(v.model) {
+			return archiveMatchFallback
+		}
+		if !containsFoldLowerASCII(v.model, f.Model) {
+			return archiveMatchNo
+		}
+	}
+	if f.ClientIP != "" {
+		if !v.clientIPSet {
+			return archiveMatchNo
+		}
+		if !isASCII(v.clientIP) {
+			return archiveMatchFallback
+		}
+		if !containsFoldLowerASCII(v.clientIP, f.ClientIP) {
+			return archiveMatchNo
+		}
+	}
+	if f.UserAgent != "" {
+		if !v.uaSet {
+			return archiveMatchNo
+		}
+		if !isASCII(v.userAgent) {
+			return archiveMatchFallback
+		}
+		if !containsFoldLowerASCII(v.userAgent, f.UserAgent) {
+			return archiveMatchNo
+		}
+	}
+	if !f.From.IsZero() && v.at.Before(f.From) {
+		return archiveMatchNo
+	}
+	if !f.To.IsZero() && v.at.After(f.To) {
+		return archiveMatchNo
+	}
+	return archiveMatchYes
+}
+
+func isASCII(b []byte) bool {
+	for _, c := range b {
+		if c >= 0x80 {
+			return false
+		}
+	}
+	return true
+}
+
+func containsFoldLowerASCII(haystack []byte, needleLower string) bool {
+	if needleLower == "" {
+		return true
+	}
+	if len(needleLower) > len(haystack) {
+		return false
+	}
+	for i := 0; i+len(needleLower) <= len(haystack); i++ {
+		j := 0
+		for ; j < len(needleLower); j++ {
+			c := haystack[i+j]
+			if c >= 'A' && c <= 'Z' {
+				c += 'a' - 'A'
+			}
+			if c != needleLower[j] {
+				break
+			}
+		}
+		if j == len(needleLower) {
+			return true
+		}
+	}
+	return false
+}
+
+func bytesTrimSpace(b []byte) []byte {
+	for len(b) > 0 && (b[0] == ' ' || b[0] == '\t' || b[0] == '\n' || b[0] == '\r') {
+		b = b[1:]
+	}
+	for len(b) > 0 {
+		c := b[len(b)-1]
+		if c != ' ' && c != '\t' && c != '\n' && c != '\r' {
+			break
+		}
+		b = b[:len(b)-1]
+	}
+	return b
+}
+
+func scanJSONStringNoEscape(b []byte) ([]byte, int, bool) {
+	if len(b) < 2 || b[0] != '"' {
+		return nil, 0, false
+	}
+	for i := 1; i < len(b); i++ {
+		switch b[i] {
+		case '\\':
+			return nil, 0, false
+		case '"':
+			return b[1:i], i + 1, true
+		}
+	}
+	return nil, 0, false
+}
+
+func unquoteSimple(b []byte) ([]byte, bool) {
+	if len(b) < 2 || b[0] != '"' || b[len(b)-1] != '"' {
+		return nil, false
+	}
+	for i := 1; i < len(b)-1; i++ {
+		if b[i] == '\\' || b[i] == '"' {
+			return nil, false
+		}
+	}
+	return b[1 : len(b)-1], true
+}
+
+func scanJSONValue(b []byte) ([]byte, int, bool) {
+	if len(b) == 0 {
+		return nil, 0, false
+	}
+	if b[0] == '"' {
+		for i := 1; i < len(b); i++ {
+			switch b[i] {
+			case '\\':
+				i++
+			case '"':
+				return b[:i+1], i + 1, true
+			}
+		}
+		return nil, 0, false
+	}
+	depth := 0
+	for i := 0; i < len(b); i++ {
+		switch b[i] {
+		case '{', '[':
+			depth++
+		case '}', ']':
+			if depth == 0 {
+				return b[:i], i, true
+			}
+			depth--
+		case ',':
+			if depth == 0 {
+				return b[:i], i, true
+			}
+		}
+	}
+	return b, len(b), true
+}
+
+func parseRFC3339Bytes(b []byte) (time.Time, bool) {
+	s, ok := unquoteSimple(b)
+	if !ok {
+		return time.Time{}, false
+	}
+	if len(s) < 20 || s[4] != '-' || s[7] != '-' || s[10] != 'T' || s[13] != ':' || s[16] != ':' {
+		return time.Time{}, false
+	}
+	t, err := time.Parse(time.RFC3339Nano, string(s))
+	return t, err == nil
+}
+
+// readFileLimitSlow 是旧的全量解码路径，供包含非 ASCII 过滤词时回退使用。
+// 非 ASCII 的 strings.ToLower 可能做 Unicode 大小写映射（甚至改变长度），
+// 不能与下面的 ASCII 快速预筛共用同一套字节匹配规则。
+func readFileLimitSlow(f *os.File, filter Filter, keep int) ([]Event, error) {
+	if _, err := f.Seek(0, 0); err != nil {
+		return nil, err
+	}
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 64<<10), 1<<20)
+	type seqEvent struct {
+		e   Event
+		seq int64
+	}
+	capacity := 16
+	if keep > 0 {
+		capacity = 2 * keep
+		if capacity > 4096 {
+			capacity = 4096
+		}
+	}
+	window := make([]seqEvent, 0, capacity)
+	var line int64
+	sortWindow := func() {
+		sort.SliceStable(window, func(i, j int) bool {
+			if !window[i].e.Time.Equal(window[j].e.Time) {
+				return window[i].e.Time.After(window[j].e.Time)
+			}
+			return window[i].seq < window[j].seq
+		})
+	}
+	for scanner.Scan() {
+		line++
 		var e Event
 		if json.Unmarshal(scanner.Bytes(), &e) != nil || !filter.matchNormalized(e) {
 			continue
 		}
-		out = append(out, e)
+		window = append(window, seqEvent{e: e, seq: line})
+		if keep > 0 && len(window) >= 2*keep {
+			sortWindow()
+			window = window[:keep]
+		}
+	}
+	sortWindow()
+	if keep > 0 && len(window) > keep {
+		window = window[:keep]
+	}
+	out := make([]Event, len(window))
+	for i := range window {
+		out[i] = window[i].e
 	}
 	return out, scanner.Err()
 }
@@ -662,6 +1366,7 @@ func (f Filter) match(e Event) bool {
 // normalized 返回把字符串 needle 预先转小写的副本。readFile 对每个文件只算一次，
 // 避免每一行、每个字段都重复 ToLower（归档大/过滤条件多时是明显的 CPU 放大）。
 func (f Filter) normalized() Filter {
+	f.KeyID = strings.ToLower(f.KeyID)
 	f.Account = strings.ToLower(f.Account)
 	f.Model = strings.ToLower(f.Model)
 	f.ClientIP = strings.ToLower(f.ClientIP)
@@ -680,6 +1385,9 @@ func containsFoldLower(haystack, needleLower string) bool {
 // matchNormalized 与 match 同义，但要求 f 已经 normalized() 预处理。
 func (f Filter) matchNormalized(e Event) bool {
 	if f.Outcome != "" && e.Outcome != f.Outcome {
+		return false
+	}
+	if !containsFoldLower(e.KeyID, f.KeyID) {
 		return false
 	}
 	if !containsFoldLower(e.Account, f.Account) {
@@ -708,21 +1416,43 @@ func (w *archiveWriter) stats() ArchiveStats {
 	if !s.Enabled {
 		return s
 	}
+	w.statsMu.Lock()
+	if !w.statsAt.IsZero() && time.Since(w.statsAt) < archiveStatsTTL {
+		s.Files, s.Bytes = w.statsFiles, w.statsBytes
+		w.statsMu.Unlock()
+		return s
+	}
+	w.statsMu.Unlock()
+
 	entries, err := os.ReadDir(w.cfg.Dir)
 	if err != nil {
 		s.LastError = err.Error()
 		return s
 	}
+	var files int
+	var bytes int64
 	for _, entry := range entries {
 		if entry.IsDir() || !strings.HasPrefix(entry.Name(), "requests-") || !strings.HasSuffix(entry.Name(), ".jsonl") {
 			continue
 		}
 		if info, err := entry.Info(); err == nil {
-			s.Files++
-			s.Bytes += info.Size()
+			files++
+			bytes += info.Size()
 		}
 	}
+	w.statsMu.Lock()
+	w.statsAt, w.statsFiles, w.statsBytes = time.Now(), files, bytes
+	w.statsMu.Unlock()
+	s.Files, s.Bytes = files, bytes
 	return s
+}
+
+// invalidateStats 让下一次 Snapshot 重新统计归档目录。调用方必须已经释放
+// statsMu，避免与正在进行的目录扫描交叉持锁。
+func (w *archiveWriter) invalidateStats() {
+	w.statsMu.Lock()
+	w.statsAt = time.Time{}
+	w.statsMu.Unlock()
 }
 
 func (w *archiveWriter) close() {

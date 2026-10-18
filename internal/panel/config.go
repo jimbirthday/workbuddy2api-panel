@@ -9,6 +9,8 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"path/filepath"
+	"strings"
 )
 
 // getConfig 返回当前配置文件内容与路径（前端按 schema 渲染表单）。
@@ -19,14 +21,28 @@ func (p *Panel) getConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	cfg, err := p.cfg.LoadConfig()
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "load config: "+err.Error())
+		// LoadConfig 的错误可能包含宿主机的完整配置路径（Docker bind mount
+		// 提示尤其明显）；面板回稳定文案，细节仅写服务端日志。
+		log.Printf("panel: 读取配置失败: %v", err)
+		writeErr(w, http.StatusInternalServerError, "load config failed")
 		return
 	}
+	cfg = redactHostPaths(maskConfigSecrets(cfg))
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":     true,
-		"path":   p.cfg.ConfigPath,
+		"path":   displayBaseName(p.cfg.ConfigPath),
 		"config": cfg,
 	})
+}
+
+// displayBaseName 只回显宿主路径的最后一段；空配置路径必须保持空串。
+// filepath.Base("") 返回 "."，会让前端误以为配置文件叫 "."。
+func displayBaseName(path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return ""
+	}
+	return filepath.Base(path)
 }
 
 // saveConfig 保存配置：body 直接是配置 JSON（前端按 schema 组装完整对象）。
@@ -39,6 +55,11 @@ func (p *Panel) saveConfig(w http.ResponseWriter, r *http.Request) {
 	raw, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, "read body: "+err.Error())
+		return
+	}
+	raw, err = preserveBlankAPIKeys(raw, p.cfg.LoadConfig)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	restartRequired, err := p.cfg.SaveConfig(raw)

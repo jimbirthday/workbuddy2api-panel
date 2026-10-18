@@ -13,6 +13,7 @@ import (
 	"log"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -21,9 +22,14 @@ import (
 // keyTTL 粘性会话镜像 + 状态快照的默认 TTL（redis 侧兜底，防脏数据长期滞留）。
 const keyTTL = 7 * 24 * time.Hour
 
-// writeConcurrencyLimit fire-and-forget 异步写的在途上限（发现 4：写 goroutine
-// 无信号量限制，高写入速率下可瞬时堆积）。超过的排队不丢弃——写语义不变（见 goWrite）。
-const writeConcurrencyLimit = 8
+const (
+	// writeConcurrencyLimit 固定 Redis 写 worker 数。旧实现每次写都先派生 goroutine
+	// 再阻塞抢信号量，队列本身没有上限；高写入速率下会堆积任意多 goroutine。
+	writeConcurrencyLimit = 8
+	// writeQueueLimit 有界写队列容量。队列满时丢弃本次镜像（内存仍是权威状态，
+	// Redis 只是恢复备份）并计数告警，绝不阻塞请求热路径。
+	writeQueueLimit = 256
+)
 
 // Store 只放本期需要的方法。上下文由实现内部构造（读操作配短超时，写操作 fire-and-forget）。
 type Store interface {
@@ -79,11 +85,9 @@ func New(url, token string) Store {
 		return Noop{}
 	}
 	log.Printf("[redisstore] upstash 已连接 (addr=%s)", opt.Addr)
-	return &Upstash{
-		client: client,
-		sem:    make(chan struct{}, writeConcurrencyLimit),
-		done:   make(chan struct{}),
-	}
+	u := &Upstash{client: client}
+	u.ensure()
+	return u
 }
 
 // normalizeURL 把 url+token 归一化为可直接 ParseURL 的完整 rediss:// URL。
@@ -104,75 +108,103 @@ func normalizeURL(url, token string) string {
 
 // Upstash 真实现：redis.Client 封装。
 //
-// 写并发上限（发现 4）：三个异步写共享 sem（cap=writeConcurrencyLimit 的信号量），
-// 在途写超过上限时新写排队不丢弃——语义仍是 fire-and-forget，只是把"无限堆积"
-// 收敛为"有界排队"。Close 前已提交的写（含排队中）保证执行完，Close 后新提交
-// 的写直接丢弃。
+// 写入模型：固定 worker + 有界队列。SetBind/DelBind 队列满时直接丢弃本次镜像，
+// SaveState 只保留最新一份待写快照。Close 在提交锁内关闭队列，worker 会排空
+// 已接受的写后再退出；此后新提交的写直接丢弃。
 type Upstash struct {
 	client *redis.Client
-	// sem 写信号量（有界在途写）。cap=1 时退化为串行写，供测试观察调度语义。
-	sem chan struct{}
-	// done 关停标志（Close 关闭）。sem 与 done 由 New 初始化；测试可直接构造
-	//（client=nil，goWrite/Close 不触网络）。
-	done chan struct{}
-	// closeOnce 保证 Close 幂等（多次调用只关一次 done channel）。
+
+	queue chan writeTask
+	done  chan struct{}
+
+	initOnce  sync.Once
 	closeOnce sync.Once
-	// submitMu 收窄 goWrite 的提交/关停竞态：goWrite 先登记 wg 再查 done，
-	// Close 先关 done 再等 wg——两侧互斥后，「Close 前提交的写必然执行」
-	// 不再依赖 goroutine 调度时序（83d18ae 原版存在窗口：排队写在 Close
-	// 关 done 之后才跑到检查点会被误丢，close_test.go:138 稳定复现）。
+	// submitMu 同时保护提交/关停边界与队列关闭：goWrite 的 wg.Add + send 和 Close
+	// 的 close(done)+close(queue) 互斥，避免向已关闭队列发送或 Wait 后才 Add。
 	submitMu sync.Mutex
-	// wg 已提交未完成的写（Close 排空用）。
-	wg sync.WaitGroup
+	wg       sync.WaitGroup
+	dropped  atomic.Uint64
+
+	stateMu      sync.Mutex
+	pendingState []byte
+	stateQueued  bool
 }
 
-// goWrite 以 fire-and-forget 方式执行 fn：写槽（sem）有界并发，Close 前提交的写
-// 必然执行（停机镜像完整性），Close 后提交的写直接丢弃（进程已在退出）。
-func (u *Upstash) goWrite(fn func()) {
-	u.closeOnceGuard()
+type writeTask struct {
+	fn func()
+}
+
+// ensure 初始化零值 Upstash（仅测试会直接构造）并启动固定写 worker。
+func (u *Upstash) ensure() {
+	u.initOnce.Do(func() {
+		if u.queue == nil {
+			u.queue = make(chan writeTask, writeQueueLimit)
+		}
+		if u.done == nil {
+			u.done = make(chan struct{})
+		}
+		u.startWorkers(writeConcurrencyLimit)
+	})
+}
+
+func (u *Upstash) startWorkers(n int) {
+	for i := 0; i < n; i++ {
+		go func() {
+			for task := range u.queue {
+				func() {
+					defer u.wg.Done()
+					defer func() {
+						if r := recover(); r != nil {
+							log.Printf("[redisstore] WARN: 异步写 panic: %v", r)
+						}
+					}()
+					task.fn()
+				}()
+			}
+		}()
+	}
+}
+
+// goWrite 非阻塞提交一次写；返回 false 表示队列已满或 Store 已关停。
+// wg.Add 必须在 send 前且与 Close 互斥：worker 可能立即执行完任务，若先 send
+// 后 Add 会让 Close 的 Wait 提前返回。
+func (u *Upstash) goWrite(fn func()) bool {
+	u.ensure()
 	u.submitMu.Lock()
-	u.wg.Add(1)
+	defer u.submitMu.Unlock()
 	select {
 	case <-u.done:
-		u.submitMu.Unlock()
-		u.wg.Done() // 关停后提交的写：登记即撤销，直接丢弃
-		return
+		return false
 	default:
 	}
-	u.submitMu.Unlock()
-	go func() {
-		defer u.wg.Done()
-		// 只阻塞抢写槽，不检查 done：此处若select done，已阻塞排队的写会在
-		// close(done) 唤醒时全部走丢弃分支（selrand5 实测 100%），「Close 前
-		// 提交的写（含排队中）必然执行」的契约被内部检查破坏——close_test.go:138
-		// 因此间歇失败（约 20%：取决于 write-1/write-2 谁先抢到唯一槽）。丢弃
-		// 语义已由提交点（submitMu 下的 done 检查）唯一承担；此处提交已冻结在
-		// wg 中，Close 的 wg.Wait 必然等到它执行完。
-		u.sem <- struct{}{}
-		defer func() { <-u.sem }()
-		fn()
-	}()
-}
-
-// closeOnceGuard 防零值 Upstash（未经 New 构造）在 goWrite/Close 上 nil-map 式崩溃：
-// sem/done 为 nil 时补建（cap=1）。仅测试会走到该路径。
-func (u *Upstash) closeOnceGuard() {
-	if u.sem == nil || u.done == nil {
-		u.sem = make(chan struct{}, 1)
-		u.done = make(chan struct{})
+	u.wg.Add(1)
+	select {
+	case u.queue <- writeTask{fn: fn}:
+		return true
+	default:
+		u.wg.Done()
+		u.noteDrop()
+		return false
 	}
 }
 
-// Close 等待已提交的异步写全部执行完毕，再关底层 redis 连接；幂等。
-// 之后新提交的写直接丢弃（goWrite 的 done 检查）。停机路径在 pool.Close() 后调用：
+func (u *Upstash) noteDrop() {
+	n := u.dropped.Add(1)
+	if n == 1 || n%1024 == 0 {
+		log.Printf("[redisstore] WARN: Redis 写队列已满，累计丢弃 %d 次镜像（内存状态不受影响）", n)
+	}
+}
+
+// Close 等待已接受的异步写全部执行完毕，再关底层 redis 连接；幂等。
+// 之后新提交的写直接丢弃。停机路径在 pool.Close() 后调用：
 // pool 的最后一次 Flush→SaveState 已提交，本方法保证它写完才返回。
 func (u *Upstash) Close() error {
-	u.closeOnceGuard()
-	// 先关 done 再等 wg：与 goWrite 的 submitMu 互斥后，此时「已提交的写」集合
-	// 已冻结（此后新提交的直接丢弃），wg.Wait 排空即覆盖在途 + 排队两层——
-	// 原 sem 探测法在排队写尚未跑到抢槽点时会误判已排空（83d18ae 竞态）。
+	u.ensure()
 	u.submitMu.Lock()
-	u.closeOnce.Do(func() { close(u.done) })
+	u.closeOnce.Do(func() {
+		close(u.done)
+		close(u.queue)
+	})
 	u.submitMu.Unlock()
 	done := make(chan struct{})
 	go func() { u.wg.Wait(); close(done) }()
@@ -220,15 +252,49 @@ func (u *Upstash) DelBind(key string) {
 	})
 }
 
-// SaveState 异步写池状态 JSON 快照。
+// SaveState 异步写池状态 JSON 快照，并合并排队中的快照：只保留最后提交的
+// 一份，避免 5 秒一次、每次数十 KB~数 MB 的全量状态在队列里叠多份。
 func (u *Upstash) SaveState(data []byte) {
-	u.goWrite(func() {
+	u.ensure()
+	u.stateMu.Lock()
+	u.pendingState = data
+	needTask := !u.stateQueued
+	if needTask {
+		u.stateQueued = true
+	}
+	u.stateMu.Unlock()
+	if !needTask {
+		return
+	}
+	if !u.goWrite(u.flushLatestState) {
+		// 队列满/已关停：撤销占位并释放待写快照，下一次 SaveState 可重新提交。
+		u.stateMu.Lock()
+		u.stateQueued = false
+		u.pendingState = nil
+		u.stateMu.Unlock()
+	}
+}
+
+// flushLatestState 在同一个 worker 任务里持续清空最新快照。期间新 SaveState
+// 只替换 pendingState，不会新增任务，因此积压上限固定为 1 份快照。
+func (u *Upstash) flushLatestState() {
+	for {
+		u.stateMu.Lock()
+		data := u.pendingState
+		u.pendingState = nil
+		if data == nil {
+			u.stateQueued = false
+			u.stateMu.Unlock()
+			return
+		}
+		u.stateMu.Unlock()
+
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
 		if err := u.client.Set(ctx, stateKey, data, keyTTL).Err(); err != nil {
 			log.Printf("[redisstore] debug: SaveState: %v", err)
 		}
-	})
+		cancel()
+	}
 }
 
 // LoadState 同步读池状态快照。

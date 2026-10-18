@@ -56,6 +56,13 @@ type Pool struct {
 	// 收费与否的判据见 floorBlockedForModel：本地实测台账优先，缺失时用上游目录
 	// 倍率（modelRateOf 注入）兜底，避免「无观测的高价新模型」绕过保底。
 	creditFloor int64
+	// dailyTokenLimit / modelDailyTokenLimit 账号级日 Token 护栏（SetDailyLimits
+	// 注入；0 = 关闭）。只用于 pick 前过滤，不进入权重/成本分层/冷却状态。
+	dailyTokenLimit      int64
+	modelDailyTokenLimit int64
+	// dailyUsage 今日 token 计数 provider（SetDailyTokenUsageProvider 注入）。
+	// nil 或读取失败时护栏 fail-open；仅在持 p.mu 时调用，回调不得反向调用 Pool。
+	dailyUsage DailyTokenUsageProvider
 	// modelRateOf 按 (realm, 模型) 查上游目录积分倍率（"0.79" / "" = 未知）。
 	// 由 main 用 upstream.Client.ModelRate 注入——pool 不依赖 upstream 包（避免
 	// 循环依赖与分层破坏），nil 时倍率兜底不生效（退化为仅本地台账判定）。
@@ -87,6 +94,34 @@ type Pool struct {
 	stopCh chan struct{}
 	// closeOnce 保证 Close 幂等（多次调用不重复 close channel）。
 	closeOnce sync.Once
+}
+
+// UIDAvailableForModel 判断 uid 当前是否可参与指定模型的选号。它与会话粘性
+// 分配所用的 WeightedAvailableUIDsForModelRealm 同口径（健康、日额度、积分保底、
+// 在途上限），但只做只读存在性判定：不排序、不分配切片，供粘性命中热路径
+// 逐请求校验绑定号。realm 为空表示不限定域。
+func (p *Pool) UIDAvailableForModel(uid, model, realm string) bool {
+	if uid == "" {
+		return false
+	}
+	now := time.Now()
+	dailyUsage, dailyOK, dailyLimit, modelLimit := p.dailyUsageSnapshot(now)
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	e, ok := p.byUID[uid]
+	if !ok || (realm != "" && e.a.Realm() != realm) {
+		return false
+	}
+	if !e.healthyForModel(now, model) {
+		return false
+	}
+	if dailyTokenBlocked(uid, model, dailyUsage, dailyOK, dailyLimit, modelLimit) {
+		return false
+	}
+	if p.floorBlockedForRealmModel(e, model, realm, now) {
+		return false
+	}
+	return !p.inFlightFull(e)
 }
 
 // defaultBreaker* 熔断器默认参数（FreeBuff2API 参考口径）。
@@ -316,6 +351,7 @@ func (p *Pool) Acquire(uid string) bool {
 func (p *Pool) Release(uid string) {
 	p.mu.RLock()
 	e, ok := p.byUID[uid]
+	// 条目可能已经删除；此时释放对在途计数是 no-op。
 	p.mu.RUnlock()
 	if !ok {
 		return
@@ -397,11 +433,29 @@ func (p *Pool) Remove(uid string) *auth.Auth {
 // upsertLocked 更新或插入单个账号；已存在则只换凭证、保留 credits/cooling 状态。
 // 调用方必须已持有 p.mu；Add 与 SyncToDir 共用此 upsert 逻辑。
 func (p *Pool) upsertLocked(a *auth.Auth) {
+	weight, note, _, _ := a.ProfileSnapshot()
 	if e, ok := p.byUID[a.UID]; ok {
+		hasFile := a.FilePath != ""
 		e.a = a // 保留 credits/cooling 状态
+		// state.json / Redis 快照恢复出的资料镜像在 auth 重新加载前仍是唯一来源；
+		// 来自 state 的 placeholder（FilePath 为空）不能把资料清空。真实 auth
+		// 文件则拥有权威值：只有它在场时才允许把 weight 改回 1、note 清空，
+		// 否则手工清空后旧镜像会一直粘住。启动顺序是 load(state) -> SyncToDir(auth)，
+		// 因此这里最终会以 auth 文件为准。
+		if hasFile {
+			e.weight = weight
+			e.note = note
+		} else {
+			if weight > 1 {
+				e.weight = weight
+			}
+			if note != "" {
+				e.note = note
+			}
+		}
 		return
 	}
-	p.byUID[a.UID] = &entry{a: a}
+	p.byUID[a.UID] = &entry{a: a, weight: weight, note: note}
 }
 
 // Pick 返回 healthy 中积分最高的账号；无可用返回 nil。

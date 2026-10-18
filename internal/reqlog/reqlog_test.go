@@ -1,9 +1,13 @@
 package reqlog
 
 import (
+	"bufio"
+	"encoding/json"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -304,5 +308,442 @@ func TestArchivePruneHonorsSize(t *testing.T) {
 	}
 	if len(entries) != 1 || entries[0].Name() != "requests-2026-09-22.jsonl" {
 		t.Fatalf("remaining = %+v, want newest file only", entries)
+	}
+}
+
+// 统计缓存必须随 prune 失效：若在删除前刚好统计过目录，TTL 内继续返回旧
+// Files/Bytes 会让面板显示已清理的归档仍在占用空间。
+func TestArchiveStatsCacheInvalidatedAfterPrune(t *testing.T) {
+	dir := t.TempDir()
+	ages := []time.Duration{-10 * 24 * time.Hour, -24 * time.Hour}
+	for i, name := range []string{"requests-2026-09-20.jsonl", "requests-2026-09-21.jsonl"} {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte("0123456789"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		at := time.Now().Add(ages[i])
+		if err := os.Chtimes(path, at, at); err != nil {
+			t.Fatal(err)
+		}
+	}
+	w := &archiveWriter{cfg: Config{Enabled: true, Dir: dir, RetentionDays: 5, MaxBytes: 1 << 20}, done: make(chan struct{})}
+	if got := w.stats(); got.Files != 2 || got.Bytes != 20 {
+		t.Fatalf("initial stats = %+v", got)
+	}
+	w.prune()
+	if _, err := os.Stat(filepath.Join(dir, "requests-2026-09-20.jsonl")); !os.IsNotExist(err) {
+		t.Fatalf("prune should remove the oldest file, stat err=%v", err)
+	}
+	if got := w.stats(); got.Files != 1 || got.Bytes != 10 {
+		t.Fatalf("stats after prune = %+v, want one 10-byte file", got)
+	}
+}
+
+// TestReadArchiveLimitKeepsBoundedPerFile 单文件远大于 limit 时，读取窗口必须
+// 有界，且事件时间与落盘顺序不一致时仍返回全文件最新 limit 条。
+func TestReadArchiveLimitKeepsBoundedPerFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "requests-2026-10-18.jsonl")
+	base := time.Now().Add(-24 * time.Hour)
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 400 条乱序写入：第 i 条的时间为 (i*37)%400 秒，确保不能按行号直接截断。
+	for i := 0; i < 400; i++ {
+		e := Event{Time: base.Add(time.Duration((i*37)%400) * time.Second), RequestID: "r" + strconv.Itoa(i), Outcome: OutcomeSuccess, Status: 200, OK: true}
+		raw, _ := json.Marshal(e)
+		if _, err := f.Write(append(raw, '\n')); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := readFileLimit(path, Filter{}, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 10 {
+		t.Fatalf("rows=%d want 10", len(rows))
+	}
+	newest := base.Add(399 * time.Second)
+	if !rows[0].Time.Equal(newest) {
+		t.Fatalf("newest=%v want %v", rows[0].Time, newest)
+	}
+	for i := 1; i < len(rows); i++ {
+		if rows[i].Time.After(rows[i-1].Time) {
+			t.Fatalf("not descending at %d: %v > %v", i, rows[i].Time, rows[i-1].Time)
+		}
+	}
+}
+
+// 跨归档文件读取时，每个文件只能领用「limit 减去已收集条数」的窗口。否则每个
+// 旧文件都各读 limit 条再拼接，内存会变成 文件数×limit，虽然最终截断正确，
+// 但轮询期间的分配会随归档数量增长。
+func TestReadArchiveLimitShrinksAcrossFiles(t *testing.T) {
+	dir := t.TempDir()
+	base := time.Now().Add(-2 * time.Hour).Truncate(time.Second)
+	files := []string{"requests-2026-10-17.jsonl", "requests-2026-10-18.jsonl"}
+	for fi, name := range files {
+		f, err := os.Create(filepath.Join(dir, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := 0; i < 50; i++ {
+			e := Event{Time: base.Add(time.Duration(fi*3600+i) * time.Second), RequestID: name + "-" + strconv.Itoa(i)}
+			raw, _ := json.Marshal(e)
+			if _, err := f.Write(append(raw, '\n')); err != nil {
+				t.Fatal(err)
+			}
+		}
+		_ = f.Close()
+	}
+	w := &archiveWriter{cfg: Config{Enabled: true, Dir: dir}, done: make(chan struct{})}
+	rows, err := w.read(10, Filter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 10 {
+		t.Fatalf("rows=%d want 10", len(rows))
+	}
+	if rows[0].RequestID != files[1]+"-49" {
+		t.Fatalf("newest=%s want %s-49", rows[0].RequestID, files[1])
+	}
+	for i := 1; i < len(rows); i++ {
+		if rows[i].Time.After(rows[i-1].Time) {
+			t.Fatalf("not descending at %d", i)
+		}
+	}
+}
+
+// 归档文件名日期不保证与事件时间一致（恢复备份、补写历史、手工归档）。即使
+// 新文件名里的记录较旧，也不能读到 limit 条就停止，否则会漏掉旧文件名里更新
+// 的事件。这里 limit=1：先读的文件只有 stale 事件，后面文件才有真正最新事件。
+func TestReadArchiveDoesNotStopBeforeNewerEventInOlderFile(t *testing.T) {
+	dir := t.TempDir()
+	base := time.Now().Add(-time.Hour).Truncate(time.Second)
+	write := func(name string, events []Event) {
+		f, err := os.Create(filepath.Join(dir, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer f.Close()
+		for _, e := range events {
+			raw, _ := json.Marshal(e)
+			if _, err := f.Write(append(raw, '\n')); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	write("requests-2026-10-18.jsonl", []Event{{Time: base, RequestID: "stale-filename-new"}})
+	write("requests-2026-10-17.jsonl", []Event{{Time: base.Add(time.Minute), RequestID: "recent-filename-old"}})
+
+	w := &archiveWriter{cfg: Config{Enabled: true, Dir: dir}, done: make(chan struct{})}
+	rows, err := w.read(1, Filter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].RequestID != "recent-filename-old" {
+		t.Fatalf("rows=%+v want the newest event from the older filename", rows)
+	}
+}
+
+// TestReadFileLimitStableEqualTimes 同一时刻的事件超过窗口时，必须保留落盘顺序
+// 中最新的 limit 条；批量裁剪不能把同刻事件顺序打乱。readFileLimit 的结果会
+// 再经全局 Stable 排序，因此这里直接验证局部窗口的稳定契约。
+func TestReadFileLimitStableEqualTimes(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "requests-2026-10-18.jsonl")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := time.Now().Truncate(time.Second)
+	for i := 0; i < 120; i++ {
+		raw, _ := json.Marshal(Event{Time: ts, RequestID: "same-" + strconv.Itoa(i)})
+		_, _ = f.Write(append(raw, '\n'))
+	}
+	f.Close()
+	rows, err := readFileLimit(path, Filter{}, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 10 {
+		t.Fatalf("rows=%d want 10", len(rows))
+	}
+	// 全量 Stable 排序在同一时刻保留落盘正序；截断到最近 10 条时，同刻集合
+	// 的语义由 readFile 契约决定（最早落盘的同刻事件优先保留）。
+	for i, row := range rows {
+		if row.RequestID != "same-"+strconv.Itoa(i) {
+			t.Fatalf("row[%d]=%s want same-%d", i, row.RequestID, i)
+		}
+	}
+}
+
+// BenchmarkReadFileLimitOneMiB 10k 行文件、只取最近 200 条：验证窗口读法
+// 不会把整个文件都留在内存里。旧实现分配随行数增长，新实现与 limit 同阶。
+func BenchmarkReadFileLimitOneMiB(b *testing.B) {
+	dir := b.TempDir()
+	path := filepath.Join(dir, "requests-2026-10-18.jsonl")
+	f, err := os.Create(path)
+	if err != nil {
+		b.Fatal(err)
+	}
+	base := time.Now().Add(-10 * time.Hour)
+	bw := bufio.NewWriter(f)
+	for i := 0; i < 10000; i++ {
+		e := Event{Time: base.Add(time.Duration(i) * time.Millisecond), RequestID: "r" + strconv.Itoa(i), Model: "glm-5.3", Outcome: OutcomeSuccess, Status: 200, OK: true}
+		raw, _ := json.Marshal(e)
+		_, _ = bw.Write(append(raw, '\n'))
+	}
+	_ = bw.Flush()
+	_ = f.Close()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if rows, err := readFileLimit(path, Filter{}, 200); err != nil || len(rows) != 200 {
+			b.Fatalf("rows=%d err=%v", len(rows), err)
+		}
+	}
+}
+
+// TestReadFileLimitDiffAgainstFullRead 窗口读法必须与「全量读取 + Stable 倒序 +
+// 截断」逐条一致，覆盖多批同刻事件（旧测试只覆盖单批，漏掉了裁剪后同刻继续
+// 到达的乱序场景）。
+func TestReadFileLimitDiffAgainstFullRead(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "requests-2026-10-18.jsonl")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := time.Now().Add(-24 * time.Hour).Truncate(time.Second)
+	rnd := rand.New(rand.NewSource(0))
+	for i := 0; i < 500; i++ {
+		second := rnd.Intn(40) // 大量同刻事件
+		e := Event{Time: base.Add(time.Duration(second) * time.Second), RequestID: "r" + strconv.Itoa(i)}
+		raw, _ := json.Marshal(e)
+		if _, err := f.Write(append(raw, '\n')); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_ = f.Close()
+	full, err := readFile(path, Filter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	full = append([]Event(nil), full...)
+	if len(full) > 1 {
+		sortArchiveNewestFirst(full)
+	}
+	for _, keep := range []int{1, 2, 3, 7, 16, 50, 200} {
+		got, err := readFileLimit(path, Filter{}, keep)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := full
+		if len(want) > keep {
+			want = want[:keep]
+		}
+		if len(got) != len(want) {
+			t.Fatalf("keep=%d len=%d want %d", keep, len(got), len(want))
+		}
+		for i := range want {
+			if got[i].RequestID != want[i].RequestID || !got[i].Time.Equal(want[i].Time) {
+				t.Fatalf("keep=%d row[%d]=%s@%v want %s@%v", keep, i, got[i].RequestID, got[i].Time, want[i].RequestID, want[i].Time)
+			}
+		}
+	}
+}
+
+// TestReadFileLimitFastPathMatchesSlowPath 钉住快速预筛与旧完整解码路径的逐条
+// 等价性：转义字符串、坏行、未知字段、同刻乱序、时间窗口与所有过滤维度都必须
+// 完全一致。快速路径只负责缩小候选窗口，不能改变最终返回集合与顺序。
+func TestReadFileLimitFastPathMatchesSlowPath(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "requests-2026-10-18.jsonl")
+	base := time.Date(2026, 10, 18, 0, 0, 0, 0, time.UTC)
+	lines := []string{
+		`{"time":"2026-10-18T00:00:00Z","request_id":"a","model":"glm-5.3","account":"Alice(12345678)","outcome":"success","status":200,"ok":true}`,
+		`not-json`,
+		`{"time":"2026-10-18T00:00:01Z","request_id":"escaped","model":"glm-5.3","account":"A\u006cice(12345678)","outcome":"success"}`,
+		`{"time":"2026-10-18T00:00:02Z","request_id":"extra","model":"glm-5.3","meta":{"a":[1,2,{"b":"x,y"}]},"client_ip":"203.0.113.7","user_agent":"Python-Requests/2.31","outcome":"http_error","key_id":"Team-A"}`,
+		`{"time":"2026-10-18T00:00:03Z","request_id":"dup","model":"glm-5.3","model":"kimi-k3","outcome":"success"}`,
+		`{"time":"2026-10-18T00:00:04.123456789+08:00","request_id":"offset","model":"KIMI-K3","account":"bob(87654321)","outcome":"success"}`,
+		`{"time":"2026-10-17T23:59:59Z","request_id":"outside","model":"glm-5.3","outcome":"success"}`,
+		`{"time":"2026-10-18T00:00:05Z","request_id":"missing-outcome","model":"glm-5.3"}`,
+		`{"time":"2026-10-18T00:00:06Z","request_id":"null-model","model":null,"outcome":"success"}`,
+		`{"time":"2026-10-18T00:00:07Z","request_id":"bad-time","model":"glm-5.3","outcome":"success"} trailing`,
+		`{"time":"2026-10-18T00:00:00Z","request_id":"same-1","model":"glm-5.3","outcome":"success"}`,
+		`{"time":"2026-10-18T00:00:00Z","request_id":"same-2","model":"glm-5.3","outcome":"success"}`,
+		`{"time":"2026-10-18T00:00:00Z","request_id":"same-3","model":"glm-5.3","outcome":"success"}`,
+	}
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	filters := []Filter{
+		{},
+		{Model: "GLM", From: base, To: base.Add(10 * time.Second)},
+		{Account: "alice", Outcome: OutcomeSuccess},
+		{ClientIP: "203.0.113", UserAgent: "python-requests"},
+		{KeyID: "team-a"},
+		{Model: "KIMI", From: base.Add(time.Second)},
+	}
+	for _, filter := range filters {
+		for _, keep := range []int{0, 1, 2, 3, 7, 200} {
+			got, gotErr := readFileLimit(path, filter, keep)
+			want, wantErr := readFileLimitSlow(f, filter.normalized(), keep)
+			describe := func(err error) string {
+				if err == nil {
+					return "<nil>"
+				}
+				return err.Error()
+			}
+			if describe(gotErr) != describe(wantErr) {
+				t.Fatalf("filter=%+v keep=%d err=%v want %v", filter, keep, gotErr, wantErr)
+			}
+			if len(got) != len(want) {
+				t.Fatalf("filter=%+v keep=%d len=%d want %d (got=%+v want=%+v)", filter, keep, len(got), len(want), got, want)
+			}
+			for i := range want {
+				if got[i].RequestID != want[i].RequestID || !got[i].Time.Equal(want[i].Time) {
+					t.Fatalf("filter=%+v keep=%d row[%d]=%s@%v want %s@%v", filter, keep, i, got[i].RequestID, got[i].Time, want[i].RequestID, want[i].Time)
+				}
+			}
+		}
+	}
+}
+
+// TestReadFileLimitFastPathRandomized 用随机字段组合和窗口边界批量比对两条
+// 路径，防止手写预筛在空字段、同刻、乱序、超窗等组合上出现细微偏差。
+func TestReadFileLimitFastPathRandomized(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "requests-2026-10-18.jsonl")
+	base := time.Date(2026, 10, 18, 0, 0, 0, 0, time.UTC)
+	rnd := rand.New(rand.NewSource(42))
+	models := []string{"", "glm-5.3", "GLM-5.3", "kimi-k3", "deepseek-v4-pro", "含中文"}
+	outcomes := []string{"", OutcomeSuccess, OutcomeHTTPError, OutcomeInterrupted}
+	ips := []string{"", "203.0.113.7", "198.51.100.4"}
+	uas := []string{"", "python-requests/2.31", "Mozilla/5.0 Chrome/120"}
+	var lines []string
+	for i := 0; i < 700; i++ {
+		// 少量时间值制造大量同刻样本；再混入一条坏行与一条窗口外记录。
+		at := base.Add(time.Duration(rnd.Intn(25)) * time.Second)
+		e := Event{
+			Time:      at,
+			RequestID: "r" + strconv.Itoa(i),
+			Model:     models[rnd.Intn(len(models))],
+			Account:   []string{"", "alice(12345678)", "bob(87654321)"}[rnd.Intn(3)],
+			Outcome:   outcomes[rnd.Intn(len(outcomes))],
+			ClientIP:  ips[rnd.Intn(len(ips))],
+			UserAgent: uas[rnd.Intn(len(uas))],
+			Status:    200,
+			OK:        true,
+		}
+		raw, err := json.Marshal(e)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lines = append(lines, string(raw))
+		if i%137 == 0 {
+			lines = append(lines, "not-json")
+		}
+	}
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	filters := []Filter{
+		{},
+		{Model: "GLM"},
+		{Account: "alice", Outcome: OutcomeSuccess},
+		{ClientIP: "203.0.113", UserAgent: "python"},
+		{From: base.Add(3 * time.Second)},
+		{From: base.Add(2 * time.Second), To: base.Add(9 * time.Second), Model: "kimi"},
+	}
+	for fi, filter := range filters {
+		for _, keep := range []int{1, 2, 5, 17, 64, 400} {
+			got, gotErr := readFileLimit(path, filter, keep)
+			want, wantErr := readFileLimitSlow(f, filter.normalized(), keep)
+			if gotErr != nil || wantErr != nil {
+				t.Fatalf("filter[%d]=%+v keep=%d errors: %v / %v", fi, filter, keep, gotErr, wantErr)
+			}
+			if len(got) != len(want) {
+				t.Fatalf("filter[%d]=%+v keep=%d len=%d want %d", fi, filter, keep, len(got), len(want))
+			}
+			for i := range want {
+				if got[i].RequestID != want[i].RequestID || !got[i].Time.Equal(want[i].Time) {
+					t.Fatalf("filter[%d]=%+v keep=%d row[%d]=%s want %s", fi, filter, keep, i, got[i].RequestID, want[i].RequestID)
+				}
+			}
+		}
+	}
+}
+
+// TestReadArchiveFastPathFallsBackOnNonASCIIFilter 非 ASCII 过滤词不能走字节
+// 小写匹配；结果仍须与完整解码 + strings.ToLower 的语义一致。
+func TestReadArchiveFastPathFallsBackOnNonASCIIFilter(t *testing.T) {
+	dir := t.TempDir()
+	r := New(Config{Enabled: true, Dir: dir, MaxBytes: 1 << 20, RetentionDays: 7})
+	base := time.Now().Add(-time.Minute).UTC().Truncate(time.Second)
+	r.Record(Event{Time: base, RequestID: "zh", Account: "账号A(12345678)", Model: "glm-5.3", Outcome: OutcomeSuccess, Status: 200, OK: true})
+	r.Record(Event{Time: base.Add(time.Second), RequestID: "en", Account: "alice(87654321)", Model: "glm-5.3", Outcome: OutcomeSuccess, Status: 200, OK: true})
+	r.Close()
+
+	got, err := r.ReadArchive(10, Filter{Account: "账号a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].RequestID != "zh" {
+		t.Fatalf("non-ascii filter = %+v", got)
+	}
+}
+
+// TestReadArchiveFastPathFallsBackOnNonASCIIField 事件字段含非 ASCII 时，即使
+// 过滤词是 ASCII 也必须回退完整解码：strings.ToLower 可能把非 ASCII 字符映射
+// 成 ASCII（例如 Kelvin 符号 → k），字节匹配会漏掉这类命中。
+func TestReadArchiveFastPathFallsBackOnNonASCIIField(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "requests-2026-10-18.jsonl")
+	lines := []string{
+		`{"time":"2026-10-18T00:00:00Z","request_id":"kelvin","model":"\u212Aimi-k3","outcome":"success"}`,
+		`{"time":"2026-10-18T00:00:01Z","request_id":"plain","model":"kimi-k3","outcome":"success"}`,
+	}
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	got, err := readFileLimit(path, Filter{Model: "kimi"}, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := readFileLimitSlow(f, Filter{Model: "kimi"}.normalized(), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("fast path rows=%d want %d (%+v vs %+v)", len(got), len(want), got, want)
+	}
+	for i := range want {
+		if got[i].RequestID != want[i].RequestID {
+			t.Fatalf("row[%d]=%s want %s", i, got[i].RequestID, want[i].RequestID)
+		}
 	}
 }

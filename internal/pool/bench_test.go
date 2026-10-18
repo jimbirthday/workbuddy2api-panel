@@ -1,6 +1,7 @@
 package pool
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"testing"
@@ -27,6 +28,62 @@ func BenchmarkPick46Accounts(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		p.Pick()
+	}
+}
+
+// BenchmarkPick470Accounts 是生产规模（470 号）的选号基线。46 号基准无法暴露
+// 全池遍历/排序在真实账号数下的长尾；并行基准用来观察同一把池写锁的串行化程度。
+func BenchmarkPick470Accounts(b *testing.B) {
+	p := New("")
+	for i := 0; i < 470; i++ {
+		uid := fmt.Sprintf("u%03d", i)
+		p.Add(&auth.Auth{UID: uid})
+		if i%7 != 0 {
+			p.SetCredits(uid, int64(1000-i), 0)
+		}
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		p.Pick()
+	}
+}
+
+func BenchmarkPick470AccountsParallel(b *testing.B) {
+	p := New("")
+	for i := 0; i < 470; i++ {
+		uid := fmt.Sprintf("u%03d", i)
+		p.Add(&auth.Auth{UID: uid})
+		if i%7 != 0 {
+			p.SetCredits(uid, int64(1000-i), 0)
+		}
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			p.Pick()
+		}
+	})
+}
+
+// BenchmarkHasRotatable470 是限流轮转的存在性判定基线：只应做 O(n) 扫描，
+// 不排序、不分配整表。
+func BenchmarkHasRotatable470(b *testing.B) {
+	p := New("")
+	for i := 0; i < 470; i++ {
+		uid := fmt.Sprintf("u%03d", i)
+		p.Add(&auth.Auth{UID: uid})
+		if i%7 != 0 {
+			p.SetCredits(uid, int64(1000-i), 0)
+		}
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if !p.HasRotatable(nil, "", "") {
+			b.Fatal("expected rotatable account")
+		}
 	}
 }
 
@@ -128,6 +185,56 @@ func BenchmarkModelLockView470x10(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		if rows := p.ModelLockView(); len(rows) != 10 {
 			b.Fatalf("rows=%d want 10", len(rows))
+		}
+	}
+}
+
+// BenchmarkModelLockView470NoLocks 对照无锁场景：绝大多数生产时刻没有模型级
+// 冷却，聚合器应只遍历账号、建立少量空地图，不产生每模型字符串键分配。
+func BenchmarkModelLockView470NoLocks(b *testing.B) {
+	p := New("")
+	for i := 0; i < 470; i++ {
+		p.Add(&auth.Auth{UID: fmt.Sprintf("u%03d", i)})
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if rows := p.ModelLockView(); rows != nil {
+			b.Fatalf("rows=%v want nil", rows)
+		}
+	}
+}
+
+// BenchmarkRealmByUID470 请求完成时用量记账只查域；对照 Status 的完整状态构建，
+// 防止把请求热路径又改回 Status(uid)。
+func BenchmarkRealmByUID470(b *testing.B) {
+	p := New("")
+	for i := 0; i < 470; i++ {
+		p.Add(&auth.Auth{UID: fmt.Sprintf("u%03d", i), Nickname: "nick"})
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if got := p.RealmByUID("u001"); got != "cn" {
+			b.Fatalf("realm=%q want cn", got)
+		}
+	}
+}
+
+// TestCompactJSONIntoMatchesCompactJSON 原地压缩必须与独立缓冲版本逐字节一致，
+// 包括字符串内的空白、引号、反斜杠与换行转义；同时覆盖空对象/嵌套对象。
+func TestCompactJSONIntoMatchesCompactJSON(t *testing.T) {
+	cases := [][]byte{
+		[]byte("{}"),
+		[]byte(" {\n  \"accounts\" : { }\n} "),
+		[]byte("{\"u\":\"a b\\t c\\\"d\\\\e\",\"n\":{\"x\":1, \"y\":[2, 3]}}"),
+		[]byte("{\n\t\"k\" : \"中文 空格\\n换行\"\n}"),
+	}
+	for _, raw := range cases {
+		want := compactJSON(append([]byte(nil), raw...))
+		got := compactJSONInto(raw, append([]byte(nil), raw...))
+		if !bytes.Equal(got, want) {
+			t.Fatalf("mismatch for %q: got=%q want=%q", raw, got, want)
 		}
 	}
 }

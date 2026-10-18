@@ -1,6 +1,16 @@
 {
   "listen": ":7863",
   "api_key": "test_key",
+  "api_keys": [
+    {
+      "id": "client-a",
+      "name": "示例客户端",
+      "key": "test_client_key",
+      "realm": "",
+      "models": [],
+      "enabled": false
+    }
+  ],
   "auth_dir": "./auths",
   "state_file": "./data/state.json",
   "server": {
@@ -56,6 +66,10 @@
   "features": {
     "sanitize_blacklist_fingerprints": true
   },
+  "background_models": {
+    "names": "",
+    "target": ""
+  },
   "prompt": {
     "mode": "passthrough",
     "file": ""
@@ -78,7 +92,9 @@
     "prefer_expiring": true,
     "expiring_soon": "168h",
     "cost_explore_interval": "30m",
-    "credit_floor": 100
+    "credit_floor": 100,
+    "daily_token_limit": 0,
+    "model_daily_token_limit": 0
   },
   "session_sticky": {
     "enabled": true,

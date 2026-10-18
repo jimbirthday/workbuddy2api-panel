@@ -13,15 +13,19 @@ const expiringVirtualSlots = 3
 // AvailableUIDsForRealm 同 AvailableUIDs，但仅返回 Realm()==realm 的账号。
 // realm=="" 退化为 AvailableUIDs（现状语义）。
 func (p *Pool) AvailableUIDsForRealm(realm string) []string {
+	now := time.Now()
+	dailyUsage, dailyOK, dailyLimit, modelLimit := p.dailyUsageSnapshot(now)
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	now := time.Now()
 	uids := make([]string, 0, len(p.byUID))
 	for uid, e := range p.byUID {
 		if realm != "" && e.a.Realm() != realm {
 			continue
 		}
 		if !e.healthy(now) {
+			continue
+		}
+		if dailyTokenBlocked(uid, "", dailyUsage, dailyOK, dailyLimit, modelLimit) {
 			continue
 		}
 		if p.inFlightFull(e) {
@@ -42,15 +46,19 @@ func (p *Pool) AvailableUIDsForRealm(realm string) []string {
 // 该方法是现有 AvailableUIDsForModelRealm 的增量入口，不改变既有方法语义，也不
 // 修改配置、状态或 Redis schema。prefer_expiring=false 时退化为逐账号一次。
 func (p *Pool) WeightedAvailableUIDsForModelRealm(model, realm string) []string {
+	now := time.Now()
+	dailyUsage, dailyOK, dailyLimit, modelLimit := p.dailyUsageSnapshot(now)
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	now := time.Now()
 	uids := make([]string, 0, len(p.byUID))
 	for uid, e := range p.byUID {
 		if realm != "" && e.a.Realm() != realm {
 			continue
 		}
 		if !e.healthyForModel(now, model) {
+			continue
+		}
+		if dailyTokenBlocked(uid, model, dailyUsage, dailyOK, dailyLimit, modelLimit) {
 			continue
 		}
 		// 积分保底必须与 Pick/pickEarliestExpiry 同口径：会话首次分配直接走本列表，
@@ -84,15 +92,19 @@ func (p *Pool) WeightedAvailableUIDsForModelRealm(model, realm string) []string 
 // 6004 限流的账号不列入，而在**其他模型**被限流的账号照常列入（模型豁免）；realm 非空时
 // 再仅保留 Realm()==realm 的账号，realm=="" 时不按域过滤。
 func (p *Pool) AvailableUIDsForModelRealm(model, realm string) []string {
+	now := time.Now()
+	dailyUsage, dailyOK, dailyLimit, modelLimit := p.dailyUsageSnapshot(now)
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	now := time.Now()
 	uids := make([]string, 0, len(p.byUID))
 	for uid, e := range p.byUID {
 		if realm != "" && e.a.Realm() != realm {
 			continue
 		}
 		if !e.healthyForModel(now, model) {
+			continue
+		}
+		if dailyTokenBlocked(uid, model, dailyUsage, dailyOK, dailyLimit, modelLimit) {
 			continue
 		}
 		if p.floorBlockedForRealmModel(e, model, realm, now) {

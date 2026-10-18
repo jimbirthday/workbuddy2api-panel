@@ -35,6 +35,17 @@ func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize bool, efforts map[
 	if err := json.Unmarshal(src, &obj); err != nil {
 		return src
 	}
+	normalizeBodyObject(obj, sanitize, efforts, defaultEfforts)
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return src
+	}
+	return out
+}
+
+// normalizeBodyObject 对已解码的出站 body 做完整协议改写，供单次解码/编码的
+// prepareBody 复用。调用方负责最终序列化；本函数不持有或复制 body 字节。
+func normalizeBodyObject(obj map[string]any, sanitize bool, efforts map[string][]string, defaultEfforts map[string]string) {
 	obj["stream"] = true
 	// max_completion_tokens → max_tokens 翻译（吸收上游 PR #116，Closes #117）：
 	// OpenAI 规范里 max_tokens 已 deprecated、max_completion_tokens 是新字段；
@@ -84,11 +95,6 @@ func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize bool, efforts map[
 			sanitizeMessages(msgs)
 		}
 	}
-	out, err := json.Marshal(obj)
-	if err != nil {
-		return src
-	}
-	return out
 }
 
 // translateMaxCompletionTokens 把 OpenAI 别名 max_completion_tokens 翻译为上游
@@ -341,22 +347,31 @@ func ensureConsoleSystem(body []byte) []byte {
 	if err := json.Unmarshal(body, &obj); err != nil {
 		return body
 	}
-	msgs, ok := obj["messages"].([]any)
-	if !ok || len(msgs) == 0 {
+	if !ensureConsoleSystemObject(obj) {
 		return body
 	}
-	first, ok := msgs[0].(map[string]any)
-	if ok {
-		if role, _ := first["role"].(string); strings.EqualFold(strings.TrimSpace(role), "system") {
-			return body // 首条已是 system：不注入
-		}
-	}
-	obj["messages"] = append([]any{map[string]any{"role": "system", "content": "You are a helpful assistant."}}, msgs...)
 	out, err := json.Marshal(obj)
 	if err != nil {
 		return body
 	}
 	return out
+}
+
+// ensureConsoleSystemObject 在已解码 body 上执行 global 兜底 system 注入。
+// 返回是否改写；调用方在 true 时才需要序列化（单一 marshal 管线由 prepareBody 负责）。
+func ensureConsoleSystemObject(obj map[string]any) bool {
+	msgs, ok := obj["messages"].([]any)
+	if !ok || len(msgs) == 0 {
+		return false
+	}
+	first, ok := msgs[0].(map[string]any)
+	if ok {
+		if role, _ := first["role"].(string); strings.EqualFold(strings.TrimSpace(role), "system") {
+			return false // 首条已是 system：不注入
+		}
+	}
+	obj["messages"] = append([]any{map[string]any{"role": "system", "content": "You are a helpful assistant."}}, msgs...)
+	return true
 }
 
 // normalizeToolChoice 按上游 Go struct（string 类型）改写 OpenAI tool_choice。

@@ -657,7 +657,7 @@ func (p *Panel) accountTaskAuto(w http.ResponseWriter, r *http.Request) {
 		err  error
 	}
 	done := make(chan autoResult, 1)
-	go func() {
+	if !p.GoBackground(func() {
 		// 锁在流水线真正结束（而非 HTTP 超时返回）时才释放——超时返回后重复点击
 		// 会被 409 挡住，不会出现两轮并发。
 		defer p.unlockAccount(uid)
@@ -730,9 +730,13 @@ func (p *Panel) accountTaskAuto(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		log.Printf("panel: 任务动作 uid=%s code=%s progress %s -> %s claimable=%v claimed=%v",
-			uid, act.TaskCode, progressBefore, progressAfter, claimable, resp["claimed"])
+			logfmt.UID8(uid), act.TaskCode, progressBefore, progressAfter, claimable, resp["claimed"])
 		done <- autoResult{resp: resp}
-	}()
+	}) {
+		p.unlockAccount(uid)
+		writeErr(w, http.StatusServiceUnavailable, "server shutting down")
+		return
+	}
 	select {
 	case res := <-done:
 		if res.err != nil {
@@ -1286,13 +1290,17 @@ func (p *Panel) accountTaskAutoAll(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
 	defer cancel()
 	done := make(chan []map[string]any, 1)
-	go func() {
+	if !p.GoBackground(func() {
 		defer p.unlockAccount(uid) // 流水线真正结束（而非 HTTP 超时返回）才放锁
 		done <- p.runAutoAll(a)
-	}()
+	}) {
+		p.unlockAccount(uid)
+		writeErr(w, http.StatusServiceUnavailable, "server shutting down")
+		return
+	}
 	select {
 	case results := <-done:
-		log.Printf("panel: 一键完成可自动任务 uid=%s 共 %d 项", uid, len(results))
+		log.Printf("panel: 一键完成可自动任务 uid=%s 共 %d 项", logfmt.UID8(uid), len(results))
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "results": results})
 	case <-ctx.Done():
 		// HTTP 侧超时返回，但后台流水线仍在跑——锁在流水线 goroutine 内释放，

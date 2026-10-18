@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
 )
 
 const (
@@ -211,7 +212,7 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 
 	// 凭证落盘（嵌套形，与 auths/ 目录既有格式一致）→ 热加载进池。
 	if err := os.MkdirAll(p.cfg.AuthDir, 0o755); err != nil {
-		writeErr(w, http.StatusInternalServerError, "mkdir auth dir: "+err.Error())
+		writeErr(w, http.StatusInternalServerError, "mkdir auth dir: "+err.Error()+" (check that the mounted auths directory is writable by the container user)")
 		return
 	}
 	a := &auth.Auth{
@@ -252,16 +253,16 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 		// 失败不阻断登录结果（auth 已落盘），只在返回字段里体现。
 		if activated, err := p.cfg.Upstream.GlobalCompleteRegistration(a); err != nil {
 			checkinMsg = "注册激活失败: " + err.Error()
-			log.Printf("panel: global 注册激活 uid=%s: %v", acct.UID, err)
+			log.Printf("panel: global 注册激活 uid=%s: %v", logfmt.UID8(acct.UID), err)
 		} else if activated {
-			log.Printf("panel: global 注册激活 uid=%s 完成", acct.UID)
+			log.Printf("panel: global 注册激活 uid=%s 完成", logfmt.UID8(acct.UID))
 		}
 		// trial 加油包（幂等 14051 = 已领过，非错误）。
 		if claimed, err := p.cfg.Upstream.ClaimTrial(a); err != nil {
 			checkinMsg = joinMsg(checkinMsg, "trial 领取失败: "+err.Error())
-			log.Printf("panel: global trial uid=%s: %v", acct.UID, err)
+			log.Printf("panel: global trial uid=%s: %v", logfmt.UID8(acct.UID), err)
 		} else if claimed {
-			log.Printf("panel: global trial uid=%s 已领", acct.UID)
+			log.Printf("panel: global trial uid=%s 已领", logfmt.UID8(acct.UID))
 		}
 	} else if !a.IsEnterprise() {
 		// 企业版跳过签到：上游 POST /v2/billing/meter/daily-checkin 对企业号
@@ -279,7 +280,7 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 	p.loginMu.Lock()
 	delete(p.logins, state)
 	p.loginMu.Unlock()
-	log.Printf("panel: 新账号已热加载 uid=%s nickname=%q realm=%s（免重启生效）", acct.UID, acct.Nickname, sess.realm)
+	log.Printf("panel: 新账号已热加载 uid=%s nickname=%q realm=%s（免重启生效）", logfmt.UID8(acct.UID), acct.Nickname, sess.realm)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"done":            true,
 		"uid":             acct.UID,

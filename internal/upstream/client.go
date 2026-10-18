@@ -707,6 +707,9 @@ type Client struct {
 	// modelRates 缓存各模型当前生效积分倍率（规范化数值，如 "0.5"）。
 	// 与 efforts 共用 realm 分层和锁；每次成功刷新模型目录时整体替换对应域。
 	modelRates map[string]map[string]string
+	// rateRevision 在每次 modelRates 整体替换时递增。用量面板的短缓存以它
+	// 判断倍率回填结果是否仍有效；目录未刷新时允许同窗口直接命中缓存。
+	rateRevision uint64
 
 	// globalModels 缓存 global 模型名目录探测结果（成功 ∩ 静态 overlay；
 	// 1h TTL + 5min 负缓存），见 global_models.go。按实例持有，测试新建 Client 即隔离。
@@ -862,19 +865,77 @@ func (c *Client) chatBase(a *auth.Auth) string {
 
 // prepareBody 组装出站请求体（脱敏开关由 Client.SanitizeFingerprints 控制）。
 // realm 为账号 Realm()（cn/global），供 efforts 缓存分桶（跨域 effort 集合不互相污染）。
-func (c *Client) prepareBody(body []byte, realm, uid, conversationID string) []byte {
-	efforts, defs := c.effortsSnapshot(realm), c.defaultEffortsSnapshot(realm)
-	if realmKey(realm) == "global" {
-		// global 域降级源 = 远端探测桶（权威）∪ 产品静态兜底表（全局 21 名内档位如
-		// deepseek-v4.1-flash ['high']）。当前探测桶为空时也按静态表降级，不全程透传
-		//（issue #84：往 WorkBuddy 上游发 low/max 非法，须降级到 high）。
-		efforts, defs = globalEffortMap(efforts, defs)
+// consoleSystem 表示是否执行 global realm 的首条 system 兜底注入。
+//
+// 整条管线只在入口解码一次、出口编码一次：effort/role/tool 规范化、cache key
+// 注入与 global system 兜底都复用同一个 map 对象。坏 JSON 原样返回，绝不二次
+// 错误化；任一阶段未命中（已有 prompt_cache_key / 首条已是 system）仍保持原语义。
+func (c *Client) prepareBody(body []byte, realm, uid, conversationID string, consoleSystem bool) []byte {
+	if len(body) == 0 {
+		return body
 	}
-	body = PrepareBodyOptWithEffortsAndDefault(body, c.SanitizeFingerprints.Load(), efforts, defs)
+	var obj map[string]any
+	if err := json.Unmarshal(body, &obj); err != nil {
+		return body
+	}
+	model, _ := obj["model"].(string)
+	efforts, defs := c.effortFor(realm, model)
+	normalizeBodyObject(obj, c.SanitizeFingerprints.Load(), efforts, defs)
 	// prompt_cache_key 注入（P0 费用优化，费用降 ~17×）：按账号隔离的稳定缓存键，
 	// 让同一客户端对同一账号的连续请求命中上游前缀缓存。
-	body = InjectPromptCacheKey(body, uid, conversationID)
-	return body
+	injectPromptCacheKeyObject(obj, uid, conversationID)
+	if consoleSystem {
+		ensureConsoleSystemObject(obj)
+	}
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
+// effortFor 只取当前请求模型所需的档位能力，而不是复制整张域内 effort 表。
+//
+// 旧实现每请求先深拷贝 efforts/defaultEfforts（470 账号场景下目录可能有数十个
+// 模型），再为 global 合并静态兜底表；实际下游 normalizeBodyObject 只按
+// obj["model"] 精确查两个键。这里在同一个 RLock 内完成「远端桶该模型 →
+// global 静态兜底」的两级查找，返回单键 map（零命中返回 nil），语义与旧
+// globalEffortMap 的覆盖顺序完全一致，同时消除每请求 O(模型数) 的 map 分配。
+// 返回的 slice 是缓存内切片，调用方只读、不得修改（normalizeReasoningEffort 只遍历）。
+func (c *Client) effortFor(realm, model string) (map[string][]string, map[string]string) {
+	k := realmKey(realm)
+	c.effortsMu.RLock()
+	defer c.effortsMu.RUnlock()
+	var supported []string
+	if bucket := c.efforts[k]; len(bucket) > 0 && model != "" {
+		supported = bucket[model]
+	}
+	if k == "global" && len(supported) == 0 && model != "" {
+		// 远端未下发该模型档位时用产品静态表兜底（issue #84）。远端有值则权威优先。
+		if cap, ok := globalEffortFallback[model]; ok {
+			supported = cap.efforts
+		}
+	}
+	var efforts map[string][]string
+	if len(supported) > 0 && model != "" {
+		efforts = map[string][]string{model: supported}
+	}
+	var defs map[string]string
+	if model != "" {
+		// 注意 map 存在性：远端桶显式声明空默认档时，不能被静态兜底表覆盖——
+		// 旧 globalEffortMap 只覆盖非空远端值，而「远端桶存在但该模型无 default」
+		// 恰恰是 issue #84 要求回落静态表的形态。两者需要区分，不能只看 def == ""。
+		def, remoteDefault := c.defaultEfforts[k][model]
+		if k == "global" {
+			if !remoteDefault || def == "" {
+				def = globalEffortFallback[model].defaultEffort
+			}
+		}
+		if def != "" {
+			defs = map[string]string{model: def}
+		}
+	}
+	return efforts, defs
 }
 
 // supportedEfforts 返回该域该模型当前用于降级的档位表。
@@ -1118,10 +1179,8 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	prepared := c.prepareBody(body, a.Realm(), a.UID, meta.ConversationID)
-	if c.globalOn(a) {
-		prepared = ensureConsoleSystem(prepared)
-	}
+	global := c.globalOn(a)
+	prepared := c.prepareBody(body, a.Realm(), a.UID, meta.ConversationID, global)
 	// reqCtx 的 cancel 在每个出口显式调用（Do 失败 / ≥400 / 成功分支移交 monitorBody），
 	// 循环本身各分支必 return——无循环尾兜底代码（此前外层 var cancel 从未赋值 +
 	// 尾部不可达 cancel() 是潜伏 nil-panic，已删；chatPaths 恒非空由构造保证）。
@@ -1734,6 +1793,18 @@ func (c *Client) storeModelRates(realm string, infos []ModelInfo) {
 		c.modelRates = make(map[string]map[string]string)
 	}
 	c.modelRates[realmKey(realm)] = rates
+	c.rateRevision++
+}
+
+// RateRevision 返回模型倍率快照的单调版本。0 表示尚未成功刷新过目录；
+// 用量快照只在版本非零时启用带倍率回填的缓存，避免把“未知倍率”结果长期固化。
+func (c *Client) RateRevision() uint64 {
+	if c == nil {
+		return 0
+	}
+	c.effortsMu.RLock()
+	defer c.effortsMu.RUnlock()
+	return c.rateRevision
 }
 
 // ModelRate 返回最近成功刷新的指定域模型生效倍率；未知返回空串。
@@ -1895,6 +1966,10 @@ type CreditPackage struct {
 	EndTime string `json:"end_time,omitempty"`
 	// ExpiresAt 与 EndTime 同源的 Unix 毫秒时间戳，供面板按精确剩余天数聚合。
 	ExpiresAt int64 `json:"expires_at,omitempty"`
+	// ExpiryCycle 表示 EndTime 只是上游周期边界（回落自 CycleEndTime），
+	// 不代表包内积分会在这个时刻失效。只有真实失效时刻 DeductionEndTime
+	// 缺失时才为 true；面板据此避免把“周期重置”误报成“到期”。
+	ExpiryCycle bool `json:"expiry_cycle,omitempty"`
 	// CreatedAt 发放时刻，RFC3339。**这是区分「首登赠送」与「活动奖励」的唯一依据**：
 	// 两类包的 PackageName 与 PackageCode 完全相同（例如都是「国内运营裂变包」+
 	// TCACA_code_007_*），只看名字无法区分，只有时间能说明它是不是账号首次授权那刻发的。
@@ -1988,6 +2063,7 @@ func (c *Client) CreditPackages(a *auth.Auth) ([]CreditPackage, int64, int64, er
 			cp.EndTime = p.PackageEndTime
 		default:
 			cp.EndTime = p.CycleEndTime
+			cp.ExpiryCycle = true
 		}
 		if cp.ExpiresAt == 0 && cp.EndTime != "" {
 			if end, perr := time.ParseInLocation(packageEndLayout, cp.EndTime, softRateResetLoc); perr == nil {

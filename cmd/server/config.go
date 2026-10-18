@@ -12,15 +12,35 @@ import (
 	"strings"
 	"time"
 
+	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/prompt"
 )
+
+// APIKeyConfig 一条多 API Key 配置。
+//
+// Key 是唯一保存明文的位置（配置页 GET 必须脱敏）。Realm 限制跨域路由；
+// Models 为可选白名单（空 = 不限制），在网关读 body 后、选号/上游调用前生效。
+type APIKeyConfig struct {
+	ID      string   `json:"id"`
+	Name    string   `json:"name,omitempty"`
+	Key     string   `json:"key"`
+	Realm   string   `json:"realm,omitempty"` // "" / "cn" / "global"
+	Models  []string `json:"models,omitempty"`
+	Enabled *bool    `json:"enabled,omitempty"` // 缺省 true；指针区分缺省与显式 false
+}
+
+// IsEnabled 把缺省 true 的语义集中在一处。
+func (k APIKeyConfig) IsEnabled() bool { return k.Enabled == nil || *k.Enabled }
 
 // Config 顶层配置。
 type Config struct {
 	Listen    string `json:"listen"`     // ":7863"
-	APIKey    string `json:"api_key"`    // 空 = 不鉴权
+	APIKey    string `json:"api_key"`    // 兼容旧配置：作为 legacy key；空 = 不单独启用鉴权
 	AuthDir   string `json:"auth_dir"`   // ./auths
 	StateFile string `json:"state_file"` // ./data/state.json
+	// APIKeys 多租户/多客户端密钥。每项：id/name/key/realm(models 可选)；
+	// 顶层 api_key 继续兼容，作为固定 id=legacy、不限 realm 的条目。
+	APIKeys []APIKeyConfig `json:"api_keys"`
 
 	Panel struct {
 		// PackageDetailLimit 积分构成页单账号默认展示的最近到期包数；<=0 回落 5。
@@ -154,6 +174,20 @@ type Config struct {
 		SanitizeBlacklistFingerprints bool `json:"sanitize_blacklist_fingerprints"`
 	} `json:"features"`
 
+	// BackgroundModels 客户端后台任务模型重定向（默认关闭：两份名单都为空时
+	// 完全不介入请求）。桌面客户端的模型选择器只控制主对话；记忆生成、环境建议、
+	// 自动化等后台请求仍会使用客户端硬编码的模型，可能在用户选了免费模型时继续
+	// 消耗付费积分。这里只改写 model 字段，请求体其余部分逐字保留，且发生在
+	// Key 鉴权/模型白名单之后、选号之前：Key 的授权语义仍按客户端原始模型判定，
+	// 不会被一个本地别名绕过。
+	BackgroundModels struct {
+		// Names 需要拦截的模型名，逗号分隔；大小写不敏感，支持 shell 通配符
+		//（如 gpt-5.6-*）。空 = 关闭本能力。
+		Names string `json:"names"`
+		// Target 改写目标（裸模型名，可带 realm: 前缀）；空 = 不回写。
+		Target string `json:"target"`
+	} `json:"background_models"`
+
 	Prompt struct {
 		// Mode passthrough（默认）= 透传客户端原始 system（降级重试仍会切到 Degraded）；
 		// custom = 网关用自有系统提示词替换客户端 system/developer；
@@ -205,6 +239,12 @@ type Config struct {
 		// tier 0（免费）/ tier 1（无观测）不受限；签到回血越过 floor 自动恢复。
 		// 默认 0 = 关闭；负值钳 0。
 		CreditFloor int64 `json:"credit_floor"`
+		// DailyTokenLimit 账号级日 Token 上限：账号自本地零点起累计 token 达到该值后，
+		// 今日不再被选号（只过滤，不冷却/不暂停）；0 = 关闭。
+		DailyTokenLimit int64 `json:"daily_token_limit"`
+		// ModelDailyTokenLimit 按模型的账号级日 Token 上限：某账号在某模型上今日
+		// 达到该值后，仅该模型不再选中该账号，其他模型照常；0 = 关闭。
+		ModelDailyTokenLimit int64 `json:"model_daily_token_limit"`
 	} `json:"pool"`
 
 	SessionSticky struct {
@@ -296,6 +336,29 @@ func Default() *Config {
 	return c
 }
 
+// normalizeModelNameList 把逗号/空白分隔的模型名单统一成 "a,b,c" 形式：
+// 去空白、去空项、大小写不敏感去重，保持首次出现顺序。名单只用于本地匹配，
+// 不回显成数组；稳定顺序让启动日志与测试可重复。
+func normalizeModelNameList(raw string) string {
+	seen := make(map[string]bool)
+	out := make([]string, 0, 4)
+	for _, part := range strings.FieldsFunc(raw, func(r rune) bool {
+		return r == ',' || r == '，' || r == ' ' || r == '\t' || r == '\n' || r == '\r'
+	}) {
+		name := strings.TrimSpace(part)
+		if name == "" {
+			continue
+		}
+		key := strings.ToLower(name)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, name)
+	}
+	return strings.Join(out, ",")
+}
+
 // Load 从文件读，再用 WB2A_* env 覆盖。
 func Load(path string) (*Config, error) {
 	c := Default()
@@ -358,7 +421,7 @@ func WriteDefault(path string) (string, error) {
 	}
 	if dir := filepath.Dir(path); dir != "" && dir != "." {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return "", fmt.Errorf("mkdir config dir: %w", err)
+			return "", fmt.Errorf("mkdir config dir: %w (check that the config directory is writable by the running user)", err)
 		}
 	}
 	// O_EXCL 原子拒绝覆盖：即使调用方漏判"不存在"，也绝不悄悄改写用户已有配置。
@@ -527,6 +590,22 @@ func (c *Config) normalize() error {
 	if c.Pool.CreditFloor < 0 {
 		c.Pool.CreditFloor = 0
 	}
+	// 日 Token 护栏：负值钳 0（= 关闭）。0 是合法默认，无需空值回落。
+	if c.Pool.DailyTokenLimit < 0 {
+		c.Pool.DailyTokenLimit = 0
+	}
+	if c.Pool.ModelDailyTokenLimit < 0 {
+		c.Pool.ModelDailyTokenLimit = 0
+	}
+	// 后台模型重定向：两边任一为空都视为关闭（不半开），避免只配了名单却没目标
+	// 时把请求改写成空模型名。Target 只校验非空白；realm 前缀由路由层按现有
+	// resolveModel 处理，与普通请求完全同一条路径。
+	c.BackgroundModels.Names = normalizeModelNameList(c.BackgroundModels.Names)
+	c.BackgroundModels.Target = strings.TrimSpace(c.BackgroundModels.Target)
+	if c.BackgroundModels.Names == "" || c.BackgroundModels.Target == "" {
+		c.BackgroundModels.Names = ""
+		c.BackgroundModels.Target = ""
+	}
 	if c.Pool.BreakerThreshold <= 0 {
 		c.Pool.BreakerThreshold = 3
 	}
@@ -591,10 +670,88 @@ func (c *Config) normalize() error {
 		}
 		c.BalanceRefreshInterval = time.Duration(c.Schedule.BalanceRefreshMinutes) * time.Minute
 	}
+	if err := c.normalizeAPIKeys(); err != nil {
+		return err
+	}
 	if err := c.validateScheduleHours(); err != nil {
 		return err
 	}
 	return c.normalizePrompt()
+}
+
+// normalizeAPIKeys 校验多 key 配置并归一化空值。
+//
+// 规则：
+//   - id 非空且在 api_keys 内唯一；
+//   - 新增 api_keys 条目 key 非空且长度 >= 4（禁空串/占位符）；
+//   - 顶层 api_key 是旧配置兼容入口：只拒绝纯空白，不做最小长度硬拒绝。
+//     历史配置里存在 api_key:"k" 这类短键，升级不能因此启动失败。
+//   - realm 仅 cn/global/空；
+//   - id 不得与 legacy 冲突（legacy 固定给顶层 api_key）。
+//
+// 注意：这里不把 api_keys[].key 合并到 APIKey；两者在运行时都进入 keyring，
+// 顶层 api_key 始终作为 legacy 条目存在，保证老客户端零改动。
+func (c *Config) normalizeAPIKeys() error {
+	if c.APIKey != "" && strings.TrimSpace(c.APIKey) == "" {
+		return fmt.Errorf("api_key: 不能只包含空白字符")
+	}
+	c.APIKey = strings.TrimSpace(c.APIKey)
+	seen := map[string]bool{}
+	for i := range c.APIKeys {
+		k := &c.APIKeys[i]
+		k.ID = strings.TrimSpace(k.ID)
+		k.Name = strings.TrimSpace(k.Name)
+		// key 是凭证原文：只校验空白，不做 Trim 改写。首尾空格若属于真实
+		// 密钥，改写会让客户端持有旧 key 时无法通过校验。
+		keyTrimmed := strings.TrimSpace(k.Key)
+		k.Realm = strings.ToLower(strings.TrimSpace(k.Realm))
+		if k.ID == "" {
+			return fmt.Errorf("api_keys[%d].id: 不能为空", i)
+		}
+		if k.ID == httpauth.DefaultLegacyKeyID {
+			return fmt.Errorf("api_keys[%d].id: %q 是顶层 api_key 的保留 id，请换一个", i, k.ID)
+		}
+		if seen[k.ID] {
+			return fmt.Errorf("api_keys[%d].id: %q 重复", i, k.ID)
+		}
+		seen[k.ID] = true
+		if keyTrimmed == "" {
+			// 配置页 GET 回显 ***，POST 时 panel 层按 id 还原原值；能在
+			// normalize 看到空 key，说明是新增空条目（或调用方绕过了面板），
+			// 必须拒绝而不是静默丢弃。
+			return fmt.Errorf("api_keys[%d].key: 不能为空", i)
+		}
+		if len(k.Key) < 4 {
+			return fmt.Errorf("api_keys[%d].key: 长度必须 >= 4", i)
+		}
+		if k.Realm != "" && k.Realm != "cn" && k.Realm != "global" {
+			return fmt.Errorf("api_keys[%d].realm: %q 不是合法值（cn / global / 空）", i, k.Realm)
+		}
+		for j := range k.Models {
+			k.Models[j] = strings.TrimSpace(k.Models[j])
+		}
+	}
+	return nil
+}
+
+// keyring 把顶层 legacy api_key 与 api_keys[] 合并为运行时鉴权列表。
+// 返回值每次新分配，避免 livecfg 快照与配置对象共享可变切片。
+func (c *Config) keyring() []httpauth.Key {
+	if c == nil {
+		return nil
+	}
+	specs := make([]httpauth.KeySpec, 0, len(c.APIKeys))
+	for _, k := range c.APIKeys {
+		specs = append(specs, httpauth.KeySpec{
+			ID:      k.ID,
+			Name:    k.Name,
+			Key:     k.Key,
+			Realm:   k.Realm,
+			Models:  append([]string(nil), k.Models...),
+			Enabled: k.IsEnabled(),
+		})
+	}
+	return httpauth.Keyring(c.APIKey, specs)
 }
 
 // normalizePrompt 校验 prompt.mode 并按 file 加载提示词文本（custom/append 模式）。

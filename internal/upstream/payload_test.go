@@ -2,9 +2,13 @@ package upstream
 
 import (
 	"encoding/json"
+	"io"
+	"net/http"
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 )
 
 // TestNormalizeRoles 验证出站请求体把 developer 角色归一为 system。
@@ -189,6 +193,188 @@ func decodeBody(b []byte) (map[string]any, error) {
 	var obj map[string]any
 	err := json.Unmarshal(b, &obj)
 	return obj, err
+}
+
+// TestPrepareBodySingleDecodeEquivalent 验证 prepareBody 的单次解码/编码管线
+// 与旧的两段字节管线和独立的 global system 步骤逐字节等价，覆盖全部关键语义。
+func TestPrepareBodySingleDecodeEquivalent(t *testing.T) {
+	c := &Client{}
+	c.SanitizeFingerprints.Store(false)
+	c.efforts = map[string]map[string][]string{
+		"cn": {"glm-5.2": {"low", "high"}},
+	}
+	c.defaultEfforts = map[string]map[string]string{
+		"cn": {"glm-5.2": "high"},
+	}
+	cases := []struct {
+		name          string
+		body          string
+		conv          string
+		consoleSystem bool
+	}{
+		{
+			name: "normalization and generated cache key",
+			body: `{"model":"glm-5.2","reasoning_effort":"max","messages":[{"role":"developer","content":"sys"},{"role":"user","content":"hi"}],"tool_choice":{"type":"function","function":{"name":"f"}},"tools":[{"type":"function","function":{"name":"f"}}]}`,
+			conv: "conv-42",
+		},
+		{
+			name:          "global system injection",
+			body:          `{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`,
+			conv:          "conv-42",
+			consoleSystem: true,
+		},
+		{
+			name:          "global system not duplicated",
+			body:          `{"model":"glm-5.2","messages":[{"role":"system","content":"already"},{"role":"user","content":"hi"}]}`,
+			conv:          "conv-42",
+			consoleSystem: true,
+		},
+		{
+			name:          "global empty messages unchanged",
+			body:          `{"model":"glm-5.2","messages":[]}`,
+			conv:          "conv-42",
+			consoleSystem: true,
+		},
+		{
+			name: "existing cache key preserved",
+			body: `{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}],"prompt_cache_key":"client-key"}`,
+			conv: "conv-42",
+		},
+		{
+			name: "body conversation id precedence",
+			body: `{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}],"conversation_id":"body-conv"}`,
+			conv: "header-conv",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := c.prepareBody([]byte(tc.body), "cn", "user-abc-123", tc.conv, tc.consoleSystem)
+			want := PrepareBodyOptWithEffortsAndDefault([]byte(tc.body), false, c.efforts["cn"], c.defaultEfforts["cn"])
+			want = InjectPromptCacheKey(want, "user-abc-123", tc.conv)
+			if tc.consoleSystem {
+				want = ensureConsoleSystem(want)
+			}
+			if string(got) != string(want) {
+				t.Fatalf("single-pass body differs from legacy pipeline:\ngot:  %s\nwant: %s", got, want)
+			}
+		})
+	}
+}
+
+// TestPrepareBodyBadJSONPassthrough 坏 JSON 必须在统一入口原样回退，不因新管线被改写。
+func TestPrepareBodyBadJSONPassthrough(t *testing.T) {
+	c := &Client{}
+	c.SanitizeFingerprints.Store(false)
+	in := []byte(`{"model":"glm-5.2",`)
+	if got := c.prepareBody(in, "global", "uid", "conv", true); string(got) != string(in) {
+		t.Fatalf("bad JSON altered: got=%q want=%q", got, in)
+	}
+	if got := c.prepareBody(nil, "cn", "uid", "conv", false); len(got) != 0 {
+		t.Fatalf("nil body altered: %q", got)
+	}
+}
+
+// TestPrepareBodyGlobalEffortFallbackMatchesLegacy global 域远端桶缺该模型时，
+// effortFor 单键查找必须与旧 globalEffortMap 合并结果一致（静态兜底优先补齐），
+// 且远端桶有值时权威覆盖；同时确保不会整表复制。
+func TestPrepareBodyGlobalEffortFallbackMatchesLegacy(t *testing.T) {
+	c := &Client{}
+	c.SanitizeFingerprints.Store(false)
+	c.efforts = map[string]map[string][]string{
+		"global": {"gpt-6-astra": {"low", "max"}},
+	}
+	c.defaultEfforts = map[string]map[string]string{
+		"global": {"gpt-6-astra": "max"},
+	}
+	in := []byte(`{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"low"}`)
+	got := c.prepareBody(in, "global", "uid", "conv", false)
+	var obj map[string]any
+	if err := json.Unmarshal(got, &obj); err != nil {
+		t.Fatal(err)
+	}
+	if obj["reasoning_effort"] != "high" {
+		t.Fatalf("global static fallback must downgrade low->high, got %v body=%s", obj["reasoning_effort"], got)
+	}
+
+	in = []byte(`{"model":"gpt-6-astra","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"low"}`)
+	got = c.prepareBody(in, "global", "uid", "conv", false)
+	if err := json.Unmarshal(got, &obj); err != nil {
+		t.Fatal(err)
+	}
+	if obj["reasoning_effort"] != "low" {
+		t.Fatalf("remote bucket must override static fallback, got %v body=%s", obj["reasoning_effort"], got)
+	}
+}
+
+// TestChatStreamGlobalInjectsConsoleSystemOnce 覆盖 wire 级语义：global 请求
+// 首条非 system 时注入且只注入一条；首条已是 system 时不重复注入。
+func TestChatStreamGlobalInjectsConsoleSystemOnce(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		body         string
+		wantSystems  int
+		wantFirstSys bool
+	}{
+		{"inject once", `{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`, 1, true},
+		{"no duplicate", `{"model":"glm-5.2","messages":[{"role":"system","content":"already"},{"role":"user","content":"hi"}]}`, 1, true},
+		{"no messages", `{"model":"glm-5.2","messages":[]}`, 0, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var wire map[string]any
+			c := testClient(func(r *http.Request) (*http.Response, error) {
+				body, _ := io.ReadAll(r.Body)
+				if err := json.Unmarshal(body, &wire); err != nil {
+					t.Fatalf("wire body: %v", err)
+				}
+				return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"text/event-stream"}}, Body: io.NopCloser(strings.NewReader("data: [DONE]\n\n"))}, nil
+			})
+			c.GlobalEnabled = true
+			c.ChatBaseGlobal = "https://global.example"
+			a := &auth.Auth{AccessToken: "at", UID: "u1"}
+			if _, err := auth.BackfillRealmFor(a, "global"); err != nil {
+				t.Fatalf("set realm: %v", err)
+			}
+			rc, status, respBody, err := c.ChatStream(a, []byte(tc.body), "", ChatMeta{ConversationID: "conv"})
+			if err != nil || status != 200 {
+				t.Fatalf("chat: status=%d body=%s err=%v", status, respBody, err)
+			}
+			rc.Close()
+			msgs, _ := wire["messages"].([]any)
+			systems := 0
+			for _, raw := range msgs {
+				msg, _ := raw.(map[string]any)
+				if role, _ := msg["role"].(string); role == "system" {
+					systems++
+				}
+			}
+			if systems != tc.wantSystems {
+				t.Fatalf("system messages=%d want %d: %v", systems, tc.wantSystems, msgs)
+			}
+			if tc.wantFirstSys && len(msgs) > 0 {
+				first, _ := msgs[0].(map[string]any)
+				if role, _ := first["role"].(string); role != "system" {
+					t.Fatalf("first message role=%v want system", first["role"])
+				}
+			}
+		})
+	}
+}
+
+// TestPrepareBodyEmptyObject 空对象是合法 JSON，必须走完整管线而不是坏 JSON 回退。
+func TestPrepareBodyEmptyObject(t *testing.T) {
+	c := &Client{}
+	c.SanitizeFingerprints.Store(false)
+	out := c.prepareBody([]byte(`{}`), "cn", "uid", "conv", false)
+	obj, err := decodeBody(out)
+	if err != nil {
+		t.Fatalf("out not json: %v", err)
+	}
+	if obj["stream"] != true {
+		t.Fatalf("stream not forced: %v", obj)
+	}
+	if got, _ := obj["prompt_cache_key"].(string); got == "" {
+		t.Fatalf("cache key missing: %v", obj)
+	}
 }
 
 // TestPrepareBodyDeterministic 序列化稳定性：同输入跑多遍出站字节级一致

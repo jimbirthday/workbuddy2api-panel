@@ -48,3 +48,32 @@ func TestRingWriteStripsTimestamp(t *testing.T) {
 		t.Errorf("stale ts: %v", es[0].TS)
 	}
 }
+
+// TestRingOverwriteOrderAndZeroValue 环形覆盖后 Snapshot 必须仍按写入顺序返回
+// 最新 cap 条；零值 Ring 也应能直接写入（旧实现依赖 append 自动分配）。
+func TestRingOverwriteOrderAndZeroValue(t *testing.T) {
+	var zero Ring
+	if _, err := zero.Write([]byte("zero\n")); err != nil {
+		t.Fatal(err)
+	}
+	if got := zero.Snapshot(); len(got) != 1 || got[0].Text != "zero" {
+		t.Fatalf("zero ring snapshot=%v", got)
+	}
+
+	r := NewRing(3)
+	for _, line := range []string{"one", "two", "three", "four", "five"} {
+		if _, err := r.Write([]byte(line + "\n")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got := r.Snapshot()
+	want := []string{"three", "four", "five"}
+	if len(got) != len(want) {
+		t.Fatalf("len=%d want %d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i].Text != want[i] {
+			t.Fatalf("snapshot[%d]=%q want %q", i, got[i].Text, want[i])
+		}
+	}
+}

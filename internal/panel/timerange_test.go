@@ -127,3 +127,41 @@ func TestRequestLogsEmptyRangeReturnsArray(t *testing.T) {
 		t.Fatalf("未来区间不该命中任何记录: %+v", out.Entries)
 	}
 }
+
+// 归档目录未变时，默认响应省略 entries 大数组；显式 include_entries=1
+// 仍返回完整窗口，保证调试/旧脚本兼容。
+func TestRequestLogsUnchangedOmitsEntriesByDefault(t *testing.T) {
+	rec := reqlog.New(reqlog.Config{Enabled: true, Dir: t.TempDir(), MaxBytes: 1 << 20, RetentionDays: 7})
+	rec.Record(reqlog.Event{Time: time.Now().Add(-time.Minute), RequestID: "r1", Status: 200, OK: true, Outcome: reqlog.OutcomeSuccess})
+	rec.Close()
+	p := New(Config{Version: "test", APIKey: "k", Pool: pool.New(""), RequestLog: rec})
+
+	get := func(path string) (int, bool, []reqlog.Event) {
+		t.Helper()
+		req := httptest.NewRequest("GET", path, nil)
+		req.Header.Set("Authorization", "Bearer k")
+		rr := httptest.NewRecorder()
+		p.ServeHTTP(rr, req)
+		var out struct {
+			Entries   []reqlog.Event `json:"entries"`
+			Unchanged bool           `json:"unchanged"`
+		}
+		if err := json.Unmarshal(rr.Body.Bytes(), &out); err != nil {
+			t.Fatalf("decode %s: %v body=%s", path, err, rr.Body)
+		}
+		return rr.Code, out.Unchanged, out.Entries
+	}
+
+	code, _, entries := get("/panel/api/request_logs")
+	if code != 200 || len(entries) != 1 {
+		t.Fatalf("first request: code=%d entries=%d", code, len(entries))
+	}
+	code, unchanged, entries := get("/panel/api/request_logs")
+	if code != 200 || !unchanged || len(entries) != 0 || entries == nil {
+		t.Fatalf("unchanged request must omit entries: code=%d unchanged=%v entries=%+v", code, unchanged, entries)
+	}
+	code, unchanged, entries = get("/panel/api/request_logs?include_entries=1")
+	if code != 200 || !unchanged || len(entries) != 1 {
+		t.Fatalf("include_entries must keep old window: code=%d unchanged=%v entries=%+v", code, unchanged, entries)
+	}
+}

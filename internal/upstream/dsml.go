@@ -344,30 +344,24 @@ func parseMarkupParams(body string) (string, bool) {
 // 两个来源都为空 → 返回 nil，由调用方决定是否启用弱判定（见 NewMarkupRepair）。
 // 解析失败按空处理（不编造名单）。
 func ToolNameAllowlist(body []byte) map[string]bool {
-	var req struct {
-		Tools []struct {
-			Name     string `json:"name"`
-			Function *struct {
-				Name string `json:"name"`
-			} `json:"function"`
-		} `json:"tools"`
-		Functions []struct {
-			Name string `json:"name"`
-		} `json:"functions"`
-		Messages []struct {
-			ToolCalls []struct {
-				Function *struct {
-					Name string `json:"name"`
-				} `json:"function"`
-			} `json:"tool_calls"`
-			FunctionCall *struct {
-				Name string `json:"name"`
-			} `json:"function_call"`
-		} `json:"messages"`
-	}
+	var req ToolNamesRequest
 	if json.Unmarshal(body, &req) != nil {
 		return nil
 	}
+	return ToolNamesFromRequest(req)
+}
+
+// ToolNamesRequest 是请求体里提取工具名所需的最小字段集。handler 已经在入口
+// 解析请求时复用它，不再为工具名单做第二次全量 JSON 解码。
+type ToolNamesRequest struct {
+	Tools     []ToolDecl         `json:"tools"`
+	Functions []FunctionDecl     `json:"functions"`
+	Messages  []MessageToolNames `json:"messages"`
+}
+
+// ToolNamesFromRequest 返回已解析请求里的工具名集合，语义与 ToolNameAllowlist
+// 完全一致（两个来源都收、空集合返回 nil、不编造名字）。
+func ToolNamesFromRequest(req ToolNamesRequest) map[string]bool {
 	names := map[string]bool{}
 	for _, t := range req.Tools {
 		if t.Function != nil && t.Function.Name != "" {
@@ -397,6 +391,69 @@ func ToolNameAllowlist(body []byte) map[string]bool {
 		return nil
 	}
 	return names
+}
+
+// ToolNamesFromFields 是 ToolNameAllowlist 的已解码版本，供入口复用同一次
+// JSON 解析。Sources 与 ToolNameAllowlist 的两个来源逐项对应，空集合返回 nil。
+func ToolNamesFromFields(tools []ToolDecl, functions []FunctionDecl, messages []MessageToolNames) map[string]bool {
+	names := map[string]bool{}
+	for _, t := range tools {
+		if t.Function != nil && t.Function.Name != "" {
+			names[t.Function.Name] = true
+			continue
+		}
+		if t.Name != "" {
+			names[t.Name] = true
+		}
+	}
+	for _, f := range functions {
+		if f.Name != "" {
+			names[f.Name] = true
+		}
+	}
+	for _, m := range messages {
+		for _, tc := range m.ToolCalls {
+			if tc.Function != nil && tc.Function.Name != "" {
+				names[tc.Function.Name] = true
+			}
+		}
+		if m.FunctionCall != nil && m.FunctionCall.Name != "" {
+			names[m.FunctionCall.Name] = true
+		}
+	}
+	if len(names) == 0 {
+		return nil
+	}
+	return names
+}
+
+// ToolDecl 是 tools[] 条目里提取工具名所需的字段（函数名优先，兼容 Responses 裸 name）。
+type ToolDecl struct {
+	Name     string `json:"name"`
+	Function *struct {
+		Name string `json:"name"`
+	} `json:"function"`
+}
+
+// FunctionDecl 是旧版 functions[] 条目。
+type FunctionDecl struct {
+	Name string `json:"name"`
+}
+
+// MessageToolNames 是会话历史里可能携带工具名的字段。
+type MessageToolNames struct {
+	ToolCalls    []ToolCallDecl    `json:"tool_calls"`
+	FunctionCall *FunctionCallDecl `json:"function_call"`
+}
+
+// ToolCallDecl 是历史消息 tool_calls[] 条目里提取函数名所需字段。
+type ToolCallDecl struct {
+	Function *FunctionCallDecl `json:"function"`
+}
+
+// FunctionCallDecl 是旧版 function_call 对象。
+type FunctionCallDecl struct {
+	Name string `json:"name"`
 }
 
 // RepairAggregatedResponse 在非流式聚合响应里把正文中的标记还原为 tool_calls。

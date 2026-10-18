@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
 )
 
 // acceptBatchGap 批量接受的批间节流（对齐脚本 1.05s 口径，避免上游风控）。
@@ -82,7 +83,7 @@ func (p *Panel) accountTaskAccept(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadGateway, "accept: "+err.Error())
 		return
 	}
-	log.Printf("panel: 接受任务 uid=%s codes=%v", uid, body.TaskCodes)
+	log.Printf("panel: 接受任务 uid=%s codes=%v", logfmt.UID8(uid), body.TaskCodes)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
@@ -131,7 +132,7 @@ func (p *Panel) taskAcceptAll(w http.ResponseWriter, r *http.Request) {
 			end = len(codes)
 		}
 		if err := p.cfg.Upstream.AcceptTasks(a, codes[i:end]); err != nil {
-			log.Printf("panel: 批量接受失败 uid=%s codes=%v err=%v", uid, codes[i:end], err)
+			log.Printf("panel: 批量接受失败 uid=%s codes=%v err=%v", logfmt.UID8(uid), codes[i:end], err)
 			failed = append(failed, codes[i:end]...)
 			continue
 		}
@@ -149,7 +150,7 @@ func (p *Panel) taskAcceptAll(w http.ResponseWriter, r *http.Request) {
 		}
 		if len(mpCodes) > 0 {
 			if err := p.cfg.Upstream.AcceptTasksMP(a, mpCodes); err != nil {
-				log.Printf("panel: mp 批量接受失败 uid=%s err=%v", uid, err)
+				log.Printf("panel: mp 批量接受失败 uid=%s err=%v", logfmt.UID8(uid), err)
 				failed = append(failed, mpCodes...)
 			} else {
 				accepted += len(mpCodes)
@@ -157,7 +158,7 @@ func (p *Panel) taskAcceptAll(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	log.Printf("panel: 全部接受 uid=%s 接受=%d 失败=%d", uid, accepted, len(failed))
+	log.Printf("panel: 全部接受 uid=%s 接受=%d 失败=%d", logfmt.UID8(uid), accepted, len(failed))
 	resp := map[string]any{"ok": true, "accepted": accepted, "failed": failed}
 	if len(failed) > 0 {
 		resp["message"] = "部分任务接受失败（上游拒绝），可重试"
@@ -192,10 +193,10 @@ func (p *Panel) accountTaskClaim(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if credit == 0 && energy == 0 {
-		log.Printf("panel: 领取任务奖励 uid=%s code=%s（已领取过，无新增）", uid, body.TaskCode)
+		log.Printf("panel: 领取任务奖励 uid=%s code=%s（已领取过，无新增）", logfmt.UID8(uid), body.TaskCode)
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "already_claimed": true, "message": "该奖励此前已领取"})
 		return
 	}
-	log.Printf("panel: 领取任务奖励 uid=%s code=%s +%d分 +%d能", uid, body.TaskCode, credit, energy)
+	log.Printf("panel: 领取任务奖励 uid=%s code=%s +%d分 +%d能", logfmt.UID8(uid), body.TaskCode, credit, energy)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "credit": credit, "energy": energy})
 }

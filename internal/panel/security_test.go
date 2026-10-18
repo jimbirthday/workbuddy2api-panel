@@ -93,6 +93,47 @@ func TestAppScriptServed(t *testing.T) {
 	if !strings.Contains(rec.Body.String(), "'use strict'") {
 		t.Error("app.js body looks wrong")
 	}
+	if rec.Header().Get("ETag") == "" {
+		t.Error("app.js must carry a content ETag")
+	}
+	if got := rec.Header().Get("Cache-Control"); got != "no-cache" {
+		t.Errorf("Cache-Control=%q want no-cache", got)
+	}
+}
+
+// 静态资源条件 GET：同版本重复访问必须 304 且不回正文；版本升级（ETag 变化）
+// 必须重新下发，不能因为缓存让用户继续跑旧脚本。
+func TestStaticAssetsConditionalGET(t *testing.T) {
+	p := newTestPanel()
+	for _, path := range []string{"/panel/", "/panel/app.js"} {
+		first := httptest.NewRecorder()
+		p.ServeHTTP(first, httptest.NewRequest("GET", path, nil))
+		etag := first.Header().Get("ETag")
+		if etag == "" {
+			t.Fatalf("%s: missing ETag", path)
+		}
+		req := httptest.NewRequest("GET", path, nil)
+		req.Header.Set("If-None-Match", etag)
+		rec := httptest.NewRecorder()
+		p.ServeHTTP(rec, req)
+		if rec.Code != http.StatusNotModified {
+			t.Fatalf("%s: code=%d want 304", path, rec.Code)
+		}
+		if rec.Body.Len() != 0 {
+			t.Errorf("%s: 304 must not include body, got %d bytes", path, rec.Body.Len())
+		}
+		if rec.Header().Get("Content-Security-Policy") == "" {
+			t.Errorf("%s: 304 must keep security headers", path)
+		}
+		// 弱比较与多候选都应命中。
+		req2 := httptest.NewRequest("GET", path, nil)
+		req2.Header.Set("If-None-Match", `"stale", W/`+etag)
+		rec2 := httptest.NewRecorder()
+		p.ServeHTTP(rec2, req2)
+		if rec2.Code != http.StatusNotModified {
+			t.Errorf("%s: weak/multi ETag mismatch code=%d", path, rec2.Code)
+		}
+	}
 }
 
 // UID 白名单：拒绝路径穿越与异常字符，放行真实 UUID 形态。

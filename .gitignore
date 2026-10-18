@@ -12,6 +12,7 @@ data/
 /credit
 /wb2api
 /signin_bin
+/server
 
 # Config with secrets (use config.example.json)
 config.json

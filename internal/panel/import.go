@@ -6,12 +6,14 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
 )
 
 // cockpitAccount 映射 cockpit tools 导出格式的单个账号。
@@ -41,7 +43,9 @@ type cockpitAccount struct {
 //	Content-Type: multipart/form-data
 //	Body: file=<json>
 //
-// 返回 {ok, total, imported, skipped, errors}。
+// 返回 {ok, dry_run, overwrite, total, added, updated, skipped, invalid, errors}。
+// 同 UID 文件默认跳过，只有 overwrite=true 才替换；dryRun=true 只做解析和
+// 分类，不写盘、不入池、不触发上游签到/激活。
 func (p *Panel) importCockpit(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseMultipartForm(32 << 20); err != nil {
 		writeErr(w, http.StatusBadRequest, "parse form: "+err.Error())
@@ -85,35 +89,63 @@ func (p *Panel) importCockpit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var (
-		total, imported, skipped int
-		errs                     []string
-		mu                       sync.Mutex
-		wg                       sync.WaitGroup
-		// sem 限制导入内逐账号的上游调用并发（口径与面板其它路径一致，
-		// concurrency=3）：账号多时串行太慢，但无界并发会瞬间打满上游触发风控。
-		sem = make(chan struct{}, 3)
-	)
+	dryRun := parseImportBool(r.FormValue("dryRun"), r.FormValue("dry_run"))
+	overwrite := parseImportBool(r.FormValue("overwrite"), "")
+	result := p.importCockpitAccounts(accounts, dryRun, overwrite)
 
+	log.Printf("panel: cockpit import finished dry_run=%t overwrite=%t total=%d added=%d updated=%d skipped=%d invalid=%d",
+		dryRun, overwrite, result.Total, result.Added, result.Updated, result.Skipped, result.Invalid)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":        true,
+		"dry_run":   dryRun,
+		"overwrite": overwrite,
+		"total":     result.Total,
+		"added":     result.Added,
+		"updated":   result.Updated,
+		"skipped":   result.Skipped,
+		"invalid":   result.Invalid,
+		"imported":  result.Added + result.Updated,
+		"errors":    result.Errors,
+	})
+}
+
+type cockpitImportJob struct {
+	a         *auth.Auth
+	uid       string
+	realm     string
+	overwrite bool
+}
+
+type cockpitImportResult struct {
+	Total   int
+	Added   int
+	Updated int
+	Skipped int
+	Invalid int
+	Errors  []string
+}
+
+// importCockpitAccounts 是导入的纯业务实现：先完整分类，再决定是否执行。
+// dryRun 只返回分类结果；写入失败单独计为 skipped，invalid 只表示解析期
+// 拒绝（缺字段/非法 UID）。errors 只包含 id/uid 与原因，绝不拼接凭证。
+func (p *Panel) importCockpitAccounts(accounts []cockpitAccount, dryRun, overwrite bool) cockpitImportResult {
+	res := cockpitImportResult{Total: len(accounts), Errors: []string{}}
+	jobs := make([]cockpitImportJob, 0, len(accounts))
+	jobsByUID := make(map[string]int, len(accounts))
 	for _, acc := range accounts {
 		uid := strings.TrimSpace(acc.UID)
 		at := strings.TrimSpace(acc.AccessToken)
 		rt := strings.TrimSpace(acc.RefreshToken)
 		if uid == "" || at == "" || rt == "" {
-			mu.Lock()
-			skipped++
-			errs = append(errs, fmt.Sprintf("missing required fields (id=%s)", acc.ID))
-			mu.Unlock()
+			res.Invalid++
+			res.Errors = append(res.Errors, fmt.Sprintf("missing required fields (id=%s)", safeImportID(acc.ID)))
 			continue
 		}
 		if !validImportUID(uid) {
-			mu.Lock()
-			skipped++
-			errs = append(errs, fmt.Sprintf("invalid uid (id=%s)", acc.ID))
-			mu.Unlock()
+			res.Invalid++
+			res.Errors = append(res.Errors, fmt.Sprintf("invalid uid (id=%s)", safeImportID(acc.ID)))
 			continue
 		}
-
 		// 按 domain 推断 realm：workbuddy.ai 家族 → global，否则 cn。
 		realm := auth.ResolveRealm("", acc.Domain)
 
@@ -122,12 +154,11 @@ func (p *Panel) importCockpit(w http.ResponseWriter, r *http.Request) {
 		if expiresAt <= 0 {
 			expiresAt = time.Now().Add(365 * 24 * time.Hour).Unix()
 		}
-
 		nickname := acc.Nickname
 		if strings.TrimSpace(nickname) == "" {
 			nickname = acc.Email
 		}
-
+		filePath := filepath.Join(p.cfg.AuthDir, fmt.Sprintf("workbuddy-%s.json", uid))
 		a := &auth.Auth{
 			AccessToken:  at,
 			RefreshToken: rt,
@@ -135,74 +166,167 @@ func (p *Panel) importCockpit(w http.ResponseWriter, r *http.Request) {
 			Domain:       acc.Domain,
 			UID:          uid,
 			Nickname:     nickname,
-			FilePath:     filepath.Join(p.cfg.AuthDir, fmt.Sprintf("workbuddy-%s.json", uid)),
+			FilePath:     filePath,
 		}
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
 
-			if realm == "global" {
-				if _, err := auth.BackfillRealmFor(a, "global"); err != nil {
-					mu.Lock()
-					skipped++
-					errs = append(errs, fmt.Sprintf("uid=%s: set realm failed: %v", uid, err))
-					mu.Unlock()
-					return
-				}
-			} else {
-				_, _ = a.BackfillRealm()
+		exists := p.importTargetExists(uid, filePath)
+		if exists && !overwrite {
+			res.Skipped++
+			res.Errors = append(res.Errors, fmt.Sprintf("uid=%s: already exists (set overwrite=true to replace)", safeImportUID(uid)))
+			continue
+		}
+		// 同一文件内重复 UID：默认保留第一条；overwrite 时后一条替换待写任务，
+		// 仍只产生一次写盘，避免并发写同一 auth 文件。
+		if idx, seen := jobsByUID[uid]; seen {
+			if !overwrite {
+				res.Skipped++
+				res.Errors = append(res.Errors, fmt.Sprintf("uid=%s: duplicate uid in import", safeImportUID(uid)))
+				continue
 			}
+			jobs[idx] = cockpitImportJob{a: a, uid: uid, realm: realm, overwrite: exists}
+			continue
+		}
+		jobsByUID[uid] = len(jobs)
+		jobs = append(jobs, cockpitImportJob{a: a, uid: uid, realm: realm, overwrite: exists})
+	}
+	if dryRun {
+		for _, j := range jobs {
+			if j.overwrite {
+				res.Updated++
+			} else {
+				res.Added++
+			}
+		}
+		return res
+	}
 
-			if err := a.SaveAtomic(); err != nil {
-				mu.Lock()
-				skipped++
-				errs = append(errs, fmt.Sprintf("uid=%s: save auth failed: %v", uid, err))
-				mu.Unlock()
+	if len(jobs) > 0 {
+		// runBackgroundBounded 会并发执行回调，共享结果必须由互斥锁保护：
+		// 否则多个成功/失败分支会丢计数，甚至并发 append 破坏 Errors 切片。
+		var mu sync.Mutex
+		if !p.runBackgroundBounded(3, len(jobs), func(k int) {
+			j := jobs[k]
+			err := saveAndActivateImportedAccount(p, j.a, j.realm, j.overwrite)
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				res.Skipped++
+				res.Errors = append(res.Errors, fmt.Sprintf("uid=%s: %s", safeImportUID(j.uid), err.Error()))
 				return
 			}
-
-			p.cfg.Pool.Add(a)
-			p.cfg.Pool.Revive(uid)
-
-			// 顺带签到/激活（幂等；失败仅记日志，不阻断导入）。
-			if realm == "global" {
-				if activated, err := p.cfg.Upstream.GlobalCompleteRegistration(a); err != nil {
-					log.Printf("panel: import global 注册激活 uid=%s: %v", uid, err)
-				} else if activated {
-					log.Printf("panel: import global 注册激活 uid=%s 完成", uid)
-				}
-				if claimed, err := p.cfg.Upstream.ClaimTrial(a); err != nil {
-					log.Printf("panel: import global trial uid=%s: %v", uid, err)
-				} else if claimed {
-					log.Printf("panel: import global trial uid=%s 已领", uid)
-				}
+			if j.overwrite {
+				res.Updated++
 			} else {
-				if err := p.cfg.Upstream.DailyCheckin(a); err != nil {
-					log.Printf("panel: import checkin uid=%s: %v", uid, err)
-				}
+				res.Added++
 			}
-			if rm, tt, err := p.cfg.Upstream.UserResource(a); err == nil {
-				p.cfg.Pool.ReenableIfCredits(uid, rm, tt)
+		}) {
+			for _, j := range jobs {
+				res.Skipped++
+				res.Errors = append(res.Errors, fmt.Sprintf("uid=%s: server shutting down", safeImportUID(j.uid)))
 			}
-
-			mu.Lock()
-			imported++
-			mu.Unlock()
-		}()
+		}
 	}
-	wg.Wait()
+	p.invalidateOverview()
+	return res
+}
 
-	total = len(accounts)
-	log.Printf("panel: cockpit import finished total=%d imported=%d skipped=%d", total, imported, skipped)
-	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":       true,
-		"total":    total,
-		"imported": imported,
-		"skipped":  skipped,
-		"errors":   errs,
-	})
+// saveAndActivateImportedAccount 写入单个已校验账号并完成入池后的幂等激活动作。
+// 返回的错误只含固定文案与 uid，不会把 auth.Auth 的 token 拼进响应。
+func saveAndActivateImportedAccount(p *Panel, a *auth.Auth, realm string, overwrite bool) error {
+	if realm == "global" {
+		if _, err := auth.BackfillRealmFor(a, "global"); err != nil {
+			return fmt.Errorf("set realm failed: %v", err)
+		}
+	} else {
+		_, _ = a.BackfillRealm()
+	}
+	if err := a.SaveAtomic(); err != nil {
+		return fmt.Errorf("save auth failed: %v", err)
+	}
+
+	p.cfg.Pool.Add(a)
+	// 新号一律解除人工禁用/暂停。覆盖已有凭证时，保留人工暂停/禁用决定，
+	// 但清掉旧凭证导致的自动禁用或限流冷却——否则用户用新 token 覆盖后仍
+	// 无法路由。人工禁用由面板固定缘由标识，不会被这里误复活。
+	if overwrite {
+		p.cfg.Pool.ReviveAfterCredentialReplacement(a.UID)
+	} else {
+		p.cfg.Pool.Revive(a.UID)
+	}
+
+	if p.cfg.Upstream != nil {
+		// 顺带签到/激活（幂等；失败仅记日志，不阻断导入）。
+		if realm == "global" {
+			if activated, err := p.cfg.Upstream.GlobalCompleteRegistration(a); err != nil {
+				log.Printf("panel: import global 注册激活 uid=%s: %v", logfmt.UID8(a.UID), err)
+			} else if activated {
+				log.Printf("panel: import global 注册激活 uid=%s 完成", logfmt.UID8(a.UID))
+			}
+			if claimed, err := p.cfg.Upstream.ClaimTrial(a); err != nil {
+				log.Printf("panel: import global trial uid=%s: %v", logfmt.UID8(a.UID), err)
+			} else if claimed {
+				log.Printf("panel: import global trial uid=%s 已领", logfmt.UID8(a.UID))
+			}
+		} else if err := p.cfg.Upstream.DailyCheckin(a); err != nil {
+			log.Printf("panel: import checkin uid=%s: %v", logfmt.UID8(a.UID), err)
+		}
+		if rm, tt, err := p.cfg.Upstream.UserResource(a); err == nil {
+			p.cfg.Pool.ReenableIfCredits(a.UID, rm, tt)
+		}
+	}
+	return nil
+}
+
+// importTargetExists 检查同一 UID 是否已有账号。池内存在即视为重复；同时检查
+// 目标 auth 文件，覆盖「文件已在但尚未热加载/已从池移除」的边界，避免静默覆盖。
+func (p *Panel) importTargetExists(uid, filePath string) bool {
+	if p.cfg.Pool != nil && p.cfg.Pool.AuthByUID(uid) != nil {
+		return true
+	}
+	if filePath == "" || p.cfg.AuthDir == "" {
+		return false
+	}
+	_, err := os.Stat(filePath)
+	return err == nil
+}
+
+func parseImportBool(values ...string) bool {
+	for _, v := range values {
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "1", "true", "yes", "on":
+			return true
+		}
+	}
+	return false
+}
+
+// safeImportID 只输出导入行自带的短 id，并剔除控制字符；缺失时用 "-"。
+// 这样错误响应可定位行，又不会把 token 等字段回显出去。
+func safeImportID(id string) string {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return "-"
+	}
+	if len(id) > 32 {
+		id = id[:32]
+	}
+	var b strings.Builder
+	for _, r := range id {
+		if r < 0x20 || r == 0x7f {
+			continue
+		}
+		b.WriteRune(r)
+	}
+	if b.Len() == 0 {
+		return "-"
+	}
+	return b.String()
+}
+
+// safeImportUID 在导入错误/日志中只暴露 uid 前 8 位，规则与运行日志一致。
+// 错误响应可能被浏览器缓存或转贴，不能回显完整账号标识。
+func safeImportUID(uid string) string {
+	return logfmt.UID8(strings.TrimSpace(uid))
 }
 
 // validImportUID 校验导入 uid 是否可用于拼文件名（同 login.go validUID 口径）。

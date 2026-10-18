@@ -11,14 +11,24 @@ package livecfg
 import (
 	"sync/atomic"
 	"time"
+
+	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
 )
 
 // Snapshot 一次读取的不可变配置视图。
 type Snapshot struct {
-	APIKey               string        // 网关/面板共同鉴权密钥；空 = 不鉴权
+	APIKey string // 顶层兼容密钥；空 = 该条目不参与鉴权
+	// Keys 是完整 keyring（含 legacy 条目）。APIKey 保留是为了旧调用方与
+	// 只读字段兼容；鉴权优先使用 Keys，Keys 为空时才回落到 APIKey。
+	Keys                 []httpauth.Key
 	SoftCooldown         time.Duration // 429 软冷却基数（<=0 时调用方回退内置默认）
 	SanitizeFingerprints bool          // 出站请求体指纹脱敏
 	RecordClientInfo     bool          // 请求日志是否记录调用来源（客户端 IP / UA）
+	// BackgroundModels 客户端后台任务模型重定向（空名单/空目标 = 关闭）。
+	// 与鉴权同一次快照读取，保存配置后无需重启；重定向发生在 Key 的模型白名单
+	// 校验之后，不会让受限 Key 通过别名访问白名单外的模型。
+	BackgroundModelNames  string
+	BackgroundModelTarget string
 }
 
 // Holder 原子持有当前快照。

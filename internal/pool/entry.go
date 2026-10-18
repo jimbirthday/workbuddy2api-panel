@@ -61,10 +61,17 @@ type TokenUsageDelta struct {
 
 // Status 单个账号对外暴露的状态（脱敏）。
 type Status struct {
-	UID          string `json:"uid"`
-	Nickname     string `json:"nickname,omitempty"`
-	Credits      int64  `json:"credits"`
-	CreditsTotal int64  `json:"credits_total,omitempty"` // 积分总额度（各套餐聚合）；0 = 未知（旧 state/查询失败）
+	UID      string `json:"uid"`
+	Nickname string `json:"nickname,omitempty"`
+	// Weight / Note 是手动调度权重（1 = 不干预）与面板备注：随凭证档持久化，
+	// 供面板展示与编辑。Note 纯展示，不参与任何选号判断。
+	Weight int    `json:"weight,omitempty"`
+	Note   string `json:"note,omitempty"`
+	// HasTokens 凭证完整度（accessToken + refreshToken 都有）：面板据此提示
+	// 只有半边凭证的账号，避免运维把「保活成功」误当成「可接单」。
+	HasTokens    bool  `json:"has_tokens"`
+	Credits      int64 `json:"credits"`
+	CreditsTotal int64 `json:"credits_total,omitempty"` // 积分总额度（各套餐聚合）；0 = 未知（旧 state/查询失败）
 	// CreditsExpiring / CreditsEarliestExpiry / CreditsEarliestRemaining 描述当前积分中
 	// 的到期压力。CreditsExpiring 是配置窗口内的剩余积分；后两者是全部未来到期批次中
 	// 最早的一批及其剩余量，供 WorkDaddy 同口径的“最早到期优先”路由使用。
@@ -200,9 +207,13 @@ type entry struct {
 	// 幂等拒绝（"今天已签到"）都算；statusOf 据此输出 CheckinDone 供面板按钮显示
 	// 签到/已签。持久化：跨重启不丢当日状态。
 	lastCheckinDay string
-	coolKind       CoolKind
-	until          time.Time // 冷却截止（即时冷却：CoolSoft 429 / CoolHard 余额耗尽）
-	disabled       bool
+	// weight / note 是手动调度权重与面板备注的内存镜像：auth 文件为权威源，
+	// state.json 仅作重启/Redis 恢复镜像；写入经 Pool.SetProfile，读取在 p.mu 下。
+	weight   int
+	note     string
+	coolKind CoolKind
+	until    time.Time // 冷却截止（即时冷却：CoolSoft 429 / CoolHard 余额耗尽）
+	disabled bool
 	// paused 暂停选号：与 disabled 正交。置位后退出选号候选（healthy 判否），
 	// 但保号任务遍历只按 Disabled 过滤，故 paused 号天然继续参与签到 / 活跃上报 /
 	// 保活 / 余额刷新。持久化（state.json），跨重启不丢。
@@ -419,6 +430,14 @@ func (e *entry) fallbackKind(now time.Time) string {
 	return "soft"
 }
 
+// ManualWeight 返回手动调度权重（1 = 不干预）。调用方必须已持 p.mu。
+func (e *entry) manualWeight() int {
+	if e.weight <= 0 {
+		return 1
+	}
+	return e.weight
+}
+
 // stateAccount 单个账号的持久化状态（JSON tag 全小写下划线，向后兼容：缺字段零值）。
 type stateAccount struct {
 	Credits      int64     `json:"credits"`
@@ -476,6 +495,22 @@ type stateAccount struct {
 	// 重新付学费探测。落盘/恢复均按 modelCostTTL 惰性过滤（6h 外不写不恢复——
 	// 陈旧价格不复活）；恢复侧剔除非法值（负 per1k/零 LastSeen 的结构破损条目）。
 	ModelCosts map[string]stateModelCost `json:"model_costs,omitempty"`
+	// Weight / Note 是手动调度权重与面板备注的内存镜像（auth 文件才是权威源）。
+	// 落盘 state.json 让重启后、auth 尚未重新加载的窗口内面板仍能展示，且与
+	// Redis 快照恢复保持一致；非 0/非空才写，避免污染旧文件。
+	Weight int    `json:"weight,omitempty"`
+	Note   string `json:"note,omitempty"`
+}
+
+// stateWeight 把持久化权重收敛到 [1,100]；0/脏值回落 1（不干预）。
+func stateWeight(w int) int {
+	if w < 1 {
+		return 1
+	}
+	if w > 100 {
+		return 100
+	}
+	return w
 }
 
 // stateModelCooldown 单个 (账号, 模型) 的模型级独立冷却持久化记录，与运行态

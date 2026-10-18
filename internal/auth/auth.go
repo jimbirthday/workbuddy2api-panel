@@ -38,6 +38,14 @@ type Auth struct {
 	Nickname     string
 	FilePath     string // 来源文件；refresh 后原子写回此处
 
+	// Weight 手动调度权重（1-100，1 = 不干预）。与 hub 语义一致：>1 的账号优先
+	// 接单，多个高权重按权重比分流；落盘在 auth 文件的 weight 键，导出/导入照常
+	// 携带。非法/越界值在 Parse 时收敛到 [1,100]，坏数据不会让账号加载失败。
+	Weight int `json:"-"`
+	// Note 账号备注（面板自填的「批量」「自用」等标记）。纯展示，不参与任何
+	// 路由判断；随凭证档持久化，重启后保留。超长截断到 200 字符。
+	Note string `json:"-"`
+
 	// DeviceToken 设备风控 Token（X-Device-Token 头），来源 auth 文件的 device_token 键。
 	// 缺省为空 = 不注入该头（容器内无桌面端 Turing SDK 的常见部署）。
 	// 手写扁平形 auth 文件可直接写 "device_token": "..."；插件 OAuth 嵌套形
@@ -209,6 +217,47 @@ func (a *Auth) IsGlobal() bool { return a.Realm() == "global" }
 // 无需加锁——Realm() 加锁是因为 realm/Domain 会被 RefreshToken 在锁内改写。
 func (a *Auth) IsEnterprise() bool { return strings.TrimSpace(a.EnterpriseID) != "" }
 
+// WeightValue 返回归一化后的手动调度权重：1 = 不干预，2-100 = 更高优先级。
+func (a *Auth) WeightValue() int { return normalizeWeight(a.Weight) }
+
+// SetWeight 设置手动调度权重（1-100），越界值收敛而非报错。
+func (a *Auth) SetWeight(weight int) { a.Weight = normalizeWeight(weight) }
+
+// SetNote 设置账号备注（纯展示，截断到 200 字符）。
+func (a *Auth) SetNote(note string) { a.Note = normalizeNote(note) }
+
+// ProfileSnapshot 返回面板展示需要的账号资料快照（weight/note + 持久化标签）。
+// 读取 weight/note 也走 a.mu：SetProfile 会在锁内改写它们，避免数据竞争。
+func (a *Auth) ProfileSnapshot() (weight int, note, nickname, realm string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return normalizeWeight(a.Weight), a.Note, a.Nickname, a.realmLocked()
+}
+
+// normalizeWeight 把任意权重收敛到 [1,100]；0/负数/异常值回落 1（不干预）。
+func normalizeWeight(w int) int {
+	if w < 1 {
+		return 1
+	}
+	if w > 100 {
+		return 100
+	}
+	return w
+}
+
+// normalizeNote 去首尾空白并截断到 200 字符（按 rune，避免切坏中文）。
+func normalizeNote(note string) string {
+	note = strings.TrimSpace(note)
+	if len(note) <= 200 {
+		return note
+	}
+	r := []rune(note)
+	if len(r) > 200 {
+		r = r[:200]
+	}
+	return string(r)
+}
+
 // isGlobalDomain 判定 domain 是否指向 www.workbuddy.ai 家族。
 // 同时接受裸域 workbuddy.ai 与任意子域（HasSuffix("www.workbuddy.ai") 或裸域本身）。
 func isGlobalDomain(d string) bool {
@@ -252,6 +301,8 @@ func Parse(raw []byte) (*Auth, error) {
 				UID          string `json:"uid"`
 				EnterpriseID string `json:"enterpriseId"`
 				Nickname     string `json:"nickname"`
+				Weight       int    `json:"weight"`
+				Note         string `json:"note"`
 			} `json:"account"`
 			// DeviceToken 顶层 device_token（嵌套形与扁平形共用；手写时无需嵌进 auth 对象）。
 			DeviceToken string `json:"device_token"`
@@ -269,6 +320,8 @@ func Parse(raw []byte) (*Auth, error) {
 			EnterpriseID: n.Account.EnterpriseID,
 			Nickname:     n.Account.Nickname,
 			DeviceToken:  n.DeviceToken,
+			Weight:       normalizeWeight(n.Account.Weight),
+			Note:         normalizeNote(n.Account.Note),
 		}
 	} else {
 		var f struct {
@@ -281,6 +334,8 @@ func Parse(raw []byte) (*Auth, error) {
 			EnterpriseID string `json:"enterpriseId"`
 			Nickname     string `json:"nickname"`
 			DeviceToken  string `json:"device_token"`
+			Weight       int    `json:"weight"`
+			Note         string `json:"note"`
 		}
 		if err := json.Unmarshal(raw, &f); err != nil {
 			return nil, fmt.Errorf("storage_parse_error: %w", err)
@@ -295,6 +350,8 @@ func Parse(raw []byte) (*Auth, error) {
 			EnterpriseID: f.EnterpriseID,
 			Nickname:     f.Nickname,
 			DeviceToken:  f.DeviceToken,
+			Weight:       normalizeWeight(f.Weight),
+			Note:         normalizeNote(f.Note),
 		}
 	}
 	if strings.TrimSpace(a.AccessToken) == "" {
@@ -309,6 +366,13 @@ func Parse(raw []byte) (*Auth, error) {
 func (a *Auth) SaveAtomic() error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	return a.saveLocked()
+}
+
+// saveLocked 是 SaveAtomic 的持锁主体。调用方必须已持有 a.mu；新增的
+// SetProfile 需要「改字段 + 立即落盘」在同一把锁里完成，避免与 RefreshToken
+// 并发时把半更新状态写回。
+func (a *Auth) saveLocked() error {
 	if strings.TrimSpace(a.AccessToken) == "" {
 		return fmt.Errorf("save refused: empty accessToken (uid=%s)", a.UID)
 	}
@@ -327,6 +391,8 @@ func (a *Auth) SaveAtomic() error {
 			"uid":          a.UID,
 			"enterpriseId": a.EnterpriseID,
 			"nickname":     a.Nickname,
+			"weight":       normalizeWeight(a.Weight),
+			"note":         normalizeNote(a.Note),
 		},
 	}
 	// DeviceToken 非空才写回顶层 device_token：避免在无该字段的旧文件里引入空键
@@ -352,6 +418,38 @@ func (a *Auth) SaveAtomic() error {
 		return errors.New(msg)
 	}
 	return os.Rename(tmp, a.FilePath)
+}
+
+// SetProfile 原子更新面板可编辑的账号资料（nil 表示该字段不变）并落盘。
+// 只允许改 weight/note：这两个字段不参与鉴权，但必须与 token 刷新共用 a.mu，
+// 否则 refresh 写回时可能用旧值覆盖刚保存的备注/权重。
+func (a *Auth) SetProfile(weight *int, note *string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if weight != nil {
+		a.Weight = normalizeWeight(*weight)
+	}
+	if note != nil {
+		a.Note = normalizeNote(*note)
+	}
+	return a.saveLocked()
+}
+
+// NormalizeProfileInput 返回面板写入前应采用的 weight/note 规范值。SetProfile
+// 在池镜像与 auth 文件中必须使用同一规则：仅 TrimSpace 会让 state.json/概览
+// 短暂保存超长备注，而 auth 文件与 UI 已按 200 字符截断。
+func NormalizeProfileInput(weight *int, note *string) (*int, *string) {
+	var w *int
+	if weight != nil {
+		v := normalizeWeight(*weight)
+		w = &v
+	}
+	var n *string
+	if note != nil {
+		v := normalizeNote(*note)
+		n = &v
+	}
+	return w, n
 }
 
 // LoadDir 扫描并解析 dir 下 workbuddy*.json；解析失败的文件静默跳过（启动日志由调用方统计）。

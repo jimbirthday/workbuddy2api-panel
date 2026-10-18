@@ -9,8 +9,16 @@
 package panel
 
 import (
-	_ "embed"
+	"bytes"
+	"compress/gzip"
+	"crypto/sha256"
+	"encoding/hex"
+	"hash/fnv"
 	"net/http"
+	"strconv"
+	"strings"
+
+	_ "embed"
 )
 
 //go:embed index.html
@@ -18,6 +26,116 @@ var indexHTML []byte
 
 //go:embed app.js
 var appJS []byte
+
+// staticETag 为嵌入资源生成强 ETag（内容哈希）：升级后内容变化即失效，无需
+// 手工维护版本号；同一二进制内重复请求直接走 304，省掉整份 app.js 传输。
+func staticETag(b []byte) string {
+	sum := sha256.Sum256(b)
+	return `"` + hex.EncodeToString(sum[:12]) + `"`
+}
+
+var (
+	indexETag = staticETag(indexHTML)
+	appETag   = staticETag(appJS)
+	// 预压缩一次、常驻进程：面板 JS 约 280 KB，压缩后通常 <70 KB。请求热路径
+	// 只写内存字节，不做每请求压缩。压缩失败时回落原文（例如极小/不可压缩体）。
+	indexGzip = gzipStatic(indexHTML)
+	appGzip   = gzipStatic(appJS)
+)
+
+// gzipStatic 预压缩嵌入资源；失败返回 nil，serveStatic 回落未压缩原文。
+func gzipStatic(body []byte) []byte {
+	var buf bytes.Buffer
+	zw, err := gzip.NewWriterLevel(&buf, gzip.BestSpeed)
+	if err != nil {
+		return nil
+	}
+	if _, err := zw.Write(body); err != nil {
+		return nil
+	}
+	if err := zw.Close(); err != nil {
+		return nil
+	}
+	return buf.Bytes()
+}
+
+// serveStatic 输出嵌入的静态资源并支持条件 GET。面板页面本身不含秘密，但
+// 仍使用 no-cache + ETag：浏览器每次先校验，命中 304 时只回响应头，既不会
+// 在升级后继续跑旧脚本，也避免重复下载数百 KB 的前端代码。
+func serveStatic(w http.ResponseWriter, r *http.Request, contentType, etag string, body, gzipped []byte) {
+	h := w.Header()
+	responseETag := etag
+	if len(gzipped) > 0 && acceptsGzip(r.Header.Get("Accept-Encoding")) {
+		responseETag = gzipETag(etag)
+	}
+	h.Set("ETag", responseETag)
+	h.Set("Cache-Control", "no-cache")
+	// 同一 ETag 对应两种编码。Vary 只在实际返回压缩体时写入（见下方），
+	// 避免未压缩响应被 Vary 过宽导致中间缓存放弃存储。
+	if match := r.Header.Get("If-None-Match"); match != "" && etagMatches(match, responseETag) {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+	payload := body
+	if len(gzipped) > 0 && acceptsGzip(r.Header.Get("Accept-Encoding")) {
+		payload = gzipped
+		h.Set("Content-Encoding", "gzip")
+	}
+	h.Set("Content-Type", contentType)
+	h.Set("Content-Length", strconv.Itoa(len(payload)))
+	// Vary 按本次实际协商结果再收窄：Accept-Encoding: gzip 必然拿到压缩体，
+	// 不应与未压缩表示共用缓存键；不支持压缩的客户端直接取原文，避免中间缓存
+	// 因 Vary 过宽而放弃缓存。
+	if _, compressed := h["Content-Encoding"]; compressed {
+		h.Set("Vary", "Accept-Encoding")
+	}
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(payload)
+}
+
+// gzipETag 为压缩表示派生独立强 ETag（保留弱比较前缀 W/ 语义：输出始终是
+// 裸引号标签，与未压缩版本不同）。fnv-1a 足以派生稳定短标签，不参与内容校验。
+func gzipETag(etag string) string {
+	hsh := fnv.New64a()
+	_, _ = hsh.Write([]byte(etag))
+	return `"` + hex.EncodeToString(hsh.Sum(nil)) + `-gzip"`
+}
+
+// acceptsGzip 判断 Accept-Encoding 是否允许 gzip。支持 q=0 拒绝语义。
+func acceptsGzip(header string) bool {
+	for _, part := range strings.Split(header, ",") {
+		fields := strings.Split(strings.TrimSpace(part), ";")
+		if !strings.EqualFold(strings.TrimSpace(fields[0]), "gzip") {
+			continue
+		}
+		for _, p := range fields[1:] {
+			p = strings.TrimSpace(p)
+			if strings.HasPrefix(p, "q=") {
+				if q := strings.TrimSpace(strings.TrimPrefix(p, "q=")); q == "0" || q == "0.0" || q == "0.00" || q == "0.000" {
+					return false
+				}
+			}
+		}
+		return true
+	}
+	return false
+}
+
+// etagMatches 按 RFC 7232 处理 If-None-Match：支持逗号分隔的多个候选与
+// 弱比较前缀 W/；"*" 表示任意当前表示都匹配。
+func etagMatches(header, etag string) bool {
+	for _, part := range strings.Split(header, ",") {
+		candidate := strings.TrimSpace(part)
+		if candidate == "*" {
+			return true
+		}
+		candidate = strings.TrimPrefix(candidate, "W/")
+		if candidate == etag {
+			return true
+		}
+	}
+	return false
+}
 
 // csp 内容安全策略（严格版，无需 unsafe-inline）：
 //   - default-src 'none'        默认全禁，逐个开口
@@ -47,15 +165,11 @@ func setSecurityHeaders(w http.ResponseWriter) {
 // index 输出面板页面（静态无秘密；数据接口 /panel/api/* 才走鉴权）。
 func (p *Panel) index(w http.ResponseWriter, r *http.Request) {
 	setSecurityHeaders(w)
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(indexHTML)
+	serveStatic(w, r, "text/html; charset=utf-8", indexETag, indexHTML, indexGzip)
 }
 
 // appScript 输出前端逻辑（同源脚本，供 CSP script-src 'self' 加载）。
 func (p *Panel) appScript(w http.ResponseWriter, r *http.Request) {
 	setSecurityHeaders(w)
-	w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(appJS)
+	serveStatic(w, r, "text/javascript; charset=utf-8", appETag, appJS, appGzip)
 }

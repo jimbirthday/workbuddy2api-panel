@@ -14,9 +14,12 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
+	"github.com/linguo2625469/workbuddy2api-panel/internal/activity"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/panel"
@@ -32,6 +35,9 @@ import (
 
 // appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
 const appVersion = "1.13.0-panel"
+
+// exitCode 由 main 的异常路径设置；main 结束时统一退出，确保 defer 清理先执行。
+var exitCode atomic.Int32
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
@@ -101,6 +107,7 @@ func main() {
 	p.SetSoftRateMax(cfg.SoftRateMaxDur)                 // 软冷却指数退避封顶（soft_rate_max，默认 2h）
 	p.SetCostExploreInterval(cfg.CostExploreIntervalDur) // costTier 探索窗口（issue #136，默认 30m；0 关停）
 	p.SetCreditFloor(cfg.Pool.CreditFloor)               // 积分保底（默认 0 = 关闭）
+	p.SetDailyLimits(cfg.Pool.DailyTokenLimit, cfg.Pool.ModelDailyTokenLimit)
 	p.SetWeights(cfg.Pool.IdleWeightPerHour, cfg.Pool.IdleWeightMax)
 	p.SetPreferExpiring(cfg.Pool.PreferExpiring)
 
@@ -119,6 +126,14 @@ func main() {
 			// realm 感知闭包：带前缀模型名按 realm 过滤可用账号（跨 realm 不泄漏）；
 			// 裸名走 cn（现状零回归）。闭包内部 resolveModel 剥前缀，再按 realm 过滤。
 			AvailableForModel: realmAwareAvailableForModel(p),
+			// 快路径只校验绑定号本身，避免每次粘性命中重建整池候选列表（470 号
+			// 生产形态约 50µs/16KB；单账号判定为 O(1) 读锁）。
+			// 注意参数顺序：session.CanRoute 是 (model, realm, uid)，pool 方法是
+			// (uid, model, realm)。直接赋值三个 string 参数也能编译，但会在运行时
+			// 把模型名当 uid、把 realm 当模型；必须用显式闭包适配。
+			CanRoute: func(model, realm, uid string) bool {
+				return p.UIDAvailableForModel(uid, model, realm)
+			},
 		})
 		sessRouter.LoadFromStore() // 启动时从 Redis 恢复粘性（读操作仅此处）
 		sessRouter.StartGC()
@@ -170,6 +185,13 @@ func main() {
 	// 回落仓库内嵌种子；models.dev 按需拉取成功后原子写回。
 	upstream.SetModelCatalogPath(stateSibling(cfg.StateFile, "model.json"))
 
+	// 活动历史与 state 同目录：随 state_file 配置一起搬移；不参与任何路由。
+	activityStore := activity.New(activity.Config{
+		Path:     stateSibling(cfg.StateFile, activity.FileName()),
+		MaxBytes: 16 << 20,
+		Async:    true,
+	})
+
 	sch := scheduler.New(scheduler.Config{
 		Pool:           p,
 		Upstream:       up,
@@ -187,6 +209,7 @@ func main() {
 		KeepaliveDisabled:  !cfg.Schedule.KeepaliveEnabled,
 		BlackcatDisabled:   !cfg.Schedule.BlackcatEnabled,
 		GrowthDisabled:     !cfg.Schedule.GrowthEnabled,
+		Activity:           activityStore,
 		// 保号类四任务是否覆盖禁用账号（缺省 false = 禁用即跳过，保持既有行为）。
 		IncludeDisabledInTasks: cfg.Schedule.IncludeDisabledInTasks,
 	})
@@ -233,10 +256,13 @@ func main() {
 	// 面板环形缓冲，供 /panel/api/logs 读取；控制台输出行为完全不变。
 	// live 承载可热改字段（api_key/soft_rate/脱敏开关），面板保存配置时在线替换。
 	live := livecfg.New(livecfg.Snapshot{
-		APIKey:               cfg.APIKey,
-		SoftCooldown:         cfg.SoftRateDur,
-		SanitizeFingerprints: cfg.Features.SanitizeBlacklistFingerprints,
-		RecordClientInfo:     cfg.Logging.RequestClientInfo,
+		APIKey:                cfg.APIKey,
+		Keys:                  cfg.keyring(),
+		SoftCooldown:          cfg.SoftRateDur,
+		SanitizeFingerprints:  cfg.Features.SanitizeBlacklistFingerprints,
+		RecordClientInfo:      cfg.Logging.RequestClientInfo,
+		BackgroundModelNames:  cfg.BackgroundModels.Names,
+		BackgroundModelTarget: cfg.BackgroundModels.Target,
 	})
 	// 用量记录器：与 state 文件同目录，随 state_file 配置一起搬移。
 	// datapath 由 state 文件路径推出，避免再加一个配置项。
@@ -244,6 +270,9 @@ func main() {
 	rec := usage.New(usagePath)
 	rec.Start()
 	defer rec.Stop()
+	// 日额度计数直接复用 Recorder 的只读聚合；它在锁外调用并带 1s 快照缓存，
+	// 不会把请求热路径拖进用量分片锁。
+	p.SetDailyTokenUsageProvider(rec)
 	log.Printf("[usage] 逐请求用量记录已启用: %s (%s)", usagePath, rec.Describe())
 
 	// 请求指标始终启用；JSONL 归档只写脱敏元数据，写盘失败不影响聊天请求。
@@ -265,6 +294,7 @@ func main() {
 	pn := panel.New(panel.Config{
 		Pool:        p,
 		Usage:       rec,
+		Activity:    activityStore,
 		RequestLog:  requestLog,
 		Upstream:    up,
 		Scheduler:   sch,
@@ -314,7 +344,11 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	go sch.Run(ctx)
+	// 调度器与后台批量任务也纳入停机等待：否则 activityStore.Close 可能在最后一笔
+	// 签到/保活 append 之前执行，记录被静默丢弃。顺序：停 HTTP → 等调度/批量 →
+	// 关活动队列（排空）→ 其它 defer。
+	var schedDone = make(chan struct{})
+	go func() { defer close(schedDone); sch.Run(ctx) }()
 	sch.StartBalanceRefresh(ctx, cfg.BalanceRefreshInterval)
 
 	// 启动即预热模型积分倍率表：倍率只在 FetchModels/FetchGlobalModelInfos 成功时
@@ -340,19 +374,59 @@ func main() {
 		// （长流式生成合法时长可达数分钟，全局 WriteTimeout 会误杀在途 SSE）。
 		IdleTimeout: 120 * time.Second,
 	}
+
+	// 服务退出统一走同一个清理流程：信号触发与 ListenAndServe 致命错误都必须
+	// 等 HTTP/调度器/面板后台任务退出后再关活动写队列，最后由 defer 完成 pool、
+	// usage、request-log 落盘。不能在这两条路径上 log.Fatalf，否则 defer 全被跳过。
+	var shutdownOnce sync.Once
+	// shutdownDone 让主 goroutine 在 ListenAndServe 返回后仍等待信号路径的
+	// 完整清理（面板后台任务、调度器、活动写队列）。否则 main 可能先返回，
+	// 与 defer 的 pool/usage/request-log 落盘并发，造成退出时状态竞争。
+	shutdownDone := make(chan struct{})
+	shutdown := func(reason string) {
+		shutdownOnce.Do(func() {
+			defer close(shutdownDone)
+			if reason != "" {
+				log.Printf("shutdown: %s", reason)
+			}
+			stop()
+			p.Flush()
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := srv.Shutdown(shutdownCtx); err != nil {
+				log.Printf("shutdown: %v（强制关闭剩余连接）", err)
+				_ = srv.Close()
+			}
+			pn.StopWaiting()
+			<-schedDone
+			sch.WaitBatches()
+			sch.WaitBalanceRefresh()
+			if err := activityStore.Close(); err != nil {
+				log.Printf("activity history close: %v", err)
+			}
+		})
+	}
 	go func() {
 		<-ctx.Done()
-		p.Flush() // 信号触发：先落盘再做优雅停机
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = srv.Shutdown(shutdownCtx)
+		shutdown("")
 	}()
 
 	log.Printf("workbuddy2api listening on %s (api_key=%v)，管理面板 http://127.0.0.1%s/panel/", cfg.Listen, cfg.APIKey != "", panelListenPath(cfg.Listen))
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Fatalf("http: %v", err)
+		// 端口占用等致命错误：先停服并完成统一清理，再以非零状态退出。
+		// 直接 log.Fatalf 会跳过 pool/usage/request-log 的 defer 落盘。
+		shutdown("http: " + err.Error())
+		log.Printf("http: %v", err)
+		exitCode.Store(1)
+		return
 	}
+	// context 取消（signal.NotifyContext）先触发 shutdown；ListenAndServe 因
+	// Shutdown 返回后，这里必须等清理完成再离开 main，不能与 defer 竞争。
+	<-shutdownDone
 	log.Printf("bye")
+	if code := exitCode.Load(); code != 0 {
+		os.Exit(int(code))
+	}
 }
 
 // warmModelRates 启动预热各域模型积分倍率表（供积分保底的目录兜底判定）。
@@ -480,10 +554,13 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 
 	// 4) 热应用：能立即生效的字段全部应用，并列出仍需重启的字段。
 	live.Store(livecfg.Snapshot{
-		APIKey:               newCfg.APIKey,
-		SoftCooldown:         newCfg.SoftRateDur,
-		SanitizeFingerprints: newCfg.Features.SanitizeBlacklistFingerprints,
-		RecordClientInfo:     newCfg.Logging.RequestClientInfo,
+		APIKey:                newCfg.APIKey,
+		Keys:                  newCfg.keyring(),
+		SoftCooldown:          newCfg.SoftRateDur,
+		SanitizeFingerprints:  newCfg.Features.SanitizeBlacklistFingerprints,
+		RecordClientInfo:      newCfg.Logging.RequestClientInfo,
+		BackgroundModelNames:  newCfg.BackgroundModels.Names,
+		BackgroundModelTarget: newCfg.BackgroundModels.Target,
 	})
 	up.SanitizeFingerprints.Store(newCfg.Features.SanitizeBlacklistFingerprints)
 	p.SetBreaker(newCfg.Pool.BreakerThreshold, newCfg.BreakerCooldownDur, newCfg.BreakerCooldownMaxD)
@@ -493,6 +570,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	p.SetSoftRateMax(newCfg.SoftRateMaxDur)
 	p.SetCostExploreInterval(newCfg.CostExploreIntervalDur) // costTier 探索窗口热生效（0 关停）
 	p.SetCreditFloor(newCfg.Pool.CreditFloor)               // 积分保底热生效（0 = 关闭）
+	p.SetDailyLimits(newCfg.Pool.DailyTokenLimit, newCfg.Pool.ModelDailyTokenLimit)
 	p.SetWeights(newCfg.Pool.IdleWeightPerHour, newCfg.Pool.IdleWeightMax)
 	p.SetPreferExpiring(newCfg.Pool.PreferExpiring)
 	sch.SetExpiringSoonWindow(newCfg.ExpiringSoonDur)

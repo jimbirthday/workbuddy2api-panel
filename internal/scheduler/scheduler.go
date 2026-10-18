@@ -7,10 +7,12 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/linguo2625469/workbuddy2api-panel/internal/activity"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
@@ -61,6 +63,13 @@ type Config struct {
 	// 待办并执行，与面板「执行全部待办」按钮同管线）。调度器只管时点不管实现——
 	// panel 在 scheduler 之后构造，用 SetGrowthHook 事后挂载；nil 时到点跳过。
 	GrowthHook func()
+
+	// ActivityPath 账号每日活动历史 JSONL 路径（可选）。为空且 Activity 为 nil 时
+	// 埋点整体关闭，不影响任何任务行为。构造时注入，调度器内部只追加、不读。
+	ActivityPath string
+	// Activity 可选的高级覆盖（测试/外部已有 Store 时直接注入）。nil 且
+	// ActivityPath 非空时 New 会按路径构造。写失败一律静默，不反噬主任务。
+	Activity *activity.Store
 }
 
 // Scheduler 调度器。
@@ -89,10 +98,17 @@ type Scheduler struct {
 	// 键为稳定的 kind 字符串（checkin/travel/activity/keepalive/blackcat）。
 	batchMu      sync.Mutex
 	batchRunning map[string]bool
+	batchWG      sync.WaitGroup
+	// refreshWG 跟踪余额刷新 ticker（含进行中的一轮）。停机时先等它退出，
+	// 再关闭下游活动历史/用量存储。
+	refreshWG sync.WaitGroup
 }
 
 // New 构建。
 func New(cfg Config) *Scheduler {
+	if cfg.Activity == nil && strings.TrimSpace(cfg.ActivityPath) != "" {
+		cfg.Activity = activity.New(activity.Config{Path: cfg.ActivityPath})
+	}
 	if len(cfg.CheckinHours) == 0 {
 		cfg.CheckinHours = []int{9, 21}
 	}
@@ -409,13 +425,13 @@ func (s *Scheduler) runBatch(ctx context.Context, kinds []taskKind) {
 			defer wg.Done()
 			switch k {
 			case taskCheckin:
-				s.tryRunBatchKind("checkin", s.RunCheckinNow)
+				s.tryRunBatchKind("checkin", func() { s.runCheckin(activity.TriggerSchedule) })
 			case taskTravel:
-				s.tryRunBatchKind("travel", s.RunTravelNow)
+				s.tryRunBatchKind("travel", func() { s.runTravel(activity.TriggerSchedule) })
 			case taskActivity:
-				s.tryRunBatchKind("activity", func() { s.runActivity(ctx) })
+				s.tryRunBatchKind("activity", func() { s.runActivity(ctx, activity.TriggerSchedule) })
 			case taskKeepalive:
-				s.tryRunBatchKind("keepalive", s.RunKeepaliveNow)
+				s.tryRunBatchKind("keepalive", func() { s.runKeepalive(activity.TriggerSchedule) })
 			case taskBlackcat:
 				s.tryRunBatchKind("blackcat", s.RunBlackcatNow)
 			case taskGrowth:
@@ -440,11 +456,19 @@ func (s *Scheduler) TryRunBatch(kind string, fn func()) bool {
 	if !s.beginBatchKind(kind) {
 		return false
 	}
+	s.batchWG.Add(1)
 	go func() {
+		defer s.batchWG.Done()
 		defer s.endBatchKind(kind)
 		fn()
 	}()
 	return true
+}
+
+// WaitBatches 等待所有通过 TryRunBatch 启动的后台批量任务结束（含签到/旅行/
+// 活跃/保活/余额）。仅供停机排空使用；定时 runBatch 本身是同步等待，不在其内。
+func (s *Scheduler) WaitBatches() {
+	s.batchWG.Wait()
 }
 
 // tryRunBatchKind 定时路径的同步变体：在**当前 goroutine** 内申请并执行，
@@ -494,6 +518,23 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 	}
 }
 
+// recordActivity 写一条账号活动历史。它是纯观测旁路：nil Store、写失败都静默，
+// 绝不改变签到/活跃/旅行/保活任一任务的返回值、日志或上游调用次序。
+func (s *Scheduler) recordActivity(a *auth.Auth, task activity.Task, trigger activity.Trigger, ok bool, message string) {
+	if s == nil || s.cfg.Activity == nil || a == nil {
+		return
+	}
+	_ = s.cfg.Activity.Append(activity.Record{
+		UID:      a.UID,
+		Nickname: a.Nickname,
+		Realm:    a.Realm(),
+		Task:     task,
+		Trigger:  trigger,
+		OK:       ok,
+		Message:  message,
+	})
+}
+
 // RunCheckinNow 立即对所有账号执行签到 + 余额刷新 + 解冻。
 // 冷却中的账号也参与（签到就是为了解冻它们）；禁用账号默认跳过——
 // 若 schedule.include_disabled_in_tasks 打开则一并执行（禁用只关选号，不停保号）。
@@ -501,13 +542,17 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 // 末尾追加连登管家（streak.go）：可兑换档位自动兑换 + 抽奖次数自动抽完——
 // 连登兑换按天数解锁，挂在每日签到后即「到天数那天自动完成兑换→抽奖闭环」。
 func (s *Scheduler) RunCheckinNow() {
+	s.runCheckin(activity.TriggerManual)
+}
+
+func (s *Scheduler) runCheckin(trigger activity.Trigger) {
 	expiringSoon := s.ExpiringSoonWindow()
 	includeDisabled := s.includeDisabledInTasks()
-	for _, st := range s.cfg.Pool.List() {
-		if st.Disabled && !includeDisabled {
-			continue
-		}
-		a := s.cfg.Pool.AuthByUID(st.UID)
+	// TaskAccounts 在一次读锁内取 UID/凭证，不再为每个账号构建完整 Status
+	//（成本台账、模型限流行、冷却剩余秒等）。调度任务只需要凭证与少量判定字段，
+	// 470 账号时 List+AuthByUID 的整表投影与 N 次加锁都是固定浪费。
+	for _, acct := range s.cfg.Pool.TaskAccounts(includeDisabled) {
+		uid, a := acct.UID, acct.Auth
 		if a == nil || a.RefreshTokenValue() == "" {
 			continue
 		}
@@ -525,27 +570,30 @@ func (s *Scheduler) RunCheckinNow() {
 			if err := s.cfg.Upstream.DailyCheckin(a); err != nil {
 				// "今天已签到"是幂等成功（上游对重复签到返回 code!=0），不再当失败打 error 行。
 				if upstream.IsAlreadyCheckin(err) {
-					s.cfg.Pool.NoteCheckinDone(st.UID)
-					log.Printf("checkin %s: 今天已签到（幂等）", logfmt.Label(st.UID, st.Nickname))
+					s.cfg.Pool.NoteCheckinDone(uid)
+					log.Printf("checkin %s: 今天已签到（幂等）", logfmt.Label(uid, a.Nickname))
+					s.recordActivity(a, activity.TaskCheckin, trigger, true, "今天已签到（幂等）")
 				} else {
-					log.Printf("checkin %s: %v", logfmt.Label(st.UID, st.Nickname), err)
+					log.Printf("checkin %s: %v", logfmt.Label(uid, a.Nickname), err)
+					s.recordActivity(a, activity.TaskCheckin, trigger, false, err.Error())
 				}
 				// 其余业务错误也继续走余额查询
 			} else {
 				// 首次签到成功此前静默——排查「签到到底跑没跑」时无迹可循（幂等行只在
 				// 重复触发时出现），成功也落一行。
-				s.cfg.Pool.NoteCheckinDone(st.UID)
-				log.Printf("checkin %s: 签到成功", logfmt.Label(st.UID, st.Nickname))
+				s.cfg.Pool.NoteCheckinDone(uid)
+				log.Printf("checkin %s: 签到成功", logfmt.Label(uid, a.Nickname))
+				s.recordActivity(a, activity.TaskCheckin, trigger, true, "签到成功")
 			}
 		}
 		// 分桶查余额：配置窗口内的积分单独标记，同时记录最早未来到期批次。
 		remain, total, expiring, earliestAt, earliestRemaining, err := s.cfg.Upstream.UserResourceDetailedWithExpiry(a, expiringSoon)
 		if err != nil {
-			log.Printf("user-resource %s: %v", logfmt.Label(st.UID, st.Nickname), err)
+			log.Printf("user-resource %s: %v", logfmt.Label(uid, a.Nickname), err)
 			continue
 		}
-		s.cfg.Pool.ReenableIfCredits(st.UID, remain, total)
-		s.cfg.Pool.SetCreditsDetailed(st.UID, remain, total, expiring, earliestAt, earliestRemaining)
+		s.cfg.Pool.ReenableIfCredits(uid, remain, total)
+		s.cfg.Pool.SetCreditsDetailed(uid, remain, total, expiring, earliestAt, earliestRemaining)
 	}
 	s.RunStreakBonusNow()
 }
@@ -560,18 +608,15 @@ func (s *Scheduler) RunCheckinNow() {
 // RunActivityNow 是无 ctx 的外部入口（面板/测试一次性触发）；排程主循环走
 // runActivity（ctx 取消时立即放弃剩余账号，不等限速睡满）。
 func (s *Scheduler) RunActivityNow() {
-	s.runActivity(context.Background())
+	s.runActivity(context.Background(), activity.TriggerManual)
 }
 
 // runActivity 活跃上报遍历，随 ctx 取消立即退出。
-func (s *Scheduler) runActivity(ctx context.Context) {
+func (s *Scheduler) runActivity(ctx context.Context, trigger activity.Trigger) {
 	first := true
 	includeDisabled := s.includeDisabledInTasks()
-	for _, st := range s.cfg.Pool.List() {
-		if st.Disabled && !includeDisabled {
-			continue
-		}
-		a := s.cfg.Pool.AuthByUID(st.UID)
+	for _, acct := range s.cfg.Pool.TaskAccounts(includeDisabled) {
+		a := acct.Auth
 		if a == nil || a.AccessTokenValue() == "" {
 			continue
 		}
@@ -596,9 +641,11 @@ func (s *Scheduler) runActivity(ctx context.Context) {
 		cid := fmt.Sprintf("wb2api-%d", time.Now().UnixMilli())
 		if err := s.cfg.Upstream.ReportChatActivity(a, cid, ""); err != nil {
 			log.Printf("activity %s: %v", logfmt.Label(a.UID, a.Nickname), err)
+			s.recordActivity(a, activity.TaskActivity, trigger, false, err.Error())
 			continue
 		}
 		s.checkActivityStreak(a) // 上报成功 → 回读 streak 自检
+		s.recordActivity(a, activity.TaskActivity, trigger, true, "上报成功")
 	}
 }
 
@@ -631,29 +678,34 @@ func (s *Scheduler) checkActivityStreak(a *auth.Auth) bool {
 // 连续 sessionDeadThreshold 次（3 次）才禁用（P0-1：13 个 disabled 号全是历史误判）。
 // 刷新成功 → ClearSessionDead 清计数（错误判定的账号有复活路径）。
 func (s *Scheduler) RunKeepaliveNow() {
+	s.runKeepalive(activity.TriggerManual)
+}
+
+func (s *Scheduler) runKeepalive(trigger activity.Trigger) {
 	includeDisabled := s.includeDisabledInTasks()
-	for _, st := range s.cfg.Pool.List() {
-		if st.Disabled && !includeDisabled {
-			continue
-		}
-		a := s.cfg.Pool.AuthByUID(st.UID)
+	for _, acct := range s.cfg.Pool.TaskAccounts(includeDisabled) {
+		uid, a := acct.UID, acct.Auth
 		if a == nil || a.RefreshTokenValue() == "" {
 			continue
 		}
 		if err := s.cfg.Upstream.RefreshToken(a); err != nil {
-			log.Printf("keepalive %s: %v", logfmt.Label(st.UID, st.Nickname), err)
+			log.Printf("keepalive %s: %v", logfmt.Label(uid, a.Nickname), err)
+			s.recordActivity(a, activity.TaskKeepalive, trigger, false, err.Error())
 			var ue *upstream.Error
-			if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead && !st.Disabled {
-				if s.cfg.Pool.NoteSessionDead(st.UID) {
-					log.Printf("keepalive %s: 连续 %d 次 12153 session dead — 禁用", logfmt.Label(st.UID, st.Nickname), pool.SessionDeadThreshold())
+			if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
+				if s.cfg.Pool.NoteSessionDead(uid) {
+					log.Printf("keepalive %s: 连续 %d 次 12153 session dead — 禁用", logfmt.Label(uid, a.Nickname), pool.SessionDeadThreshold())
 				}
 			}
 			continue
 		}
-		s.cfg.Pool.ClearSessionDead(st.UID) // 刷新成功清误判计数，失败不该累计
+		s.cfg.Pool.ClearSessionDead(uid) // 刷新成功清误判计数，失败不该累计
 		if err := a.SaveAtomic(); err != nil {
-			log.Printf("keepalive %s save: %v", logfmt.Label(st.UID, st.Nickname), err)
+			log.Printf("keepalive %s save: %v", logfmt.Label(uid, a.Nickname), err)
+			s.recordActivity(a, activity.TaskKeepalive, trigger, false, "token 刷新成功，写回失败: "+err.Error())
+			continue
 		}
+		s.recordActivity(a, activity.TaskKeepalive, trigger, true, "token 刷新成功")
 	}
 }
 
@@ -674,34 +726,36 @@ func (s *Scheduler) RunBalanceRefreshNow() bool {
 		return false
 	}
 	defer s.endBatchKind("balance")
-	var wg sync.WaitGroup
 	expiringSoon := s.ExpiringSoonWindow()
-	includeDisabled := s.includeDisabledInTasks()
-	// 并发上限 3（与 panel 任务中心各批量扫描口径一致）：账号量可能到几十个，
-	// 无界并发会瞬时打出一大波余额 RPC，与压低并发防风控的意图相悖。
-	sem := make(chan struct{}, 3)
-	for _, st := range s.cfg.Pool.List() {
-		if st.Disabled && !includeDisabled {
-			continue
-		}
-		a := s.cfg.Pool.AuthByUID(st.UID)
-		if a == nil {
-			continue
-		}
-		wg.Add(1)
-		go func(a *auth.Auth, uid string) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-			remain, total, expiring, earliestAt, earliestRemaining, err := s.cfg.Upstream.UserResourceDetailedWithExpiry(a, expiringSoon)
-			if err != nil {
-				log.Printf("balance %s: %v", logfmt.Label(uid, a.Nickname), err)
-				return
-			}
-			s.cfg.Pool.ReenableIfCredits(uid, remain, total)
-			s.cfg.Pool.SetCreditsDetailed(uid, remain, total, expiring, earliestAt, earliestRemaining)
-		}(a, st.UID)
+	accts := s.cfg.Pool.TaskAccounts(s.includeDisabledInTasks())
+	// 固定 3 个 worker（与 panel 任务中心各批量扫描口径一致）：旧实现为每个账号
+	// 起一个 goroutine 再争抢信号量，470 号时会瞬时堆积同阶 goroutine；这里只保留
+	// 与并发上限相同的 worker，吞吐不变、堆峰值与调度抖动更低。
+	workers := 3
+	if len(accts) < workers {
+		workers = len(accts)
 	}
+	jobs := make(chan pool.TaskAccount)
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for i := 0; i < workers; i++ {
+		go func() {
+			defer wg.Done()
+			for acct := range jobs {
+				remain, total, expiring, earliestAt, earliestRemaining, err := s.cfg.Upstream.UserResourceDetailedWithExpiry(acct.Auth, expiringSoon)
+				if err != nil {
+					log.Printf("balance %s: %v", logfmt.Label(acct.UID, acct.Auth.Nickname), err)
+					continue
+				}
+				s.cfg.Pool.ReenableIfCredits(acct.UID, remain, total)
+				s.cfg.Pool.SetCreditsDetailed(acct.UID, remain, total, expiring, earliestAt, earliestRemaining)
+			}
+		}()
+	}
+	for _, acct := range accts {
+		jobs <- acct
+	}
+	close(jobs)
 	wg.Wait()
 	return true
 }
@@ -715,7 +769,11 @@ func (s *Scheduler) StartBalanceRefresh(ctx context.Context, interval time.Durat
 		return
 	}
 	s.balanceInterval.Store(int64(interval))
+	// 先登记再启动：否则极小间隔下 ticker 恰好先于 Add 完成一轮 RunBalanceRefreshNow，
+	// WaitBalanceRefresh 可能在 Add 前就返回，停机时仍有刷新在写活动历史。
+	s.refreshWG.Add(1)
 	go func() {
+		defer s.refreshWG.Done()
 		var logged time.Duration
 		for {
 			cur := time.Duration(s.balanceInterval.Load())
@@ -745,6 +803,9 @@ func (s *Scheduler) StartBalanceRefresh(ctx context.Context, interval time.Durat
 		}
 	}()
 }
+
+// WaitBalanceRefresh 等待余额刷新循环退出（ctx 取消后）。仅停机使用。
+func (s *Scheduler) WaitBalanceRefresh() { s.refreshWG.Wait() }
 
 // SetBalanceInterval 热改余额刷新间隔；<=0 表示暂停循环（面板关闭该开关时）。
 func (s *Scheduler) SetBalanceInterval(d time.Duration) {

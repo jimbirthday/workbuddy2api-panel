@@ -21,6 +21,18 @@ func (p *Pool) Disable(uid, reason string) {
 	}
 }
 
+// DisableExisting 人工禁用已存在账号，返回账号是否存在。
+func (p *Pool) DisableExisting(uid string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return false
+	}
+	p.disableLocked(e, ManualDisableReason)
+	return true
+}
+
 // NoteSessionDead 记录一次 ErrSessionDead（12153）——**不立即禁用**。
 // 旧行为一次 12153 即 Disable，但 12153 会被临时性触发（网络抖动/上游闪断/refresh
 // 竞态），一次失败就永久杀号会误杀健康账号（P0-1 侦察：13 个 disabled 号全部 refresh
@@ -54,6 +66,46 @@ func (p *Pool) ClearSessionDead(uid string) {
 	if e, ok := p.byUID[uid]; ok {
 		e.sessionDeadFails = 0
 	}
+}
+
+// ManualDisableReason 是面板人工禁用的固定缘由标识。覆盖导入新凭证时据此
+// 区分「人工停用」与「12153/旧 token 导致的自动禁用」：前者保留，后者清除。
+const ManualDisableReason = "manual disable (panel)"
+
+// ReviveAfterCredentialReplacement 在导入覆盖同 UID 新凭证后调用：旧凭据导致的
+// 自动禁用、账号/模型级冷却、熔断与连败降权都应失效；但人工暂停和人工禁用
+// 是运维决策，必须保留（否则换 token 会悄悄把停用账号重新接流量）。
+// disabled 若不是人工禁用则清除；paused 若由禁用叠加而来不会出现在此路径
+// （disableLocked 已清 paused），这里只保留显式的人工暂停。
+func (p *Pool) ReviveAfterCredentialReplacement(uid string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return false
+	}
+	manualDisabled := e.disabled && e.reason == ManualDisableReason
+	manualPaused := e.paused
+	e.disabled = false
+	e.paused = false
+	e.until = time.Time{}
+	e.coolKind = 0
+	e.reason = ""
+	e.softStreak = 0
+	e.modelCooldowns = nil
+	e.sessionDeadFails = 0
+	e.fails = 0
+	e.retryCount = 0
+	e.breakerUntil = time.Time{}
+	e.consecutiveFails = 0
+	e.degradeUntil = time.Time{}
+	if manualDisabled {
+		e.disabled = true
+		e.reason = ManualDisableReason
+	}
+	e.paused = manualPaused
+	p.dirty.Store(true)
+	return true
 }
 
 // Revive 运维口径的"无条件恢复"：清禁用、冷却（含软退避计数）与熔断运行态。
@@ -112,6 +164,72 @@ func (p *Pool) Resume(uid string) bool {
 	}
 	p.resumeLocked(e)
 	return true
+}
+
+// SetProfile 更新账号的权重/备注并落盘 auth 文件（nil 表示该字段不变）。
+// 与 hub 语义一致：weight 1 = 不干预，2-100 = 优先调度；note 纯展示。
+//
+// 锁内只更新内存镜像并取 auth 指针；auth 文件的 Marshal/Write/Rename 在**释放
+// p.mu 后**执行。旧实现持整池写锁做磁盘 I/O，bind mount 慢时会把选号与状态查询
+// 一起堵住。释放池锁再写盘不会丢更新：auth.SetProfile 在 a.mu 内改字段并落盘，
+// 与 token refresh 仍严格串行；池内 weight/note 镜像由本方法直接更新。
+func (p *Pool) SetProfile(uid string, weight *int, note *string) (bool, error) {
+	p.mu.Lock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		p.mu.Unlock()
+		return false, nil
+	}
+	a := e.a
+	var normalizedWeight *int
+	var normalizedNote *string
+	weight, note = auth.NormalizeProfileInput(weight, note)
+	if weight != nil {
+		e.weight = stateWeight(*weight)
+		normalizedWeight = weight
+	}
+	if note != nil {
+		e.note = *note
+		normalizedNote = note
+	}
+	p.dirty.Store(true)
+	p.mu.Unlock()
+	// 落盘失败不回滚内存：面板仍显示用户刚设置的值；state.json 会在 5s 内
+	// 保存镜像，auth 文件下次刷新/保存时再写回。
+	return true, a.SetProfile(normalizedWeight, normalizedNote)
+}
+
+// SetAllEnabled 批量启用/禁用：enabled=true 走 Revive（清人工禁用与冷却），
+// false 走 Disable（人工禁用缘由，保号任务跳过）。返回实际变更的账号数。
+// 批量操作逐号加锁释放，避免长时间持池锁拖慢选号。
+func (p *Pool) SetAllEnabled(enabled bool) int {
+	return p.SetEnabledFor(nil, enabled)
+}
+
+// SetEnabledFor 批量启用/禁用指定账号；uids 为空表示整池（旧调用语义）。
+// 返回实际处理成功（账号存在）的数量。逐号调用 Revive/Disable，天然带池锁，
+// 不会长时间阻塞选号。
+func (p *Pool) SetEnabledFor(uids []string, enabled bool) int {
+	p.mu.RLock()
+	all := len(uids) == 0
+	if all {
+		uids = make([]string, 0, len(p.byUID))
+		for uid := range p.byUID {
+			uids = append(uids, uid)
+		}
+	}
+	p.mu.RUnlock()
+	n := 0
+	for _, uid := range uids {
+		if enabled {
+			if p.Revive(uid) {
+				n++
+			}
+		} else if p.DisableExisting(uid) {
+			n++
+		}
+	}
+	return n
 }
 
 // reviveCoolingLocked 只解冻余额耗尽冷却（CoolHard 的 until/coolKind/reason）并更新
@@ -314,7 +432,21 @@ func (p *Pool) Status(uid string) (Status, bool) {
 	if !ok {
 		return Status{}, false
 	}
-	return p.statusOf(uid, e), true
+	return p.statusOf(uid, e, time.Now()), true
+}
+
+// RealmByUID 返回账号的归一化域（cn/global）。只读取域，不构建 Status、
+// 不排序模型台账：请求完成时用量记账只需域，走 Status 会把冷却/成本/限额台账
+// 全算一遍（470 账号实测约 190ns/次；本方法约 20ns 且零分配）。
+// 账号不存在时返回空串，调用方按既有的“未知域回落 cn”处理。
+func (p *Pool) RealmByUID(uid string) string {
+	p.mu.RLock()
+	e, ok := p.byUID[uid]
+	p.mu.RUnlock()
+	if !ok || e == nil || e.a == nil {
+		return ""
+	}
+	return e.a.Realm()
 }
 
 // AuthByUID 返回账号的完整凭证（给调度器/运维接口用）。
@@ -330,13 +462,17 @@ func (p *Pool) AuthByUID(uid string) *auth.Auth {
 // AvailableUIDs 返回当前 healthy 且未占满在途名额的账号 UID 列表（按 UID 排序，稳定输出）。
 // 供会话粘性路由（internal/session）做快路径命中校验 + 双段分配；无可用返回空切片。
 func (p *Pool) AvailableUIDs() []string {
+	now := time.Now()
+	dailyUsage, dailyOK, dailyLimit, modelLimit := p.dailyUsageSnapshot(now)
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	now := time.Now()
 	uids := make([]string, 0, len(p.byUID))
 	for uid, e := range p.byUID {
 		if !e.healthy(now) {
 			continue
+		}
+		if dailyTokenBlocked(uid, "", dailyUsage, dailyOK, dailyLimit, modelLimit) {
+			continue // 账号级日额度用尽：会话分配也不再指向它
 		}
 		if p.inFlightFull(e) {
 			continue
@@ -352,8 +488,10 @@ func (p *Pool) AvailableUIDs() []string {
 // 这是粘性能"换得动"的关键：绑定只记 uid，若只按账号级 healthy 校验，
 // 被模型级限额的号（账号整体仍健康）会被持续选中直到轮换次数耗尽。
 func (p *Pool) PickByUIDForModel(uid, model string) *auth.Auth {
+	now := time.Now()
+	dailyUsage, dailyOK, dailyLimit, modelLimit := p.dailyUsageSnapshot(now)
 	p.mu.Lock()
-	a, warn := p.pickByUIDForModelLocked(uid, model)
+	a, warn := p.pickByUIDForModelLocked(uid, model, now, dailyUsage, dailyOK, dailyLimit, modelLimit)
 	p.mu.Unlock()
 	// floor 拦截的 WARN 在**锁外**打：持写锁打日志会把整池选号堵在 stderr 上。
 	if warn != "" {
@@ -365,13 +503,15 @@ func (p *Pool) PickByUIDForModel(uid, model string) *auth.Auth {
 // pickByUIDForModelLocked 是 PickByUIDForModel 的持锁主体，返回选中账号与一条
 // 待打的 WARN 文案（空串 = 无）。调用方必须已持有 p.mu，且在锁外打这条日志——
 // 持写锁 log.Printf 会把整池选号堵在 stderr 上。
-func (p *Pool) pickByUIDForModelLocked(uid, model string) (*auth.Auth, string) {
+func (p *Pool) pickByUIDForModelLocked(uid, model string, now time.Time, dailyUsage map[string]DailyTokenUsage, dailyOK bool, dailyLimit, modelLimit int64) (*auth.Auth, string) {
 	e, ok := p.byUID[uid]
 	if !ok {
 		return nil, ""
 	}
-	now := time.Now()
 	if !e.healthyForModel(now, model) {
+		return nil, ""
+	}
+	if dailyTokenBlocked(uid, model, dailyUsage, dailyOK, dailyLimit, modelLimit) {
 		return nil, ""
 	}
 	// 积分保底（粘性路径）：与 pick 的 floorBlocked 同判据——触底 + 收费即拦
@@ -465,18 +605,55 @@ func (p *Pool) ServableNow() bool {
 	return p.ServableForRealm("")
 }
 
+// HealthSummary 一次遍历同时给出探活所需的全部维度，避免 /healthz 为了
+// healthy/total 与 cn/global 可达性反复扫描全池、反复取日额度快照。
+//
+// 口径与 CountsDetailed + ServableNow + ServableForRealm 完全一致：
+//   - healthy 仍是「账号级可路由」计数（不含 inFlight 维度）；
+//   - servable[realm] 额外排除在途占满与今日额度用尽；
+//   - 账号处于模型级豁免（某个模型被 6004 锁住但其他模型可用）时仍可服务。
+//
+// realm 键固定为 "cn"/"global"，调用方无需再补键。
+func (p *Pool) HealthSummary() (total, healthy int, servable map[string]bool) {
+	now := time.Now()
+	dailyUsage, dailyOK, dailyLimit, modelLimit := p.dailyUsageSnapshot(now)
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	servable = map[string]bool{"cn": false, "global": false}
+	for uid, e := range p.byUID {
+		total++
+		ok := e.healthy(now)
+		if ok {
+			healthy++
+		}
+		realm := e.a.Realm()
+		// 已在上述 healthy 计算中求得结果，这里直接复用：旧实现每个账号最坏调用
+		// 两次 healthy()（健康且未命中可服务域时短路才少一次），470 号探活白白
+		// 重复扫描 disabled/until/breaker/degrade 四个截止时间。
+		if !servable[realm] && (ok || e.modelExempt(now)) && !p.inFlightFull(e) &&
+			!dailyTokenBlocked(uid, "", dailyUsage, dailyOK, dailyLimit, modelLimit) {
+			servable[realm] = true
+		}
+	}
+	return total, healthy, servable
+}
+
 // ServableForRealm 报告某 realm 是否可服务：存在至少一个该 realm 的 healthy 且未占满在途名额的账号。
 // 与 ServableNow 同口径（healthy 或模型豁免、排除 inFlightFull），仅叠加 Realm()==realm 谓词。
 // realm=="" 退化为 ServableNow（现状语义）。供 /healthz 按 realm 暴露 CN/global 各自可达性。
 func (p *Pool) ServableForRealm(realm string) bool {
+	now := time.Now()
+	dailyUsage, dailyOK, dailyLimit, modelLimit := p.dailyUsageSnapshot(now)
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	now := time.Now()
-	for _, e := range p.byUID {
+	for uid, e := range p.byUID {
 		if realm != "" && e.a.Realm() != realm {
 			continue
 		}
 		if p.inFlightFull(e) {
+			continue
+		}
+		if dailyTokenBlocked(uid, "", dailyUsage, dailyOK, dailyLimit, modelLimit) {
 			continue
 		}
 		// 存在性语义：账号级 healthy，或处于模型级豁免形态（6004 单模型软冷却——
@@ -493,6 +670,7 @@ func (p *Pool) ServableForRealm(realm string) bool {
 func (p *Pool) List() []Status {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
+	now := time.Now()
 	uids := make([]string, 0, len(p.byUID))
 	for uid := range p.byUID {
 		uids = append(uids, uid)
@@ -500,7 +678,39 @@ func (p *Pool) List() []Status {
 	sort.Strings(uids)
 	out := make([]Status, 0, len(uids))
 	for _, uid := range uids {
-		out = append(out, p.statusOf(uid, p.byUID[uid]))
+		out = append(out, p.statusOf(uid, p.byUID[uid], now))
+	}
+	return out
+}
+
+// RealmLabels 返回「昵称(uid8)」→realm 的轻量快照。只读取域与脱敏标签，
+// 不构建 Status；供性能分位把归档里的账号标签映射回域，避免为每个账号付出
+// 完整状态序列化的成本。一次加锁同时取标签与域，避免两次快照互相错位。
+func (p *Pool) RealmLabels() map[string]string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	out := make(map[string]string, len(p.byUID))
+	for _, e := range p.byUID {
+		realm := e.a.Realm()
+		if realm == "" {
+			continue
+		}
+		out[logfmt.Label(e.a.UID, e.a.Nickname)] = realm
+	}
+	return out
+}
+
+// Nicknames 返回 uid→昵称的轻量快照（不构建 Status、不排序、不做模型成本/
+// 限流台账计算）。导出与用量展示只需要昵称映射；复用 List 会为每个账号付
+// 完整状态序列化的成本（470 账号约 250 KiB 分配）。空昵称不写入。
+func (p *Pool) Nicknames() map[string]string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	out := make(map[string]string, len(p.byUID))
+	for uid, e := range p.byUID {
+		if e.a.Nickname != "" {
+			out[uid] = e.a.Nickname
+		}
 	}
 	return out
 }
@@ -526,18 +736,23 @@ func reasonIfLive(e *entry, now time.Time) string {
 	return ""
 }
 
-func (p *Pool) statusOf(uid string, e *entry) Status {
-	now := time.Now()
+func (p *Pool) statusOf(uid string, e *entry, now time.Time) Status {
+	modelRows := p.activeModelRowsLocked(e, now)
+	hasAccess := strings.TrimSpace(e.a.AccessTokenValue()) != ""
+	hasRefresh := strings.TrimSpace(e.a.RefreshTokenValue()) != ""
 	st := Status{
 		UID: uid,
 		// 限额台账（issue #36）：仅「带解析时间 6004 的模型级软冷却」仍在生效时非空，
 		// 每模型一行（modelCooldowns 内未到期的条目），多模型同时限流全部展示。
 		// 到期判据 = 该模型的独立冷却 until 未过；条件满足才输出，随到期自然消失，
 		// 普通软冷却（无模型级表）/硬冷却不产生台账（零回归）。
-		RateLimitedModels:        p.rateLimitedModelsLocked(e, now),
+		RateLimitedModels:        modelRows.rateLimited,
 		Realm:                    e.a.Realm(),
 		Enterprise:               e.a.IsEnterprise(),
 		Nickname:                 e.a.Nickname,
+		Weight:                   e.weight,
+		Note:                     e.note,
+		HasTokens:                hasAccess && hasRefresh,
 		Credits:                  e.credits,
 		CreditsTotal:             e.creditsTotal,
 		CreditsExpiring:          e.creditsExpiring,
@@ -558,7 +773,7 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		LastErrTime:      e.lastErr,
 		Until:            e.until,
 		SoftStreak:       e.softStreak,
-		ModelCosts:       p.modelCostsStatusLocked(e, now),
+		ModelCosts:       modelRows.costs,
 		ConsecutiveFails: e.consecutiveFails,
 		DegradeUntil:     e.degradeUntil,
 		InFlight:         int(e.inFlight.Load()),
@@ -593,9 +808,72 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 	return st
 }
 
+// activeModelRowSet 保存一次过滤得到的有效模型台账。限流行与成本行共享
+// 同一有效期判据，一次遍历即可同时产出，避免面板整表读取时重复扫描。
+type activeModelRowSet struct {
+	rateLimited []RateLimitedModel
+	costs       []ModelCostStatus
+}
+
+// activeModelRowsLocked 收集账号当前有效的模型级限流与成本台账。调用方必须
+// 已持有锁。两者按模型名稳定排序；无有效行时对应切片为 nil（JSON omitempty）。
+func (p *Pool) activeModelRowsLocked(e *entry, now time.Time) activeModelRowSet {
+	if len(e.modelCooldowns) == 0 && len(e.modelCost) == 0 {
+		return activeModelRowSet{}
+	}
+	models := make([]string, 0, len(e.modelCooldowns)+len(e.modelCost))
+	for m, mc := range e.modelCooldowns {
+		if mc.AuditOnly || mc.Until.IsZero() || !now.Before(mc.Until) {
+			continue
+		}
+		models = append(models, m)
+	}
+	for m, mc := range e.modelCost {
+		if mc.LastSeen.IsZero() || now.Sub(mc.LastSeen) > modelCostTTL {
+			continue
+		}
+		models = append(models, m)
+	}
+	if len(models) == 0 {
+		return activeModelRowSet{}
+	}
+	sort.Strings(models)
+	var out activeModelRowSet
+	prev := ""
+	for _, m := range models {
+		if m == prev {
+			continue
+		}
+		prev = m
+		if mc, ok := e.modelCooldowns[m]; ok && !mc.AuditOnly && !mc.Until.IsZero() && now.Before(mc.Until) {
+			kind := "rate_limit"
+			if strings.HasPrefix(mc.Reason, "11102") {
+				kind = "model_unavailable"
+			}
+			row := RateLimitedModel{Model: m, Kind: kind, Until: mc.Until, Reason: mc.Reason}
+			if !mc.ResetAt.IsZero() && !mc.ResetAt.Equal(mc.Until) {
+				row.ResetAt = mc.ResetAt
+			}
+			out.rateLimited = append(out.rateLimited, row)
+		}
+		if mc, ok := e.modelCost[m]; ok && !mc.LastSeen.IsZero() && now.Sub(mc.LastSeen) <= modelCostTTL {
+			out.costs = append(out.costs, ModelCostStatus{
+				Model:     m,
+				CostPer1k: mc.CostPer1k,
+				LastSeen:  mc.LastSeen,
+				Samples:   mc.Samples,
+			})
+		}
+	}
+	return out
+}
+
 // modelCostsStatusLocked 收集账号的有效成本台账行（P1-anti-monopoly 可观测性）。
 // 仅 modelCostTTL 内的观测进台账（过期/零值跳过，与选号读取侧同口径）；
 // 模型名稳定排序。调用方必须已持有锁。
+//
+// 独立扫描 cost map（不借道 activeModelRowsLocked）：接入页只关心成本，
+// cooldowns 往往为空；合并扫描会把一条无关的限流表也遍历/排序。
 func (p *Pool) modelCostsStatusLocked(e *entry, now time.Time) []ModelCostStatus {
 	if len(e.modelCost) == 0 {
 		return nil
@@ -603,7 +881,7 @@ func (p *Pool) modelCostsStatusLocked(e *entry, now time.Time) []ModelCostStatus
 	models := make([]string, 0, len(e.modelCost))
 	for m, mc := range e.modelCost {
 		if mc.LastSeen.IsZero() || now.Sub(mc.LastSeen) > modelCostTTL {
-			continue // 过期/零值：不进台账（与选号读取侧同口径）
+			continue
 		}
 		models = append(models, m)
 	}
@@ -632,44 +910,5 @@ func (p *Pool) modelCostsStatusLocked(e *entry, now time.Time) []ModelCostStatus
 // modelCooldowns 未到期条目按模型名稳定排序输出；全部到期/空表返回 nil。
 // 调用方必须已持有锁（statusOf 只读路径持 RLock，本函数只读不写）。
 func (p *Pool) rateLimitedModelsLocked(e *entry, now time.Time) []RateLimitedModel {
-	if len(e.modelCooldowns) == 0 {
-		return nil
-	}
-	// 先排序模型名，保证输出稳定（map 遍历无序）。
-	models := make([]string, 0, len(e.modelCooldowns))
-	for m := range e.modelCooldowns {
-		models = append(models, m)
-	}
-	sort.Strings(models)
-	rows := make([]RateLimitedModel, 0, len(models))
-	for _, m := range models {
-		mc := e.modelCooldowns[m]
-		// AuditOnly 条目（无重置时间的 6004 展示项）不拦路由、不改变选号，与
-		// ModelLockView（modelview.go 显式跳过 AuditOnly）口径一致：账号页不得把
-		// 只审计的条目渲染成「限流中」。
-		if mc.AuditOnly {
-			continue
-		}
-		if !mc.Until.IsZero() && now.Before(mc.Until) {
-			kind := "rate_limit"
-			if strings.HasPrefix(mc.Reason, "11102") {
-				kind = "model_unavailable"
-			}
-			row := RateLimitedModel{
-				Model:  m,
-				Kind:   kind,
-				Until:  mc.Until,
-				Reason: mc.Reason,
-			}
-			// 上游原始重置墙钟：截断后 until==resetAt 时省略（omitempty），台账只显示真实恢复时刻。
-			if !mc.ResetAt.IsZero() && !mc.ResetAt.Equal(mc.Until) {
-				row.ResetAt = mc.ResetAt
-			}
-			rows = append(rows, row)
-		}
-	}
-	if len(rows) == 0 {
-		return nil
-	}
-	return rows
+	return p.activeModelRowsLocked(e, now).rateLimited
 }

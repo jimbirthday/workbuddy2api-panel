@@ -1162,7 +1162,7 @@ func TestSaveFailureRecordedAndRecovers(t *testing.T) {
 	if p2.persistFails != 0 {
 		t.Fatalf("successful save should reset persistFails, got %d", p2.persistFails)
 	}
-	if raw, err := os.ReadFile(good); err != nil || !strings.Contains(string(raw), `"credits": 42`) {
+	if raw, err := os.ReadFile(good); err != nil || !strings.Contains(string(raw), `"credits":42`) {
 		t.Fatalf("state.json not written on success: %v %s", err, raw)
 	}
 }

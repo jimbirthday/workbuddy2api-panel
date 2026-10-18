@@ -61,6 +61,44 @@ func TestSaveAtomicRoundtrip(t *testing.T) {
 	}
 }
 
+// TestProfileRoundtrip 权重/备注随 auth 文件持久化；越界权重收敛、备注截断，
+// 且注释字段不影响 Parse/SaveAtomic 的凭证往返。
+func TestProfileRoundtrip(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "workbuddy-u1.json")
+	a := &Auth{AccessToken: "at", RefreshToken: "rt", ExpiresAt: 1, UID: "u1", FilePath: fp}
+	w := 7
+	note := strings.Repeat("备", 260)
+	if err := a.SetProfile(&w, &note); err != nil {
+		t.Fatalf("set profile: %v", err)
+	}
+	raw, err := os.ReadFile(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := Parse(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b.WeightValue() != 7 {
+		t.Errorf("weight=%d want 7", b.WeightValue())
+	}
+	if got := len([]rune(b.Note)); got != 200 {
+		t.Errorf("note runes=%d want 200", got)
+	}
+	// 越界值收敛到边界，而不是写坏文件/加载失败。
+	b.FilePath = fp
+	over := 999
+	if err := b.SetProfile(&over, nil); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ = os.ReadFile(fp)
+	c, err := Parse(raw)
+	if err != nil || c.WeightValue() != 100 {
+		t.Fatalf("clamped weight=%d err=%v", c.WeightValue(), err)
+	}
+}
+
 // TestLoadDirLoadsAllValid 不再按 region 过滤：所有可解析的 auth 文件都被加载，
 // 解析失败的文件静默跳过。
 func TestLoadDirLoadsAllValid(t *testing.T) {

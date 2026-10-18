@@ -3,6 +3,7 @@ package session
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -142,6 +143,30 @@ func TestTurnRequestIDDerivation(t *testing.T) {
 	for _, id := range []string{a1, TurnRequestID(""), TurnRequestID("x")} {
 		if len(id) != 32 {
 			t.Errorf("TurnRequestID value %q len=%d want 32", id, len(id))
+		}
+	}
+}
+
+// TestTurnKeyFromRequestMatchesBody 钉住已解析入口与原始 body 入口逐字一致：
+// handler 复用同一请求对象时不得改变轮级键，包括多模态内容与空态。
+func TestTurnKeyFromRequestMatchesBody(t *testing.T) {
+	bodies := []string{
+		`{"messages":[{"role":"user","content":"你好"}]}`,
+		`{"messages":[{"role":"user","content":"第一问"},{"role":"assistant","content":"答"},{"role":"user","content":"第二问"}]}`,
+		`{"messages":[{"role":"user","content":[{"type":"text","text":"看图"},{"type":"image_url","image_url":{"url":"data:x"}}]}]}`,
+		`{"messages":[{"role":"user","content":null}]}`,
+		`{"messages":[]}`,
+		`{broken`,
+	}
+	for _, body := range bodies {
+		var req TurnKeyRequest
+		if json.Unmarshal([]byte(body), &req) != nil {
+			continue // 坏 JSON 的语义由 TurnKey 的空串测试覆盖
+		}
+		fromObject := TurnKeyFromRequest(req)
+		fromBytes := TurnKey([]byte(body))
+		if fromObject != fromBytes {
+			t.Errorf("TurnKeyFromRequest(%s)=%q want %q", body, fromObject, fromBytes)
 		}
 	}
 }

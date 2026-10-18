@@ -2,6 +2,7 @@ package upstream
 
 import (
 	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -140,5 +141,46 @@ func TestPrepareBodyOptNoCacheKeyInjection(t *testing.T) {
 	}
 	if _, present := obj["prompt_cache_key"]; present {
 		t.Fatalf("PrepareBodyOpt must NOT inject prompt_cache_key, but got: %v", obj["prompt_cache_key"])
+	}
+}
+
+// TestInjectPromptCacheKeyObject_EquivalentToBytes 验证 map 级注入与字节入口
+// 完全等价：调用方在单次解码管线里复用对象时，不改变既有优先级与序列化结果。
+func TestInjectPromptCacheKeyObject_EquivalentToBytes(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		uid  string
+		conv string
+	}{
+		{"generated key", `{"model":"glm-5.2","messages":[]}`, "user-abc-123", "conv-1"},
+		{"existing key preserved", `{"model":"glm-5.2","messages":[],"prompt_cache_key":"client-set-key"}`, "user-abc-123", "conv-1"},
+		{"conversation_id wins", `{"model":"glm-5.2","messages":[],"conversation_id":"body-conv"}`, "user-abc-123", "header-conv"},
+		{"conversationId fallback", `{"model":"glm-5.2","messages":[],"conversationId":"camel-conv"}`, "user-abc-123", "header-conv"},
+		{"empty conversation", `{"model":"glm-5.2","messages":[]}`, "user-abc-123", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			want := InjectPromptCacheKey([]byte(tc.body), tc.uid, tc.conv)
+			var obj map[string]any
+			if err := json.Unmarshal([]byte(tc.body), &obj); err != nil {
+				t.Fatalf("unmarshal input: %v", err)
+			}
+			injectPromptCacheKeyObject(obj, tc.uid, tc.conv)
+			got, err := json.Marshal(obj)
+			if err != nil {
+				t.Fatalf("marshal object: %v", err)
+			}
+			var gotObj, wantObj map[string]any
+			if err := json.Unmarshal(got, &gotObj); err != nil {
+				t.Fatalf("unmarshal object output: %v", err)
+			}
+			if err := json.Unmarshal(want, &wantObj); err != nil {
+				t.Fatalf("unmarshal bytes output: %v", err)
+			}
+			if !reflect.DeepEqual(gotObj, wantObj) {
+				t.Fatalf("object path differs from bytes path semantically:\nobject: %s\nbytes:  %s", got, want)
+			}
+		})
 	}
 }

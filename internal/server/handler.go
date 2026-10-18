@@ -30,10 +30,13 @@ import (
 
 // Config handler 依赖。
 type Config struct {
-	Pool      *pool.Pool
-	Upstream  *upstream.Client
-	APIKey    string // 空 = 不鉴权（静态值；与 Live 同时给出时 Live 优先）
-	MaxRotate int    // 单请求最多换号次数，默认 3。限流换号不受此上限约束：池里还有未限流的号就继续打。
+	Pool     *pool.Pool
+	Upstream *upstream.Client
+	APIKey   string // 空 = 不鉴权（静态值；与 Live 同时给出时 Live 优先）
+	// APIKeys 静态 keyring（仅 Live 为 nil 的裸用/测试路径使用）。Live 快照
+	// 中的 Keys 是生产路径权威值。
+	APIKeys   []httpauth.Key
+	MaxRotate int // 单请求最多换号次数，默认 3。限流换号不受此上限约束：池里还有未限流的号就继续打。
 	// Session 会话粘性路由器（可选；nil = 关闭粘性，纯 Pick 轮换）。
 	Session *session.Router
 	// StickyCount 返回当前粘性会话绑定数（供 /status）；nil 时报告 0。
@@ -83,6 +86,7 @@ func (h *Handler) loadLive() livecfg.Snapshot {
 	}
 	return livecfg.Snapshot{
 		APIKey:           h.cfg.APIKey,
+		Keys:             h.cfg.APIKeys,
 		SoftCooldown:     h.cfg.SoftCooldown,
 		RecordClientInfo: h.cfg.RecordClientInfo,
 	}
@@ -136,6 +140,9 @@ func NewHandler(cfg Config) *Handler {
 	}
 	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
+	h.mux.HandleFunc("POST /v1/responses", h.withProtocolAuth(protoResponses, h.responses))
+	h.mux.HandleFunc("POST /v1/messages", h.withProtocolAuth(protoMessages, h.messages))
+	h.mux.HandleFunc("POST /v1/messages/count_tokens", h.withProtocolAuth(protoMessages, h.countMessagesTokens))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
@@ -146,8 +153,8 @@ func NewHandler(cfg Config) *Handler {
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if h.cfg.RequestLog != nil && r.Method == http.MethodPost && r.URL.Path == "/v1/chat/completions" {
-		trace := &requestTrace{id: reqlog.NewRequestID(), start: time.Now()}
+	if h.cfg.RequestLog != nil && r.Method == http.MethodPost && isTracedChatPath(r.URL.Path) {
+		trace := &requestTrace{id: reqlog.NewRequestID(), start: time.Now(), path: r.URL.Path}
 		if h.loadLive().RecordClientInfo {
 			trace.captureClientInfo(r)
 		}
@@ -168,30 +175,54 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.mux.ServeHTTP(w, r)
 }
 
+// isTracedChatPath reports which API entrypoints share the chat request
+// accounting pipeline. count_tokens is excluded: it never touches an account
+// and has no token/attempt observations to record.
+func isTracedChatPath(path string) bool {
+	switch path {
+	case "/v1/chat/completions", "/v1/responses", "/v1/messages":
+		return true
+	}
+	return false
+}
+
 func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !httpauth.VerifyBearer(r, h.loadLive().APIKey) {
+		id, ok := h.authenticate(r)
+		if !ok {
 			writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
 			return
+		}
+		if id.ID != "" {
+			r = r.WithContext(httpauth.WithIdentity(r.Context(), id))
 		}
 		next(w, r)
 	}
 }
 
+// authenticate 校验请求并返回命中身份。livecfg 快照优先；快照没有 Keys 时
+// 回落静态 APIKey（兼容旧装配路径）。未启用鉴权时返回空身份 + true。
+func (h *Handler) authenticate(r *http.Request) (httpauth.Identity, bool) {
+	live := h.loadLive()
+	if len(live.Keys) > 0 {
+		return httpauth.VerifyAny(r, live.Keys)
+	}
+	if strings.TrimSpace(live.APIKey) == "" {
+		return httpauth.Identity{}, true
+	}
+	return httpauth.VerifyBearerKey(r, httpauth.Key{ID: httpauth.DefaultLegacyKeyID, Key: live.APIKey, Enabled: true})
+}
+
 func (h *Handler) healthz(w http.ResponseWriter, r *http.Request) {
-	total, healthy, _, _, _ := h.cfg.Pool.CountsDetailed()
+	total, healthy, realmServable := h.cfg.Pool.HealthSummary()
 	// 用 ServableNow 判定：healthy>0 但全占满在途时 chat 会 503，探活必须同口径，
 	// 否则负载均衡器会把流量持续打进无法受理的实例。
 	status := http.StatusOK
-	if !h.cfg.Pool.ServableNow() {
+	if !realmServable["cn"] && !realmServable["global"] {
 		status = http.StatusServiceUnavailable
 	}
 	// realm_servable 域可服务维度：不改判活语义（存在性探活保持不变），
 	// 只新增 CN/global 各自可达性供双域部署运维观察（任一域不可用单独告警）。
-	realmServable := map[string]bool{
-		"cn":     h.cfg.Pool.ServableForRealm("cn"),
-		"global": h.cfg.Pool.ServableForRealm("global"),
-	}
 	// 恒无鉴权（负载均衡/编排探活只需 2xx/503 语义），身份靠 service 字段 + X-Service 头双保险。
 	w.Header().Set("X-Service", ServiceName)
 	writeJSON(w, status, map[string]any{
@@ -203,7 +234,10 @@ func (h *Handler) healthz(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
-	total, healthy, cooling, disabled, inFlightFull := h.cfg.Pool.CountsDetailed()
+	// 管理面需要完整账号列表；业务 Key 只拿聚合计数与模型锁摘要。先判定可见性，
+	// 让一次池快照按需决定是否构建 Status 行，而不是先算完整列表再丢弃。
+	isClientKey := h.isClientRequest(r)
+	snap := h.cfg.Pool.StatusSnapshot(!isClientKey)
 	sticky := 0
 	if h.cfg.StickyCount != nil {
 		sticky = h.cfg.StickyCount()
@@ -216,25 +250,24 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 	// (域, 模型) 的最近探索时刻（键 "realm|model"）。与 accounts[].model_costs
 	// 行对照即可读出「探索→毕业」全链路（单一事实来源，不做双表示）。零回归只增键。
 	exploreEvents, exploreLast := h.cfg.Pool.CostExploreStatus()
-	writeJSON(w, http.StatusOK, map[string]any{
-		"accounts":       h.cfg.Pool.List(),
-		"total":          total,
-		"healthy":        healthy,
-		"cooling":        cooling,
-		"disabled":       disabled,
-		"in_flight_full": inFlightFull,
+	status := map[string]any{
+		"total":          snap.Total,
+		"healthy":        snap.Healthy,
+		"cooling":        snap.Cooling,
+		"disabled":       snap.Disabled,
+		"in_flight_full": snap.InFlightFull,
 		// realm_totals 按域分组的计数汇总（双 realm 并存时运维一眼看到各域可用性）：
 		// 只新增字段，既有 total/healthy/cooling/disabled/in_flight_full 汇总键不变（零回归）。
 		"realm_totals": map[string]map[string]int{
-			"cn":     countsMapFrom(h.cfg.Pool.CountsDetailedForRealm("cn")),
-			"global": countsMapFrom(h.cfg.Pool.CountsDetailedForRealm("global")),
+			"cn":     realmCountsMap(snap.Realms["cn"]),
+			"global": realmCountsMap(snap.Realms["global"]),
 		},
 		"sticky_sessions": sticky,
 		"redis_mode":      redisMode,
 		// model_locks 当前有未过期模型级限流的 (域, 模型) 全清单：账号池视图回答
 		// 「哪些号不能用」，本键回答「哪些模型不能用、锁了几个号、还要锁多久」。
 		// 与 ModelBlocked（请求失败时的单模型判定）互补；无锁时为 null。零回归只增键。
-		"model_locks": h.cfg.Pool.ModelLockView(),
+		"model_locks": snap.ModelLocks,
 		// credit_floor 生效的积分保底值（0 = 关闭）。与 accounts[].credits +
 		// model_costs 对照即可判定「某号为何对某模型不出票」。零值也显式写出
 		// （运维口径：缺失会让人误以为没记录）。
@@ -244,7 +277,60 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 			"events_total": exploreEvents,
 			"per_model":    exploreLast,
 		},
-	})
+	}
+	if !isClientKey {
+		status["accounts"] = snap.Accounts
+	} else {
+		// 业务 Key 的可见性口径：不回传 accounts 键（连空数组都不给，避免
+		// 客户端把“空池”误读成没有账号）；model_locks 只保留模型与恢复时间。
+		status["accounts_visible"] = false
+		status["model_locks"] = publicModelLocks(snap.ModelLocks)
+	}
+	writeJSON(w, http.StatusOK, status)
+}
+
+// realmCountsMap 把一次快照中的单域计数转成既有 /status JSON 形状。
+func realmCountsMap(rc pool.RealmCounts) map[string]int {
+	return map[string]int{
+		"total":          rc.Total,
+		"healthy":        rc.Healthy,
+		"cooling":        rc.Cooling,
+		"disabled":       rc.Disabled,
+		"in_flight_full": rc.InFlightFull,
+	}
+}
+
+// isClientRequest 判断当前请求是否只能看到业务面字段。管理面身份以顶层
+// api_key 为准：legacy 条目本身只是兼容包装，不能仅凭 IdentityFrom 命中就
+// 认定其为客户端 Key，否则管理密钥会被误降级而看不到账号池详情。
+// 未启用鉴权（无身份）时保持旧的单机自用行为。
+func (h *Handler) isClientRequest(r *http.Request) bool {
+	if _, ok := httpauth.IdentityFrom(r); !ok {
+		return false
+	}
+	if key := strings.TrimSpace(h.loadLive().APIKey); key != "" && httpauth.VerifyBearer(r, key) {
+		return false
+	}
+	return true
+}
+
+// publicModelLocks 把模型级锁摘要降到业务 Key 也能安全看到的字段：模型名、
+// realm、锁定的账号数量与恢复时间。完整明细可能含账号身份与内部原因字符串，
+// 不对客户端暴露。
+func publicModelLocks(rows []pool.ModelLockRow) []map[string]any {
+	out := make([]map[string]any, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, map[string]any{
+			"model":        row.Model,
+			"realm":        row.Realm,
+			"state":        row.State,
+			"servable":     row.Servable,
+			"locked":       row.Locked,
+			"unlock_at":    row.UnlockAt,
+			"fully_unlock": row.FullyUnlockAt,
+		})
+	}
+	return out
 }
 
 // countsMapFrom 把 CountsDetailed 五元组打包成 /status 的域分组建模。
@@ -277,9 +363,28 @@ const (
 // models 返回模型列表：纯动态（缓存 10min），失败/无号返回空列表（无静态兜底——
 // 拉不出目录即意味着上游不可用，假名单只会让客户端选到 11102 的模型）。
 func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
+	list := h.modelList()
+	// realm/models 受限的 key 只看到自己可用的模型：realm 过滤前缀，models
+	// 白名单按裸名匹配（显示值仍是带前缀的完整 id）。这样客户端不会先选到
+	// 必然 400 的模型；限制只在请求前过滤，不改变上游模型目录本身。
+	if id, ok := httpauth.IdentityFrom(r); ok {
+		filtered := make([]map[string]any, 0, len(list))
+		for _, entry := range list {
+			full, _ := entry["id"].(string)
+			realm, bare := resolveModel(full)
+			if id.Realm != "" && realm != id.Realm {
+				continue
+			}
+			if !id.AllowsModel(bare) {
+				continue
+			}
+			filtered = append(filtered, entry)
+		}
+		list = filtered
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"object": "list",
-		"data":   h.modelList(),
+		"data":   list,
 	})
 }
 
@@ -519,30 +624,98 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "read body: "+err.Error())
 		return
 	}
-	var peek struct {
-		Stream bool   `json:"stream"`
-		Model  string `json:"model"`
+	// 一次解析 + 多路复用：下面所有前置判定（model/stream、工具名单、会话键/
+	// 轮级键、图片形态、conversationId）都来自同一次结构化解码。此前每个辅助
+	// 函数各自 Unmarshal 一遍，64KB body 的前置链会多出约 5 次全量解码与千级分配。
+	// 结构化解析失败时退回一次宽松 map 解析，保证畸形/边界 JSON 仍按原语义提取
+	// 可读字段；两份都失败时各提取器返回空值，原始 body 照常透传给上游。
+	var envelope chatEnvelope
+	envelopeOK := json.Unmarshal(body, &envelope) == nil
+	if !envelopeOK {
+		// 解析失败完全回退旧解析器：各提取器对畸形 JSON 的宽容度并不相同
+		//（例如一条 role 类型异常会让 TurnKey 整体失败），用 map 宽松恢复会改变
+		// 路由键。异常请求不追求热点性能，优先保持逐字节旧语义。
+		envelope = chatEnvelope{Stream: jsonBoolField(body, "stream"), Model: jsonStringField(body, "model")}
 	}
-	_ = json.Unmarshal(body, &peek)
+	if envelopeOK {
+		envelope.prepare()
+	}
+	peek := envelope.peek()
 
 	// 工具名名单：上游在没有 tools 的请求里会把工具调用吐成原生标记文本
 	// （见 upstream/dsml.go），修复层用它做严格判定。名单来自「本请求声明的 tools」
 	// 与「会话历史里出现过的工具名」两个来源——实测 tools 声明会在中转环节丢失，
 	// 只认前者会让修复层在最需要它的场景下失效。
 	// 在提示词/模型名改写之前取（那些改写不动 tools / messages[].tool_calls 子树）。
-	declaredTools := upstream.ToolNameAllowlist(body)
+	declaredTools := upstream.ToolNamesFromFields(envelope.toolDecls(), envelope.functionDecls(), envelope.messageToolNames())
+	if !envelopeOK {
+		declaredTools = upstream.ToolNameAllowlist(body)
+	}
 
 	// realm 前缀解析（D6）：model 名可能带 "[realm:]" 前缀。剥出 realm + bareModel，
 	// bareModel 用于选号/粘性/出站 body 重写（前缀是网关侧路由协议，上游只认裸名）。
 	// 裸名 → ("cn", 原串)，CN 现状零回归。
 	realm, bareModel := resolveModel(peek.Model)
+	// 多 key 路由约束必须在读 body 之后、选号/上游调用之前生效：跨域请求明确
+	// 400，不静默改走另一个域；models 白名单同样在请求前拒绝。这里只处理 chat；
+	// /v1/models 的可见性过滤见 models handler。
+	if keyID, ok := httpauth.IdentityFrom(r); ok {
+		if keyID.Realm != "" && realm != keyID.Realm {
+			writeOpenAIError(w, http.StatusBadRequest, "realm_not_allowed",
+				"api key "+keyID.ID+" is restricted to realm "+keyID.Realm)
+			return
+		}
+		if !keyID.AllowsModel(bareModel) {
+			writeOpenAIError(w, http.StatusBadRequest, "model_not_allowed",
+				"api key "+keyID.ID+" is not allowed to use model "+bareModel)
+			return
+		}
+	}
+	// 客户端后台任务模型重定向：必须在 Key 的 realm/模型白名单校验之后执行，
+	// 否则受限 Key 可以用白名单内的别名跳到白名单外的付费模型。命中后同步改写
+	// 路由变量与请求体，后续选号、冷却、粘性、用量都按实际目标模型记账。
+	originalModel := peek.Model
+	if live := h.loadLive(); live.BackgroundModelTarget != "" {
+		if rw := backgroundModelAlias(originalModel, live.BackgroundModelNames, live.BackgroundModelTarget); !rw.Empty {
+			targetRealm, targetBare := resolveModel(rw.Target)
+			// 目标模型必须同样满足 Key 的 realm / 模型白名单。只在原始模型上
+			// 做一次校验，会让受限 Key 用「白名单内的后台模型名」借别名访问
+			// 白名单外的付费模型——这是安全边界，不是配置便利性问题。
+			if keyID, ok := httpauth.IdentityFrom(r); ok {
+				if keyID.Realm != "" && targetRealm != keyID.Realm {
+					writeOpenAIError(w, http.StatusBadRequest, "realm_not_allowed",
+						"api key "+keyID.ID+" background model target is restricted to realm "+keyID.Realm)
+					return
+				}
+				if !keyID.AllowsModel(targetBare) {
+					writeOpenAIError(w, http.StatusBadRequest, "model_not_allowed",
+						"api key "+keyID.ID+" is not allowed to use background model target "+targetBare)
+					return
+				}
+			}
+			if next, ok := rewriteBackgroundModel(body, originalModel, rw.Target); ok {
+				body = next
+				peek.Model = rw.Target
+				realm, bareModel = targetRealm, targetBare
+				if envelopeOK {
+					envelope.Model = rw.Target
+				}
+				log.Printf("INFO: [server] background model alias: %s -> %s", originalModel, rw.Target)
+			}
+		}
+	}
 	modelRate := ""
 	if h.cfg.Upstream != nil {
 		modelRate = h.cfg.Upstream.ModelRate(realm, bareModel)
 	}
 
 	// 请求级统计：出口即打一行表格日志（任何路径都会走到）。
-	st := newChatStat(time.Now(), body, peek.Stream)
+	// 日志展示原始模型名（客户端实际请求的那个），否则「后台请求被改写成免费
+	// 模型」这件事在请求流水/归档里完全不可见，用户也无从核对省了多少额度。
+	st := newChatStatWithModel(time.Now(), originalModel, peek.Stream)
+	if keyID, ok := httpauth.IdentityFrom(r); ok && keyID.ID != "" {
+		st.keyID = keyID.ID
+	}
 	if tr := requestTraceFrom(r); tr != nil {
 		tr.stat = st
 		// 来源在 ServeHTTP 入口采集（此时才知道开关与请求头），此处转交给统计对象，
@@ -562,7 +735,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 会话粘性：从请求体提取会话键并解析绑定号（找不到/无效则 stickyUID 为空，走普通轮换）。
 	// ExtractKey 与粘性开关解耦（issue #35 侧）：关闭粘性时会话头族的聚合主键仍按
 	// 会话级（RequestIDForKey(sessKey)），不悄悄退化成轮级——提取本身与粘性无关。
-	sessKey := session.ExtractKey(body)
+	sessKey := session.ExtractKeyFromFields(envelope.keyFields())
+	if !envelopeOK {
+		sessKey = session.ExtractKey(body)
+	}
 	stickyUID := ""
 	if h.cfg.Session != nil && sessKey != "" {
 		// 按模型解析：绑定号在**当前模型**被 6004 限额时视为不可用 → 重新分配，
@@ -578,11 +754,17 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 清空重生成），故不再限 sessKey=="" 才计算；sessKey 由下方派生处以复合键方式
 	// 入键（防不同会话同轮文本互撞）。
 	// 必须在下方 prompt.Rewrite 之前取——改写会动 messages 内容，之后取会让键漂移。
-	turnKey := session.TurnKey(body)
+	turnKey := session.TurnKeyFromFields(envelope.turnMessages())
+	if !envelopeOK {
+		turnKey = session.TurnKey(body)
+	}
 
 	// gateway_hint 判定所需的请求形态（image_url part）：在改写前取（与 turnKey
 	// 同理）。11133「模型不支持图片」指向的前提。
-	reqHasImage := hasImagePart(body)
+	reqHasImage := envelope.hasImage()
+	if !envelopeOK {
+		reqHasImage = hasImagePart(body)
+	}
 
 	// 在途租约：成功选中即占名额；函数出口（含成功 return 与 panic）统一释放。
 	var heldUID string
@@ -655,9 +837,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		// 上游成功但省略 usage 仍是成功，反之错误体里夹带 usage 也不能算成功。
 		// 失败也计入请求数——否则重试放大在「用量」视图里看不见。
 		if h.cfg.Usage != nil {
-			realm := "cn"
-			if a, ok := h.cfg.Pool.Status(uid); ok && a.Realm != "" {
-				realm = a.Realm
+			realm := h.cfg.Pool.RealmByUID(uid)
+			if realm == "" {
+				realm = "cn"
 			}
 			h.cfg.Usage.Add(time.Now(), realm, uid, delta.Model, usage.Delta{
 				PromptTokens:     delta.PromptTokens,
@@ -676,6 +858,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				HasLatency:       delta.HasLatencyMs,
 				TokensPerSecond:  delta.TokensPerSecond,
 				HasTPS:           delta.HasTokensPerSecond,
+				KeyID:            st.keyID,
 			}, ok)
 		}
 	}
@@ -719,7 +902,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// the upstream prompt_cache_key degrades into one constant per account and
 	// every client on that account ends up sharing a single, constantly evicted
 	// prefix-cache slot.
-	convID := session.ResolveConversationID(body)
+	convID := session.ResolveConversationIDFromFields(envelope.convFields())
+	if !envelopeOK {
+		convID = session.ResolveConversationID(body)
+	}
 	if convID == "" {
 		convID = sessKey
 	}
@@ -990,6 +1176,19 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			rotates++
 			continue
 		}
+		// 防御：ChatStreamContext 对「≥400 但分类为 ErrNone」的异常信封会返回
+		// (nil, status, raw, nil)。正常路径不会到这里，但上游/代理返回畸形
+		// 状态码时不能假设 err==nil 就一定有 body，否则下面 stats/StreamHint
+		// 会 nil-panic，整条请求链 500 且账号状态不确定。按上游空响应处理。
+		if rc == nil {
+			recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, false, false, attemptStarted, 0)
+			st.status = http.StatusBadGateway
+			st.outcome = reqlog.OutcomeHTTPError
+			lastErr = &upstream.Error{Kind: upstream.ErrServer, Status: http.StatusBadGateway, Msg: "upstream returned an empty response"}
+			log.Printf("WARN: [server] upstream returned status %d with empty body acct=%s model=%s body=%s",
+				status, logfmt.Label(acct.UID, acct.Nickname), bareModel, logfmt.Truncate(string(respBody), 200))
+			break
+		}
 		// 成功判定与粘性绑定一律**延后到这一跳真正成功之后**（见下方流式/非流式分支）：
 		// 上游「200 已开流 + 一帧 error」是真实形态（6004 限流、内容拦截、审核），
 		// 此前在读第一帧之前就 NoteSuccess + 清 11102 负缓存 + 绑粘性 → 被限流的号
@@ -1055,24 +1254,34 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				}
 				log.Printf("WARN: [server] stream acct=%s model=%s: error frame before content kind=%s (no rotate) payload=%s",
 					logfmt.Label(acct.UID, acct.Nickname), bareModel, kind, logfmt.Truncate(held.Payload, 200))
-				st.status = http.StatusOK
-				st.outcome = reqlog.OutcomeStreamError
-				if werr := writeHeldStreamError(w, held.Payload); werr != nil {
-					st.outcome = reqlog.OutcomeInterrupted
+				// 正文前且无可换账号：客户端一个字节都还没收到（StreamHint 现在
+				// 延迟提交 200），返回真实状态码 + 上游原文，而不是 200 SSE error 帧
+				// ——后者会被部分 SDK 当作「成功但空回答」。协议入口会在 Finish 时
+				// 再翻成 native 错误信封（requestId/extError 随原文保留）。
+				status, code := heldStreamStatus(kind)
+				msg := strings.TrimSpace(held.Payload)
+				if msg == "" {
+					msg = "upstream request failed before any content"
 				}
+				writeOpenAIErrorHint(w, status, code, msg,
+					h.hintOf(kind, held.Payload, bareModel, reqHasImage, nil))
+				st.status = status
+				st.outcome = reqlog.OutcomeStreamError
 				return
 			}
 			switch {
 			case upstream.IsEmptyStreamError(sErr):
-				// 上游 200 但空流（0 有效帧）：StreamHint 已写 error 帧 + [DONE]
-				// 兜底（HTTP 头已发出只能 200），但这是上游缺陷不是成功——日志/
-				// 状态收敛到 502 观测，与非流式 Aggregate 空流→502 upstream_parse
-				// 同语义（此前 `_ =` 吞错把失败流记成 200，运维看到假成功）。
+				// 上游 200 但空流（0 有效帧）：StreamHint 现在一个字节都不写
+				//（200 成功头延迟到首个正文帧），因此这里能返回真实 502 JSON，
+				// 而不是先提交 200 再在流里塞 error 帧。与非流式 Aggregate 空流
+				// →502 upstream_parse 同语义。协议入口经 protocolStreamWriter 会
+				// 把它翻成 native error 信封。
 				// 只认 IsEmptyStreamError：客户端断连的写失败不误标（人已走，
 				// 502 观测没有意义）。
 				st.status = http.StatusBadGateway
 				st.outcome = reqlog.OutcomeStreamError
 				attemptOK = false
+				writeOpenAIError(w, http.StatusBadGateway, "upstream_parse", "upstream returned an empty stream")
 				log.Printf("WARN: [server] stream acct=%s model=%s: empty upstream stream (200+0 frames)", logfmt.Label(acct.UID, acct.Nickname), bareModel)
 			case errFrame != "":
 				// 上游以 error 帧报错（6004 限流 / 内容拦截 / 审核）：按帧内容分类并
@@ -1081,6 +1290,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				// 整个会话钉在它身上，后续每轮都失败。
 				kind := upstream.FrameKind(errFrame)
 				h.applyErrorPolicy(acct.UID, kind, errFrame, bareModel, nil)
+				// 正文已经写出，不能换号；但本次尝试的租约必须释放，且若失败的正是
+				// 粘性号，必须解绑——否则下一轮仍会被 ResolveForModel 钉在这个号上
+				// （6004 只锁模型，账号对其他模型仍健康，粘性校验未必能挡住）。
+				fail(acct.UID)
 				st.status = http.StatusServiceUnavailable
 				st.outcome = reqlog.OutcomeStreamError
 				attemptOK = false
@@ -1111,14 +1324,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 						logfmt.Label(acct.UID, acct.Nickname), bareModel, sErr)
 				}
 			case sErr != nil:
-				// 客户端写失败（断连）：上游帧无恙，账号健康——账号侧照常记成功
-				// （与 default 同语义），请求日志归为 Interrupted（人已走，未完成）。
+				// 客户端写失败（断连）：账号侧**不洗白**——写失败发生在哪个时刻都可能，
+				// 上游可能只发了一半甚至刚开流；没有完整读完就不能证明该号成功。
+				// 与读侧「客户端已断连」分支同口径：不罚号、不记 usage 错误，但也绝不
+				// NoteSuccess / 清 11102 / 绑粘性（否则一个限流号会在用户点停止时被
+				// 记成健康，粘性把会话继续钉在它身上）。
 				st.outcome = reqlog.OutcomeInterrupted
-				h.cfg.Pool.NoteSuccess(acct.UID)
-				h.cfg.Pool.BlockModelClear(acct.UID, bareModel)
-				if sessKey != "" && h.cfg.Session != nil {
-					h.cfg.Session.Bind(sessKey, acct.UID)
-				}
 			default:
 				// 真成功：这一跳读完且上游没有报错，才记成功并让粘性跟上。
 				st.outcome = reqlog.OutcomeSuccess
@@ -1425,29 +1636,29 @@ func usageCreditTotal(resp map[string]any) (credit float64, total int, ok bool) 
 // 不能用 Pick 的返回值：全冷却时 Pick 会捞「最早到期」的冷却号再试一次，
 // 那一跳几乎必然再 429，等于把限流错误交回用户。
 func (h *Handler) poolHasRotatable(tried map[string]bool, model, realm string) bool {
-	for _, uid := range h.cfg.Pool.AvailableUIDsForModelRealm(model, realm) {
-		if !tried[uid] {
-			return true
-		}
-	}
-	return false
+	return h.cfg.Pool.HasRotatable(tried, model, realm)
 }
 
-// writeHeldStreamError 把扣住的上游 error 帧补写给客户端（后面没有可换的号时）。
-// 与 StreamHint 的 error 透传同形：一帧 data + [DONE]，客户端能正常收尾。
-func writeHeldStreamError(w http.ResponseWriter, payload string) error {
-	h := w.Header()
-	h.Set("Content-Type", "text/event-stream")
-	h.Set("Cache-Control", "no-cache")
-	h.Set("Connection", "keep-alive")
-	h.Set("X-Accel-Buffering", "no")
-	if _, err := io.WriteString(w, "data: "+payload+"\n\ndata: [DONE]\n\n"); err != nil {
-		return err
+// heldStreamStatus maps a pre-content upstream error frame to the real HTTP
+// status/code returned when no other account can be rotated in. A model-level
+// rate limit stays retryable 429; request-level failures are 400; everything
+// else is an upstream fault (502).
+func heldStreamStatus(kind upstream.ErrKind) (int, string) {
+	switch kind {
+	case upstream.ErrSoftRate:
+		return http.StatusTooManyRequests, "rate_limit_exceeded"
+	case upstream.ErrContentBlocked:
+		return http.StatusBadRequest, "content_blocked"
+	case upstream.ErrModelBlocked:
+		return http.StatusBadRequest, "model_unavailable"
+	case upstream.ErrPromptTooLong:
+		return http.StatusBadRequest, "prompt_too_long"
+	case upstream.ErrImageInvalid:
+		return http.StatusBadRequest, "image_invalid"
+	case upstream.ErrBadParams:
+		return http.StatusBadRequest, "bad_params"
 	}
-	if fl, ok := w.(http.Flusher); ok {
-		fl.Flush()
-	}
-	return nil
+	return http.StatusBadGateway, "upstream_error"
 }
 
 // rotateBackoff 轮转间指数退避 + 抖动（WAF 403 修复 P0-2）：第 i 次轮转失败
@@ -1689,6 +1900,28 @@ func writeOpenAIErrorHint(w http.ResponseWriter, status int, code, msg, hint str
 			"gateway_hint": hint,
 		},
 	})
+}
+
+// jsonStringField / jsonBoolField 只用于结构化解析失败时的 model/stream
+// 快速兜底；工具、会话与图片等仍由旧解析器各自处理，保持原宽容度。
+func jsonStringField(body []byte, key string) string {
+	var obj map[string]json.RawMessage
+	if json.Unmarshal(body, &obj) != nil {
+		return ""
+	}
+	var v string
+	_ = json.Unmarshal(obj[key], &v)
+	return v
+}
+
+func jsonBoolField(body []byte, key string) bool {
+	var obj map[string]json.RawMessage
+	if json.Unmarshal(body, &obj) != nil {
+		return false
+	}
+	var v bool
+	_ = json.Unmarshal(obj[key], &v)
+	return v
 }
 
 // hasImagePart 报告聊天请求体是否携带多模态 image_url part（OpenAI 兼容形态

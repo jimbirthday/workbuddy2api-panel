@@ -5447,11 +5447,7 @@ async function runBenefitAction(ref, act, label) {
       if (act === 'daily_chat') path = 'benefits/' + encodeURIComponent(ref) + '/daily_chat';
       else if (act === 'streak') path = 'benefits/' + encodeURIComponent(ref) + '/streak';
       else if (act === 'travel') path = 'benefits/' + encodeURIComponent(ref) + '/travel';
-      else if (act === 'checkin') {
-        // 签到仍复用账号动作端点；完整 UID 由后端短引用解析后由前端使用？
-        // 这里不能拿完整 UID，因此改走福利专用签到入口（见 statusActionRef）。
-        path = 'benefits/' + encodeURIComponent(ref) + '/checkin';
-      }
+      else if (act === 'checkin') path = 'benefits/' + encodeURIComponent(ref) + '/checkin';
       const r = await api(path, { method: 'POST' });
       const msg = (r && (r.message || r.checkin_message)) || (label + '完成');
       toast(msg, r && r.success === false ? 'err' : 'ok');

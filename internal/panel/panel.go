@@ -300,6 +300,7 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/daily_chat_all", p.withAuth(p.dailyChatAll))
 	p.mux.HandleFunc("POST /panel/api/streak_all", p.withAuth(p.streakAll))
 	p.mux.HandleFunc("POST /panel/api/benefits/{ref}/daily_chat", p.withAuth(p.benefitsDailyChat))
+	p.mux.HandleFunc("POST /panel/api/benefits/{ref}/daily_chat_web", p.withAuth(p.benefitsDailyChatWeb))
 	p.mux.HandleFunc("POST /panel/api/benefits/{ref}/streak", p.withAuth(p.benefitsStreak))
 	p.mux.HandleFunc("POST /panel/api/benefits/{ref}/travel", p.withAuth(p.benefitsTravel))
 	p.mux.HandleFunc("GET /panel/api/benefits/{ref}/tasks", p.withAuth(p.benefitsTasks))
@@ -1108,6 +1109,18 @@ func (p *Panel) rememberBenefitRefs(statuses []pool.Status) {
 
 // benefitsAccount 取福利单号动作的目标账号，并检查它属于该动作的体系。
 // 入参是页面持有的短引用；完整 UID 只在服务端解析，不随页面下发。
+// benefitUIDForRef 把页面短引用解析为完整 UID；仅供服务端内部查询使用。
+// 未知/过期引用返回空串，调用方不得据此回退到客户端输入。
+func (p *Panel) benefitUIDForRef(ref string) string {
+	ref = strings.TrimSpace(ref)
+	if ref == "" {
+		return ""
+	}
+	p.benefitRefMu.Lock()
+	defer p.benefitRefMu.Unlock()
+	return p.benefitRefs[ref]
+}
+
 func (p *Panel) benefitsAccount(ref string, wantGlobal bool) (*auth.Auth, string) {
 	ref = strings.TrimSpace(ref)
 	if ref == "" {
@@ -1160,6 +1173,38 @@ func (p *Panel) benefitsDailyChat(w http.ResponseWriter, r *http.Request) {
 		UID: uid, Nickname: a.Nickname, Realm: a.Realm(), Task: activity.TaskDailyChat,
 		Trigger: activity.TriggerManual, OK: res.OK,
 		Message: dailyChatResultMessage(res),
+	})
+	p.invalidateOverview()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "success": res.OK, "conversation": res.Conversation,
+		"status": res.Status, "chunks": res.Chunks, "elapsed_ms": res.ElapsedMS,
+		"error": res.Error, "message": dailyChatResultMessage(res),
+	})
+}
+
+// benefitsDailyChatWeb 单号网页通道打卡。与 Hub 的 daily-chat-web 对齐：
+// 只建网页端会话，不发桌面腿；手动补打不写“今日已打卡”闸门，避免影响定时巡检。
+func (p *Panel) benefitsDailyChatWeb(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.Upstream == nil {
+		writeErr(w, http.StatusNotImplemented, "upstream client unavailable")
+		return
+	}
+	a, msg := p.benefitsAccount(r.PathValue("ref"), true)
+	if a == nil {
+		writeErr(w, http.StatusBadRequest, msg)
+		return
+	}
+	uid := a.UID
+	if !p.tryLockAccount(uid) {
+		writeErr(w, http.StatusConflict, "account operation already running")
+		return
+	}
+	defer p.unlockAccount(uid)
+	res := p.cfg.Upstream.DailyChatWeb(a, "deepseek-v4.1-flash")
+	_ = p.cfg.Activity.Append(activity.Record{
+		UID: uid, Nickname: a.Nickname, Realm: a.Realm(), Task: activity.TaskDailyChat,
+		Trigger: activity.TriggerManual, OK: res.OK,
+		Message: "网页通道打卡：" + dailyChatResultMessage(res),
 	})
 	p.invalidateOverview()
 	writeJSON(w, http.StatusOK, map[string]any{

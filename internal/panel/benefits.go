@@ -33,6 +33,24 @@ var benefitsGrowthTimeout = 12 * time.Second
 func (p *Panel) benefitsOverview(w http.ResponseWriter, r *http.Request) {
 	statuses := p.cfg.Pool.List()
 	p.rememberBenefitRefs(statuses)
+	// 聚焦对象在池的原始顺序上确定（Hub 默认第一个启用中的国内个人号），
+	// 之后再按区域/昵称排序展示；否则排序会改变“默认选谁”，导致刷新后
+	// 选择器跳到另一个账号。
+	focusRef := strings.TrimSpace(r.URL.Query().Get("focus"))
+	focusUID := p.benefitUIDForRef(focusRef)
+	focusPoolUID := ""
+	for _, st := range statuses {
+		if st.Realm != "cn" || st.Enterprise || st.Disabled {
+			continue
+		}
+		if focusUID != "" && st.UID == focusUID {
+			focusPoolUID = st.UID
+			break
+		}
+		if focusPoolUID == "" {
+			focusPoolUID = st.UID
+		}
+	}
 	sort.SliceStable(statuses, func(i, j int) bool {
 		if statuses[i].Realm != statuses[j].Realm {
 			return statuses[i].Realm < statuses[j].Realm
@@ -99,6 +117,9 @@ func (p *Panel) benefitsOverview(w http.ResponseWriter, r *http.Request) {
 		Tier14d         string `json:"tier_14d,omitempty"`
 		Tier28d         string `json:"tier_28d,omitempty"`
 		GrowthError     string `json:"growth_error,omitempty"`
+		// Focused 标记当前选择器聚焦的账号；该账号的成长任务明细统一从
+		// 顶层 task_rows 返回，避免每个账号都复制一份完整任务列表。
+		Focused bool `json:"focused,omitempty"`
 	}
 
 	summary := struct {
@@ -274,6 +295,29 @@ func (p *Panel) benefitsOverview(w http.ResponseWriter, r *http.Request) {
 	summary.LastActivityTask = lastTask
 	summary.TodayFailed = todayFailed
 
+	// 选择器聚焦：Hub 的任务页一次展示一个国内个人号的成长任务明细。
+	// focus 是页面持有的服务端短引用；未知/过期引用回落到第一个可用国内号。
+	// 任务列表已在 benefitsGrowthSnapshot 中随成长汇总一起拉取，这里只复用
+	// 快照，不再额外请求两个任务端点（否则每轮概览会多打 2N 次上游）。
+	taskRows := []upstream.Task{}
+	taskRowsErr := ""
+	if focusPoolUID != "" {
+		for i := range out {
+			if benefitRefFor(focusPoolUID) != out[i].Ref {
+				continue
+			}
+			out[i].Focused = true
+			if g, ok := growthByUID[focusPoolUID]; ok {
+				taskRows = g.Tasks
+				taskRowsErr = g.TasksErr
+				if g.TasksErr != "" && out[i].GrowthError == "" {
+					out[i].GrowthError = g.TasksErr
+				}
+			}
+			break
+		}
+	}
+
 	welfareGrants := p.welfareGrantRows()
 	for _, row := range welfareGrants.rows {
 		summary.WelfareCreditsTotal += row.Size
@@ -285,10 +329,12 @@ func (p *Panel) benefitsOverview(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":            true,
-		"summary":       summary,
-		"accounts":      out,
-		"recent_grants": welfareGrants.recent,
+		"ok":              true,
+		"summary":         summary,
+		"accounts":        out,
+		"recent_grants":   welfareGrants.recent,
+		"task_rows":       taskRows,
+		"task_rows_error": taskRowsErr,
 	})
 }
 
@@ -523,6 +569,8 @@ type benefitGrowth struct {
 	Tier7d         string
 	Tier14d        string
 	Tier28d        string
+	Tasks          []upstream.Task
+	TasksErr       string
 	Err            string
 }
 
@@ -561,6 +609,31 @@ func (p *Panel) growthResult(ctx context.Context, a *auth.Auth) benefitGrowth {
 			g.CatDailyDone = tr.DailyLimitReached
 		} else if err != nil && g.Err == "" {
 			g.Err = err.Error()
+		}
+		// 成长任务列表与汇总共用同一账号快照：默认口径为全量，mp 口径只补
+		// 专属任务。两路都失败时才把任务明细标错；一路成功仍展示已有任务，
+		// 与 Hub fetch_growth_tasks 的宽松口径一致。
+		tasks, tasksErr := p.cfg.Upstream.ListTasksContext(ctx, a)
+		if tasksErr == nil {
+			mpTasks, mpErr := p.cfg.Upstream.ListTasksMPContext(ctx, a)
+			if mpErr == nil {
+				seen := make(map[string]bool, len(tasks))
+				for _, t := range tasks {
+					seen[t.TaskCode] = true
+				}
+				for _, t := range mpTasks {
+					if !seen[t.TaskCode] {
+						tasks = append(tasks, t)
+						seen[t.TaskCode] = true
+					}
+				}
+			}
+			g.Tasks = tasks
+		} else {
+			g.TasksErr = tasksErr.Error()
+			if g.Err == "" {
+				g.Err = tasksErr.Error()
+			}
 		}
 		done <- result{g: g}
 	}()

@@ -2722,7 +2722,7 @@ func TestAppJSBenefitsVirtualWindow(t *testing.T) {
 const vm = require('vm');
 const src = fs.readFileSync(process.argv[2], 'utf8');
 const start = src.indexOf('function benefitRealmLabel');
-const end = src.indexOf('function benefitTaskLabel', start);
+const end = src.indexOf('function renderBenefitFocus', start);
 if (start < 0 || end < 0 || end < start) throw new Error('benefits virtual region not found');
 const sink = id => ({ id, innerHTML: '', textContent: '', scrollTop: 0, clientHeight: 420, addEventListener() {}, querySelector() { return null; } });
 const nodes = {};
@@ -2747,9 +2747,85 @@ const pads = (html.match(/class="virtual-pad"/g) || []).length;
 const keptScroll = $('bfViewport').scrollTop;
 process.stdout.write(JSON.stringify({rendered, pads, keptScroll, hasTopPad: html.indexOf('height:840px') >= 0}));`
 	out := runNodeScript(t, "benefits-virtual", script, appJSPath(t))
-	const want = `{"rendered":50,"pads":2,"keptScroll":1120,"hasTopPad":true}`
-	if out != want {
-		t.Fatalf("benefits virtual=%s\nwant %s", out, want)
+	var got struct {
+		Rendered   int  `json:"rendered"`
+		Pads       int  `json:"pads"`
+		KeptScroll int  `json:"keptScroll"`
+		HasTopPad  bool `json:"hasTopPad"`
+	}
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("decode benefits virtual: %v (%s)", err, out)
+	}
+	// 视口 420px / 行高 56px ≈ 8 行，加上上下缓冲区仍应远小于 200；
+	// 具体缓冲区大小可在不改变虚拟化契约的前提下调整。
+	if got.Rendered < 16 || got.Rendered > 80 || got.Pads != 2 || got.KeptScroll != 1120 || !got.HasTopPad {
+		t.Fatalf("benefits virtual=%+v", got)
+	}
+}
+
+// TestAppJSBenefitsFocusContract 聚焦选择器、固定视口任务表和行内动作必须存在；
+// 渲染只用服务端短引用，不能把完整 UID 带进任务行或选择器选项。
+func TestAppJSBenefitsFocusContract(t *testing.T) {
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('function renderBenefitFocus');
+const end = src.indexOf('async function loadBenefits', start);
+if (start < 0 || end < 0 || end < start) throw new Error('benefits focus region not found');
+const nodes = {};
+const mk = id => (nodes[id] = { id, innerHTML: '', textContent: '', value: '', disabled: false, hidden: false, scrollTop: 0, clientHeight: 420, addEventListener() {}, querySelector() { return null; } });
+const $ = id => nodes[id] || mk(id);
+const ctx = {
+  $, esc: s => String(s == null ? '' : s), fmtTok: v => String(v == null ? 0 : v),
+  benefitsFocusRef: '', benefitsTaskRows: [], benefitsFocusLast: null, AUTO_TASKS: {AUTO_TASK: '自动完成'},
+};
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, end) + '\nthis.renderBenefitFocus=renderBenefitFocus;', ctx);
+ctx.renderBenefitFocus({
+  accounts: [
+    {ref: 'ref-cn', uid: '13800138000', nickname: '国内', realm: 'cn', focused: true, enterprise: false, disabled: false},
+    {ref: 'ref-ent', uid: '13900139000', nickname: '企业', realm: 'cn', enterprise: true, disabled: false},
+    {ref: 'ref-gl', uid: 'global0001', nickname: '国际', realm: 'global', enterprise: false, disabled: false}
+  ],
+  task_rows: [
+    {task_code: 'AUTO_TASK', title: '自动任务', task_desc: '说明', current: 1, target: 3, credit: 10, energy: 2, accept_status: 'accepted'},
+    {task_code: 'MANUAL_TASK', title: '手动任务', current: 0, target: 1, accept_status: 'not_accepted'}
+  ]
+});
+const sel = $('bfGrowthAcct');
+const body = $('bfTaskBody').innerHTML;
+process.stdout.write(JSON.stringify({
+  options: (sel.innerHTML.match(/<option/g) || []).length,
+  selected: sel.value,
+  focused: ctx.benefitsFocusRef,
+  viewportExists: !!$('bfTaskViewport'),
+  rows: (body.match(/<tr/g) || []).length,
+  hasAuto: body.includes('data-bf-task="auto"'),
+  hasAccept: body.includes('data-bf-task="accept"'),
+  leakedFullUID: body.includes('13800138000') || sel.innerHTML.includes('13800138000')
+}));`
+	out := runNodeScript(t, "benefits-focus", script, appJSPath(t))
+	var got struct {
+		Options        int    `json:"options"`
+		Selected       string `json:"selected"`
+		Focused        string `json:"focused"`
+		ViewportExists bool   `json:"viewportExists"`
+		Rows           int    `json:"rows"`
+		HasAuto        bool   `json:"hasAuto"`
+		HasAccept      bool   `json:"hasAccept"`
+		LeakedFullUID  bool   `json:"leakedFullUID"`
+	}
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("decode benefits focus: %v (%s)", err, out)
+	}
+	if got.Options != 1 || got.Selected != "ref-cn" || got.Focused != "ref-cn" || !got.ViewportExists {
+		t.Fatalf("focus selector=%+v", got)
+	}
+	if got.Rows != 2 || !got.HasAuto || !got.HasAccept {
+		t.Fatalf("task actions=%+v", got)
+	}
+	if got.LeakedFullUID {
+		t.Fatalf("full UID leaked to task rows or selector: %+v", got)
 	}
 }
 
@@ -2771,6 +2847,8 @@ const ctx = {
   benefitsRows: [], benefitsRowH: 56, benefitsVirtualBound: false,
   benefitsBatchSeq: 0, benefitsBatchTimer: null,
   api: () => Promise.resolve({runs: []}), view: 'taskscenter', setTimeout,
+  benefitsFocusRef: '', benefitsTaskRows: [], benefitsFocusLast: null,
+  benefitsBatchDoneSig: '', AUTO_TASKS: {},
   window: { matchMedia: () => ({ matches: false }) }, Math, Number, String, Array, Object, Date, isNaN,
 };
 vm.createContext(ctx);

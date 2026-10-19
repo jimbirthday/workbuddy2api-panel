@@ -395,6 +395,17 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 .benefits-grants-wrap th { position: sticky; top: 0; z-index: 2; background: var(--surface-2); }
 .bf-acts { white-space: nowrap; }
 .bf-acts button { margin: 2px 4px 2px 0; }
+.benefits-focus > header { gap: 8px; }
+.benefits-focus .sel-note { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.benefits-focus select { max-width: 230px; }
+.bf-focus-summary { display: flex; flex-wrap: wrap; gap: 8px 18px; color: var(--ink-2); font-size: 12px; }
+.bf-focus-summary .bf-chip { border: 1px solid var(--line); border-radius: 999px; padding: 4px 10px; background: var(--surface-2); }
+.benefits-tasks { max-height: clamp(260px, 42vh, 520px); overflow: auto; }
+.benefits-tasks .acc { min-width: 860px; }
+.benefits-tasks th { position: sticky; top: 0; z-index: 2; }
+.benefits-tasks .task-desc { max-width: 360px; color: var(--ink-3); font-size: 12px; white-space: normal; line-height: 1.45; }
+.benefits-tasks .task-prog { white-space: nowrap; }
+.benefits-tasks .task-acts { white-space: nowrap; }
 .view-acts { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
 .acc { width: 100%; border-collapse: collapse; font-size: 13px; min-width: 640px; }
 .acc th {
@@ -1305,6 +1316,26 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
               </label>
             </div>
           </div>
+        </div>
+      </div>
+      <div class="box benefits-focus">
+        <header>
+          <h3>国内版任务与福利 <span class="hint">Hub 同口径：选择一个账号查看成长任务，动作只作用于该账号</span></h3>
+          <span class="grow"></span>
+          <label class="sel-note">账号
+            <select id="bfGrowthAcct" aria-label="选择国内版账号"></select>
+          </label>
+          <button class="xs" id="bfBtnFocusCheckin" title="执行该账号 Buddy 签到并刷新余额">Buddy 签到</button>
+          <button class="xs primary" id="bfBtnFocusRun" title="接取并执行该账号全部可自动成长任务">一键做任务</button>
+          <button class="xs" id="bfBtnFocusTravel" title="该账号猫猫旅行巡检">猫猫旅行</button>
+          <button class="xs" id="bfBtnFocusStreak" title="该账号连登兑换与抽奖">连登与抽奖</button>
+        </header>
+        <div class="pad bf-focus-summary" id="bfFocusSummary"></div>
+        <div class="tbl-wrap benefits-tasks acc-viewport" id="bfTaskViewport" tabindex="0" aria-label="成长任务明细表格">
+          <table class="acc">
+            <thead><tr><th>任务名称 / 代码</th><th>说明</th><th>进度</th><th>奖励</th><th>状态</th><th>操作</th></tr></thead>
+            <tbody id="bfTaskBody"><tr><td colspan="6"><div class="empty">读取中…</div></td></tr></tbody>
+          </table>
         </div>
       </div>
       <div class="box">

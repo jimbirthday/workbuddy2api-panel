@@ -2,6 +2,7 @@ package panel
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -172,5 +173,102 @@ func TestBenefitsWelfareGrantsFromSnapshot(t *testing.T) {
 	empty.ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK || !strings.Contains(rr.Body.String(), `"welfare_grants_available":false`) {
 		t.Fatalf("empty snapshot must be explicit: %d %s", rr.Code, rr.Body.String())
+	}
+}
+
+// TestBenefitsFocusReusesGrowthSnapshot 福利页的聚焦任务明细必须来自同一次
+// 成长快照，不能为聚焦账号额外打任务列表端点；focus 使用短引用且只回显 uid8。
+func TestBenefitsFocusReusesGrowthSnapshot(t *testing.T) {
+	pl := pool.New("")
+	first := &auth.Auth{UID: "13800138000", Nickname: "甲", AccessToken: "at1"}
+	second := &auth.Auth{UID: "13900139000", Nickname: "乙", AccessToken: "at2"}
+	ent := &auth.Auth{UID: "enterprise-1", Nickname: "企业", EnterpriseID: "ent-1", AccessToken: "at3"}
+	gl := &auth.Auth{UID: "global-1", Nickname: "国际", Domain: "www.workbuddy.ai", AccessToken: "at4"}
+	pl.Add(first)
+	pl.Add(second)
+	pl.Add(ent)
+	pl.Add(gl)
+
+	calls := 0
+	up := upstream.New()
+	up.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		calls++
+		body := `{"code":0,"msg":"ok","data":{"tasks":[]}}`
+		switch {
+		case strings.Contains(r.URL.Path, "/activity/growth/streak"):
+			body = `{"code":0,"msg":"ok","data":{"streak":{"days":3},"makeup_cards":{"balance":1},"redemption_status":{"tier_7d_status":"locked","tier_14d_status":"locked","tier_28d_status":"locked"}}}`
+		case strings.Contains(r.URL.Path, "/activity/growth/lottery/summary"):
+			body = `{"code":0,"msg":"ok","data":{"chances":2}}`
+		case strings.Contains(r.URL.Path, "/activity/growth/energy"):
+			body = `{"code":0,"msg":"ok","data":{"balance":7}}`
+		case strings.Contains(r.URL.Path, "/buddy/travel/status"):
+			body = `{"code":0,"msg":"ok","data":{"state":"home"}}`
+		}
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(body))}, nil
+	})}
+	p := New(Config{Version: "test", APIKey: "k", Pool: pl, Upstream: up})
+
+	req := httptest.NewRequest(http.MethodGet, "/panel/api/benefits", nil)
+	req.Header.Set("Authorization", "Bearer k")
+	rr := httptest.NewRecorder()
+	p.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if strings.Contains(rr.Body.String(), first.UID) || strings.Contains(rr.Body.String(), second.UID) {
+		t.Fatalf("benefits leaked full UID: %s", rr.Body.String())
+	}
+	var out struct {
+		Accounts []struct {
+			UID     string `json:"uid"`
+			Ref     string `json:"ref"`
+			Focused bool   `json:"focused"`
+			Realm   string `json:"realm"`
+		} `json:"accounts"`
+		TaskRows []upstream.Task `json:"task_rows"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	var focused string
+	for _, a := range out.Accounts {
+		if a.Focused {
+			if focused != "" {
+				t.Fatalf("multiple focused accounts: %+v", out.Accounts)
+			}
+			focused = a.Ref
+			if a.UID != statusUID8(first.UID) {
+				t.Fatalf("default focus=%q want first CN personal account", a.UID)
+			}
+		}
+	}
+	if focused == "" {
+		t.Fatalf("no focused account: %+v", out.Accounts)
+	}
+	if out.TaskRows == nil {
+		t.Fatal("task_rows must be an empty array, not null")
+	}
+	firstCalls := calls
+
+	req = httptest.NewRequest(http.MethodGet, "/panel/api/benefits?focus="+benefitRefFor(second.UID), nil)
+	req.Header.Set("Authorization", "Bearer k")
+	rr = httptest.NewRecorder()
+	p.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("focus code=%d body=%s", rr.Code, rr.Body.String())
+	}
+	out.Accounts = nil
+	if err := json.Unmarshal(rr.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range out.Accounts {
+		if a.Focused && a.UID != statusUID8(second.UID) {
+			t.Fatalf("focus selected %q want %q", a.UID, statusUID8(second.UID))
+		}
+	}
+	// 第二次快照只重跑同一份成长快照；focus 不应再额外打任务列表端点。
+	// 首次 12 次 = 2 个国内个人号 ×（streak/lottery/energy/travel/task/mp-task）。
+	if delta := calls - firstCalls; delta != firstCalls {
+		t.Fatalf("focus caused extra upstream calls: delta=%d first=%d", delta, firstCalls)
 	}
 }

@@ -57,7 +57,7 @@ func TestTaskAccountLockCrossEntryShared(t *testing.T) {
 	p.unlockAccount("u1")
 }
 
-// TestTaskAcceptHandlersUseAccountLock accept / accept_all 两个入口必须与
+// TestTaskAcceptHandlersUseAccountLock accept / accept_all / claim 三个入口必须与
 // auto_all / 任务队列共用账号锁：锁被占用时直接 409，不再打上游（回归护栏）。
 func TestTaskAcceptHandlersUseAccountLock(t *testing.T) {
 	p := New(Config{Version: "test", APIKey: "k", Pool: pool.New("")})
@@ -75,6 +75,7 @@ func TestTaskAcceptHandlersUseAccountLock(t *testing.T) {
 	}{
 		{"accept", p.accountTaskAccept, `{"task_codes":["t1"]}`},
 		{"accept_all", p.taskAcceptAll, `{}`},
+		{"claim", p.accountTaskClaim, `{"task_code":"t1"}`},
 	}
 	for _, c := range cases {
 		r := httptest.NewRequest("POST", "/panel/api/accounts/u1/tasks/x", strings.NewReader(c.body))

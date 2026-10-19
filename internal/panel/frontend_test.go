@@ -1400,8 +1400,8 @@ const inert = new Proxy(function () {}, {
   get(t, k) { if (k === Symbol.toPrimitive) return () => ''; return inert; },
   set() { return true; }, apply() { return inert; }, construct() { return inert; },
 });
-// go() 会写 #ttl；真实 DOM 元素可赋值，Proxy 函数不能，单独给一个普通对象。
-const ttl = { textContent: '', hidden: false };
+// go() 会写 Hub 顶栏副标题 #navSub；Proxy 函数不能赋值，单独给一个普通对象。
+const navSub = { textContent: '', hidden: false };
 const timeouts = new Map();
 let nextTimer = 1;
 let fetchImpl = () => Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(sandbox.__scan || {}) });
@@ -1413,7 +1413,7 @@ const sandbox = {
   document: {
     querySelectorAll: sel => sel === '.view' ? [{ id: 'view-accounts' }, { id: 'view-taskscenter' }] : sel === '.nav a' ? [] : [],
     querySelector: () => inert,
-    getElementById: id => id === 'btnScanAll' ? btn : id === 'ttl' ? ttl : inert,
+    getElementById: id => id === 'btnScanAll' ? btn : id === 'navSub' ? navSub : inert,
     addEventListener() {}, documentElement: inert, head: inert, body: inert,
     createElement: () => ({ style: {}, classList: { add() {}, remove() {} }, appendChild() {}, remove() {} }),
     cookie: '',

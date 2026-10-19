@@ -225,6 +225,9 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 		Nickname:     acct.Nickname,
 		FilePath:     filepath.Join(p.cfg.AuthDir, fmt.Sprintf("workbuddy-%s.json", acct.UID)),
 	}
+	// 登录返回的 token 是当前身份权威来源：JWT 有企业 claim 时覆盖 acct 端点的
+	// 旧值；无 claim 时保留 API 显式 enterpriseId（部分企业 token 不带 claim）。
+	a.InitEnterpriseIdentity()
 	// global 登录：落盘 auth.realm=global（Realm() 按此判域；不写则依赖 domain 后缀回落）。
 	if sess.realm == "global" {
 		if _, err := auth.BackfillRealmFor(a, "global"); err != nil {

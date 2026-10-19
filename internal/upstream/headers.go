@@ -180,9 +180,13 @@ func (c *Client) injectCodeBuddyRequest(req *http.Request) {
 // 复用同值；TraceID 透传入站值（空 = 回落 conversationRequestID）。
 // messageID（消息级，每条独立）由 ChatHeaders 内部生成，无需外部可见。
 type ChatMeta struct {
-	ConversationID        string // X-Conversation-ID：body 提取的入站值，空则不发（透传优先，不伪造）
-	ConversationRequestID string // X-Conversation-Request-ID / X-Root-Request-ID：聚合主键，必发
-	TraceID               string // X-Trace-ID：入站透传值，空则回落 conversationRequestID
+	ConversationID string // X-Conversation-ID：body 提取的入站值，空则不发（透传优先，不伪造）
+	// PromptCacheConversationID 是图片请求派生出的会话源。非空时 ChatStreamContext
+	// 会把 X-Conversation-ID 与 prompt_cache_key 一起切到该值（上游按会话头绑定
+	// 图片状态，只改缓存键仍会 11135）；无图/空则两者都回落 ConversationID。
+	PromptCacheConversationID string
+	ConversationRequestID     string // X-Conversation-Request-ID / X-Root-Request-ID：聚合主键，必发
+	TraceID                   string // X-Trace-ID：入站透传值，空则回落 conversationRequestID
 }
 
 // ChatHeaders 在 common 之上加 chat 专属的账号头。
@@ -212,8 +216,11 @@ func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth, clientIP string, m
 	// （X-No-Enterprise-Id=1 声明无企业 + X-Domain=www.workbuddy.ai 声明国际版域），
 	// 且不回退 X-Domain 到登录会话原值——对齐 intl 项目出站头。
 	if a != nil && !a.IsGlobal() {
-		if a.EnterpriseID != "" {
-			req.Header.Set("X-Enterprise-Id", a.EnterpriseID)
+		if eid := a.EnterpriseIDValue(); eid != "" {
+			req.Header.Set("X-Enterprise-Id", eid)
+			// 企业聊天与 billing 同口径：上游按租户路由时两个头都读，只带
+			// X-Enterprise-Id 会让聊天落到默认租户。个人号仍只发 X-No-*。
+			req.Header.Set("X-Tenant-Id", eid)
 		} else {
 			req.Header.Set("X-No-Enterprise-Id", "1")
 		}
@@ -243,6 +250,14 @@ func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth, clientIP string, m
 // 仅 global realm 注入；CN 账号走既有 X-No-Department-Info 等分支，零回归。
 func (c *Client) injectGlobalChatHeaders(req *http.Request, a *auth.Auth) {
 	if a == nil || !a.IsGlobal() {
+		return
+	}
+	// global 与企业是两个正交维度：global 企业号仍有租户。先发企业双头，
+	// 只有真正无企业的 global 个人号才声明 X-No-Enterprise-Id。
+	if eid := a.EnterpriseIDValue(); eid != "" {
+		req.Header.Set("X-Enterprise-Id", eid)
+		req.Header.Set("X-Tenant-Id", eid)
+		req.Header.Set("X-Domain", "www.workbuddy.ai")
 		return
 	}
 	req.Header.Set("X-No-Enterprise-Id", "1")
@@ -383,9 +398,9 @@ func (c *Client) BillingHeaders(req *http.Request, a *auth.Auth) {
 	if a.UID != "" {
 		req.Header.Set("X-User-Id", a.UID)
 	}
-	if a.EnterpriseID != "" {
-		req.Header.Set("X-Enterprise-Id", a.EnterpriseID)
-		req.Header.Set("X-Tenant-Id", a.EnterpriseID)
+	if eid := a.EnterpriseIDValue(); eid != "" {
+		req.Header.Set("X-Enterprise-Id", eid)
+		req.Header.Set("X-Tenant-Id", eid)
 	}
 	if d := a.DomainValue(); d != "" {
 		req.Header.Set("X-Domain", d)
@@ -398,8 +413,9 @@ func (c *Client) BillingHeaders(req *http.Request, a *auth.Auth) {
 func (c *Client) RefreshHeaders(req *http.Request, a *auth.Auth) {
 	c.CommonHeaders(req, a)
 	req.Header.Set("X-Refresh-Token", a.RefreshToken)
-	if a.EnterpriseID != "" {
-		req.Header.Set("X-Enterprise-Id", a.EnterpriseID)
+	if eid := a.EnterpriseIDValue(); eid != "" {
+		req.Header.Set("X-Enterprise-Id", eid)
+		req.Header.Set("X-Tenant-Id", eid)
 	}
 	// X-Auth-Refresh-Source 对齐官方客户端 refresh 渠道标识 "plugin"（D3）。
 	req.Header.Set("X-Auth-Refresh-Source", "plugin")

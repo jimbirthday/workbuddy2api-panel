@@ -33,6 +33,18 @@ import (
 // 两源都空时 convHex 为定值（每次新会话不复用前缀，但仍保留账号隔离段）。
 // body 不可解析时原样返回（与 prepareBody 语义一致：坏 body 不二次错误化）。
 func InjectPromptCacheKey(body []byte, uid, conversationID string) []byte {
+	return injectPromptCacheKey(body, uid, conversationID, false)
+}
+
+// injectPromptCacheKey 是 InjectPromptCacheKey 的内部实现；forceConversation
+// 为真时忽略 body 里的 conversation_id / conversationId，只使用调用方给的
+// conversationID。图片请求用它把会话源切换到「原会话 + 图片指纹」，否则同一
+// 会话换图仍会命中旧前缀缓存（上游 11135）。
+//
+// 客户端显式 prompt_cache_key 在普通请求中依然最高优先级；图片请求例外——
+// 客户端固定复用同一个 key 时，换图后仍会命中旧会话（11135），必须由图片指纹
+// 派生值覆盖。
+func injectPromptCacheKey(body []byte, uid, conversationID string, forceConversation bool) []byte {
 	if len(body) == 0 {
 		return body
 	}
@@ -40,7 +52,7 @@ func InjectPromptCacheKey(body []byte, uid, conversationID string) []byte {
 	if err := json.Unmarshal(body, &obj); err != nil {
 		return body
 	}
-	if !injectPromptCacheKeyObject(obj, uid, conversationID) {
+	if !injectPromptCacheKeyObjectForced(obj, uid, conversationID, forceConversation) {
 		return body
 	}
 	out, err := json.Marshal(obj)
@@ -53,16 +65,25 @@ func InjectPromptCacheKey(body []byte, uid, conversationID string) []byte {
 // injectPromptCacheKeyObject 在已解码 body 上就地注入 prompt_cache_key。
 // 返回是否写入；写入后由调用方统一序列化，避免热路径重复编解码。
 func injectPromptCacheKeyObject(obj map[string]any, uid, conversationID string) bool {
-	// 优先级 1：客户端已显式带 key → 绝不覆盖。
-	if existing, ok := obj["prompt_cache_key"].(string); ok && existing != "" {
+	return injectPromptCacheKeyObjectForced(obj, uid, conversationID, false)
+}
+
+// injectPromptCacheKeyObjectForced 是带「强制会话源」开关的注入实现。
+func injectPromptCacheKeyObjectForced(obj map[string]any, uid, conversationID string, forceConversation bool) bool {
+	// 优先级 1：客户端已显式带 key → 通常绝不覆盖。图片请求例外：客户端若固定
+	// 复用同一个 key，换图后仍会命中旧会话（11135）。forceConversation 表示调用方
+	// 已按图片集合派生了新会话源，此时必须覆盖客户端 key 才能完成隔离。
+	if existing, ok := obj["prompt_cache_key"].(string); ok && existing != "" && !forceConversation {
 		return false
 	}
 	// 优先级 2：body 里的 conversation_id / conversationId 做会话哈希源。
 	conv := conversationID
-	if v := strField(obj, "conversation_id"); v != "" {
-		conv = v
-	} else if v := strField(obj, "conversationId"); v != "" {
-		conv = v
+	if !forceConversation {
+		if v := strField(obj, "conversation_id"); v != "" {
+			conv = v
+		} else if v := strField(obj, "conversationId"); v != "" {
+			conv = v
+		}
 	}
 	key := buildCacheKey(uid, conv)
 	obj["prompt_cache_key"] = key

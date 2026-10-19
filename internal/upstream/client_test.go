@@ -49,6 +49,8 @@ func TestClassify(t *testing.T) {
 		{400, `{"code":11101,"msg":"Unmarshal chat params failed with error: unexpected EOF"}`, ErrBadParams},
 		{400, `Unmarshal chat params failed`, ErrBadParams},
 		{400, `{"code":11101,"msg":"x"}`, ErrBadParams},
+		{400, `{"code": 11101, "msg":"bad stop"}`, ErrBadParams},
+		{400, `{"error":{"code": "11101"}}`, ErrBadParams},
 		// 图片格式/数据错误是确定性请求错误，分类后不轮转、不罚号。
 		{400, `{"code":11101,"msg":"Parse message failed: invalid image_url content at index 2: json: cannot unmarshal string into Go value of type v2.ImageContent"}`, ErrImageInvalid},
 		{400, `{"code":11135,"msg":"invalid_image_data"}`, ErrImageInvalid},
@@ -247,6 +249,53 @@ func testClient(fn rtFunc) *Client {
 		HTTP:          &http.Client{Transport: fn},
 		ChatBaseCN:    "https://chat.example",
 		BillingBaseCN: "https://billing.example",
+	}
+}
+
+// TestEnterpriseResourceFieldContract 企业额度解析必须区分字段缺失与合法 0，
+// 且不能在 camelCase / snake_case 两套口径之间混算已用额度。
+func TestEnterpriseResourceFieldContract(t *testing.T) {
+	cases := []struct {
+		name    string
+		body    string
+		wantRem int64
+		wantTot int64
+		wantErr bool
+	}{
+		{"camel case", `{"code":0,"data":{"credit":812.45,"limitNum":2000}}`, 1188, 2000, false},
+		{"snake case", `{"code":0,"data":{"used_num":812.45,"limit_num":2000}}`, 1188, 2000, false},
+		{"zero used is valid", `{"code":0,"data":{"credit":0,"limitNum":2000}}`, 2000, 2000, false},
+		{"zero limit is valid", `{"code":0,"data":{"credit":0,"limitNum":0}}`, 0, 0, false},
+		{"unlimited", `{"code":0,"data":{"credit":5,"limitNum":-1}}`, enterpriseUnlimitedRemain, enterpriseUnlimitedTotal, false},
+		{"empty data", `{"code":0,"data":null}`, 0, 0, true},
+		{"missing limit", `{"code":0,"data":{"credit":10}}`, 0, 0, true},
+		{"missing used", `{"code":0,"data":{"limitNum":10}}`, 0, 0, true},
+		{"mixed camel limit snake used", `{"code":0,"data":{"limitNum":100,"used_num":10}}`, 90, 100, false},
+		{"mixed snake limit camel used", `{"code":0,"data":{"limit_num":100,"credit":10}}`, 90, 100, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := testClient(func(r *http.Request) (*http.Response, error) {
+				if !strings.HasSuffix(r.URL.Path, "/get-enterprise-user-usage") {
+					return nil, errors.New("wrong path: " + r.URL.Path)
+				}
+				return jsonResp(200, tc.body), nil
+			})
+			a := &auth.Auth{AccessToken: "at", UID: "u1", EnterpriseID: "e1"}
+			remain, total, _, _, _, err := c.enterpriseResource(a, 0)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("want parse error, got remain=%d total=%d", remain, total)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if remain != tc.wantRem || total != tc.wantTot {
+				t.Fatalf("remain=%d total=%d want %d/%d", remain, total, tc.wantRem, tc.wantTot)
+			}
+		})
 	}
 }
 

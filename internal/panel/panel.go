@@ -887,7 +887,10 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
-// accountBalance 单号余额刷新：更新余额与到期快照，不触碰冷却状态。
+// accountBalance 单号余额刷新：更新余额与到期快照，并按余额恢复解冻积分冷却。
+// 解冻语义必须与签到/全量刷新一致：余额耗尽进入 CoolHard 的账号，余额回到
+// 正数就是权威恢复证据；只更新 credits 会让它继续停在冷却里，直到下一轮
+// 签到或 5 分钟全量刷新，用户手动点「余额」后仍看到「冷却中」。
 func (p *Panel) accountBalance(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
 	a := p.cfg.Pool.AuthByUID(uid)
@@ -900,6 +903,7 @@ func (p *Panel) accountBalance(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadGateway, "user resource: "+err.Error())
 		return
 	}
+	p.cfg.Pool.ReenableIfCredits(uid, remain, total)
 	p.cfg.Pool.SetCreditsDetailed(uid, remain, total, expiring, earliestAt, earliestRemaining)
 	p.invalidateOverview()
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "credits": remain, "credits_total": total})

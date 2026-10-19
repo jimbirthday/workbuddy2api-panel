@@ -199,7 +199,6 @@ func isPromptTooLongStatus(status int) bool {
 // 实测 code=10001/14001 "今天已签到"/"今日已签到"）。只对 *Error.Msg 做包含匹配，
 // 网络层/解析层错误不在此识别（见 IsAlreadyCheckin）。
 var alreadyCheckinMarkers = []string{"已签到", "already"}
-var badParamsMarkerCode = `"code":11101`
 
 // softRateResetLoc 上游 429 6004 文案中的重置时间固定按 UTC+8 解释（上游文案如此，
 // 与容器时区无关）。
@@ -665,7 +664,7 @@ func Classify(status int, body string) ErrKind {
 		// 归 ErrBadParams：不冷却/不熔断/不计错，且**不轮转**——11101 发生在上游解析
 		// 请求体阶段，还没走到模型路由，所以"不同账号可能有不同模型权限"其实是
 		// 11102（ErrModelBlocked）的理由，那里已有 (账号,模型) 负缓存避让。
-		if strings.Contains(body, badParamsMarkerMsg) || strings.Contains(body, badParamsMarkerCode) {
+		if strings.Contains(body, badParamsMarkerMsg) || codeMarker(lower, "11101") {
 			return ErrBadParams
 		}
 		return ErrClient
@@ -835,6 +834,9 @@ const (
 	dailyCheckinPath   = "/billing/meter/daily-checkin"        // global 首选
 	billingMeterPathV2 = "/v2/billing/meter/get-user-resource" // CN 现状 / global fallback
 	dailyCheckinPathV2 = "/v2/billing/meter/daily-checkin"
+	// 企业额度端点和个人资源包同属 billing/meter：global 历史路径不带 /v2。
+	enterpriseUsagePath   = "/billing/meter/get-enterprise-user-usage"
+	enterpriseUsagePathV2 = "/v2/billing/meter/get-enterprise-user-usage"
 )
 
 // billingMeterPaths 按 realm 返回 billing/meter 域路径候选序列：
@@ -871,6 +873,12 @@ func (c *Client) chatBase(a *auth.Auth) string {
 // 注入与 global system 兜底都复用同一个 map 对象。坏 JSON 原样返回，绝不二次
 // 错误化；任一阶段未命中（已有 prompt_cache_key / 首条已是 system）仍保持原语义。
 func (c *Client) prepareBody(body []byte, realm, uid, conversationID string, consoleSystem bool) []byte {
+	return c.prepareBodyForceCacheConv(body, realm, uid, conversationID, consoleSystem, false)
+}
+
+// prepareBodyForceCacheConv 在 prepareBody 基础上可强制 prompt_cache_key 使用
+// 调用方会话源（图片指纹派生场景）。force=false 时与 prepareBody 完全一致。
+func (c *Client) prepareBodyForceCacheConv(body []byte, realm, uid, conversationID string, consoleSystem, forceCacheConv bool) []byte {
 	if len(body) == 0 {
 		return body
 	}
@@ -881,9 +889,12 @@ func (c *Client) prepareBody(body []byte, realm, uid, conversationID string, con
 	model, _ := obj["model"].(string)
 	efforts, defs := c.effortFor(realm, model)
 	normalizeBodyObject(obj, c.SanitizeFingerprints.Load(), efforts, defs)
+	if forceCacheConv && conversationID != "" {
+		rewriteConversationFields(obj, conversationID)
+	}
 	// prompt_cache_key 注入（P0 费用优化，费用降 ~17×）：按账号隔离的稳定缓存键，
 	// 让同一客户端对同一账号的连续请求命中上游前缀缓存。
-	injectPromptCacheKeyObject(obj, uid, conversationID)
+	injectPromptCacheKeyObjectForced(obj, uid, conversationID, forceCacheConv)
 	if consoleSystem {
 		ensureConsoleSystemObject(obj)
 	}
@@ -892,6 +903,24 @@ func (c *Client) prepareBody(body []byte, realm, uid, conversationID string, con
 		return body
 	}
 	return out
+}
+
+// rewriteConversationFields 把图片请求出站 body 里已存在的会话字段改成图片
+// 派生会话。只在字段原本存在时替换，不凭空新增客户端没有的字段；metadata 内
+// 的 snake/camel 形态一并处理，避免上游读取另一路径时继续复用旧图片会话。
+func rewriteConversationFields(obj map[string]any, conversationID string) {
+	for _, key := range []string{"conversation_id", "conversationId"} {
+		if _, ok := obj[key].(string); ok {
+			obj[key] = conversationID
+		}
+	}
+	if meta, ok := obj["metadata"].(map[string]any); ok {
+		for _, key := range []string{"conversation_id", "conversationId"} {
+			if _, ok := meta[key].(string); ok {
+				meta[key] = conversationID
+			}
+		}
+	}
 }
 
 // effortFor 只取当前请求模型所需的档位能力，而不是复制整张域内 effort 表。
@@ -1086,6 +1115,10 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
 	}
 	// RefreshHeaders 读取 a 的字段（domain/uid 等）注入请求头——需在锁内取快照值，
 	// 用一个显式逐字段拷贝的临时 auth 构造头（不拷贝 sync.Mutex，避免 vet copies-lock）。
+	// EnterpriseIDValue 自带 a.mu（sync.Mutex 不可重入），必须在 a.Lock 之前调用。
+	// 该值只用于本次 refresh 出站头的快照；随后 a.Lock 内复制其余字段，避免把
+	// 可能尚未从 JWT 回填的空 EnterpriseID 发给企业端点。
+	enterpriseID := a.EnterpriseIDValue()
 	a.Lock()
 	hdrSnapshot := auth.Auth{
 		AccessToken:  a.AccessToken,
@@ -1093,7 +1126,7 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
 		ExpiresAt:    a.ExpiresAt,
 		Domain:       a.Domain,
 		UID:          a.UID,
-		EnterpriseID: a.EnterpriseID,
+		EnterpriseID: enterpriseID,
 		Nickname:     a.Nickname,
 		DeviceToken:  a.DeviceToken,
 	}
@@ -1130,6 +1163,10 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
 		return nil
 	}
 	a.AccessToken = tok.AccessToken
+	// 刷新响应可能切换到个人空间或另一企业空间。必须在同一把锁内按新 JWT
+	// 重算企业身份，否则 enterpriseToken 仍指向旧 token 时，后续请求会继续
+	// 使用旧企业额度端点与 X-Enterprise-Id（串租户）。
+	a.ReparseEnterpriseID()
 	if tok.RefreshToken != "" {
 		a.RefreshToken = tok.RefreshToken
 	}
@@ -1180,7 +1217,18 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 		ctx = context.Background()
 	}
 	global := c.globalOn(a)
-	prepared := c.prepareBody(body, a.Realm(), a.UID, meta.ConversationID, global)
+	cacheConv := meta.PromptCacheConversationID
+	if cacheConv == "" {
+		cacheConv = meta.ConversationID
+	}
+	// 图片请求的会话头与缓存键必须同源：上游若按 X-Conversation-ID 绑定图片
+	// 状态，只改 prompt_cache_key 仍会复用旧会话并返回 11135。这里只对已派生
+	// 图片会话的请求覆盖头值；无图请求继续逐字透传客户端原值。
+	if meta.PromptCacheConversationID != "" {
+		meta.ConversationID = meta.PromptCacheConversationID
+	}
+	prepared := c.prepareBodyForceCacheConv(body, a.Realm(), a.UID, cacheConv, global,
+		meta.PromptCacheConversationID != "")
 	// reqCtx 的 cancel 在每个出口显式调用（Do 失败 / ≥400 / 成功分支移交 monitorBody），
 	// 循环本身各分支必 return——无循环尾兜底代码（此前外层 var cancel 从未赋值 +
 	// 尾部不可达 cancel() 是潜伏 nil-panic，已删；chatPaths 恒非空由构造保证）。
@@ -1497,6 +1545,12 @@ func (c *Client) fetchEnterpriseModels(a *auth.Auth) ([]ModelInfo, error) {
 	c.CommonHeaders(req, a) // 复用共享请求头（Origin/Referer/UA/Accept/Content-Type）
 	// AccessToken 加锁快照（见 auth.AccessTokenValue：keepalive 刷新在 a.mu 内改写）。
 	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
+	// CN 企业号的个人模型端点同样按租户返回：缺 X-Enterprise-Id / X-Tenant-Id
+	// 时上游会给默认租户目录，企业私有模型缺失。与 chat/billing 双头口径一致。
+	if eid := a.EnterpriseIDValue(); eid != "" {
+		req.Header.Set("X-Enterprise-Id", eid)
+		req.Header.Set("X-Tenant-Id", eid)
+	}
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		return nil, err
@@ -1856,6 +1910,12 @@ func (c *Client) fetchV3ConfigModelMap(a *auth.Auth, ua string) (map[string]Mode
 	if a != nil && a.UID != "" {
 		req.Header.Set("X-User-Id", a.UID)
 	}
+	// 企业账号的 /v3/config 目录同样按租户下发；缺头会拿到个人/默认租户模型集，
+	// 与企业聊天实际可用模型不一致。与 chat/billing 保持双头口径。
+	if eid := a.EnterpriseIDValue(); eid != "" {
+		req.Header.Set("X-Enterprise-Id", eid)
+		req.Header.Set("X-Tenant-Id", eid)
+	}
 	req.Header.Set("X-Domain", v3ConfigDomain(a, c.chatBase(a)))
 	req.Header.Set("X-Product", "SaaS")
 	if ua == "" {
@@ -2177,32 +2237,58 @@ func (c *Client) enterpriseResource(a *auth.Auth, soon time.Duration) (remain, t
 	var data json.RawMessage
 	err = c.retryBillingTransient(func() error {
 		var e error
-		data, e = c.billingJSON(a, http.MethodPost, "/v2/billing/meter/get-enterprise-user-usage", map[string]any{})
+		// 与 get-user-resource / daily-checkin 同族：global 计费域的历史路径可能
+		// 不带 /v2，CN 固定带。走同一 fallback（仅 404 换路径），避免 global 企业
+		// 号因硬编码 /v2 而额度恒失败——失败会被调度器逐号 continue，面板表现
+		// 为「企业额度未知」而不是显式错误，很难排查。
+		paths := []string{enterpriseUsagePathV2}
+		if c.globalOn(a) {
+			paths = []string{enterpriseUsagePath, enterpriseUsagePathV2}
+		}
+		data, e = c.billingMeterJSON(a, paths, http.MethodPost, map[string]any{})
 		return e
 	})
 	if err != nil {
 		return 0, 0, 0, time.Time{}, 0, err
 	}
+	// billingJSON 已解出 {code,msg,data} 信封；这里 data 就是用量对象。
+	// 空 data/null 不能继续按零值解析，否则会把缺失当成合法的 0/0。
+	if len(data) == 0 || string(data) == "null" {
+		return 0, 0, 0, time.Time{}, 0, fmt.Errorf("enterprise resource parse: empty data")
+	}
 	// 兼容上游两套字段命名（桌面端两条解析路径分别读 camelCase 与 snake_case）。
+	// 指针用于区分「字段缺失」与合法的 0：缺 limit 时不能把企业额度写成 0/0，
+	// 那会触发 credit floor 且掩盖上游契约变化。金额字段按行选择命名规则，
+	// camelCase 优先且同组字段必须齐全；只有该组完全缺失才整体回落到 snake_case，
+	// 避免把两套口径（如 credit=已用 vs used_num）混算。
 	var resp struct {
-		Credit         float64 `json:"credit"`
-		LimitNum       int64   `json:"limitNum"`
-		LimitNumSnake  int64   `json:"limit_num"`
-		UsedNum        float64 `json:"used_num"`
-		CycleEndTime   string  `json:"cycleEndTime"`
-		CycleResetTime string  `json:"cycleResetTime"`
+		Credit         *float64 `json:"credit"`
+		UsedNum        *float64 `json:"used_num"`
+		LimitNum       *int64   `json:"limitNum"`
+		LimitNumSnake  *int64   `json:"limit_num"`
+		CycleEndTime   string   `json:"cycleEndTime"`
+		CycleResetTime string   `json:"cycleResetTime"`
 	}
 	if uerr := json.Unmarshal(data, &resp); uerr != nil {
 		return 0, 0, 0, time.Time{}, 0, fmt.Errorf("enterprise resource parse: %w", uerr)
 	}
-	limit := resp.LimitNum
-	if limit == 0 && resp.LimitNumSnake != 0 {
-		limit = resp.LimitNumSnake
+	// 字段级回退：camelCase 优先，缺失时使用对应 snake_case 字段。两者语义
+	// 一一对应（limitNum/limit_num = 分配额度，credit/used_num = 已用），
+	// 因此允许上游在迁移期混合命名；不能因为一个别名缺失就把整份余额判为
+	// 不完整而长期沿用旧快照。
+	limitPtr, usedPtr := resp.LimitNum, resp.Credit
+	if limitPtr == nil {
+		limitPtr = resp.LimitNumSnake
 	}
-	used := resp.Credit
-	if used == 0 && resp.UsedNum != 0 {
-		used = resp.UsedNum
+	if usedPtr == nil {
+		usedPtr = resp.UsedNum
 	}
+	if limitPtr == nil || usedPtr == nil {
+		return 0, 0, 0, time.Time{}, 0,
+			fmt.Errorf("enterprise resource parse: incomplete usage fields (limitNum=%v credit=%v)", limitPtr != nil, usedPtr != nil)
+	}
+	limit := *limitPtr
+	used := *usedPtr
 	// 不限量：池内无对应状态位，用大剩余量让路由权重与 credit_floor 都不构成限制。
 	if limit < 0 {
 		return enterpriseUnlimitedRemain, enterpriseUnlimitedTotal, 0, time.Time{}, 0, nil

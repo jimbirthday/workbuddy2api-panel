@@ -65,6 +65,11 @@ func ResponsesToChat(body []byte) ([]byte, ResponsesMeta, error) {
 		// it rather than silently dropping the caller's output budget.
 		chat["max_tokens"] = v
 	}
+	// Chat Completions accepts stop as string or string[]; pass it through and
+	// let the outbound normalizer produce the upstream []string shape.
+	if v, ok := obj["stop"]; ok && v != nil {
+		chat["stop"] = v
+	}
 	if reasoning, ok := obj["reasoning"].(map[string]any); ok {
 		if effort := stringValue(reasoning["effort"]); effort != "" {
 			chat["reasoning_effort"] = effort

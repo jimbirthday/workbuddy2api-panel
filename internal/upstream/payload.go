@@ -61,6 +61,7 @@ func normalizeBodyObject(obj map[string]any, sanitize bool, efforts map[string][
 	}
 	normalizeToolChoice(obj)
 	normalizeToolPatterns(obj)
+	normalizeStop(obj)
 	normalizeRoles(obj)
 	normalizeImageURL(obj)
 	// tool 配对三步（见 tool_pairing.go）：先合并再重排再清理。所有模型一律执行（独立于
@@ -295,6 +296,54 @@ func normalizeRoles(obj map[string]any) {
 			model, _ := obj["model"].(string)
 			log.Printf("role normalized developer->system model=%s idx=%d", model, i)
 		}
+	}
+}
+
+// normalizeStop 把 OpenAI 允许的 string | string[] 统一成上游 Go 结构体接受的
+// []string。上游把 stop 定死为 []string，收到字符串会返回 400 code=11101：
+//
+//	json: cannot unmarshal string into Go struct field Request.stop of type []string
+//
+// 只做无损形态转换：非空字符串包成单元素数组；数组仅在全部元素都是字符串时
+// 去空串后保留（全空则删除字段）；null / 空串 / 空数组直接删除字段，与 OpenAI
+// 「未设置」语义一致。数组里出现非字符串元素，或顶层是非 nil 的其它类型，都
+// 不猜测、不吞掉：原值交给上游返回明确 400，避免把调用方的错误静默变成
+// 「部分停止序列」或「没有停止序列」。
+func normalizeStop(obj map[string]any) {
+	raw, present := obj["stop"]
+	if !present {
+		return
+	}
+	switch v := raw.(type) {
+	case string:
+		if v == "" {
+			delete(obj, "stop")
+			return
+		}
+		obj["stop"] = []any{v}
+	case []any:
+		out := make([]any, 0, len(v))
+		for _, item := range v {
+			s, ok := item.(string)
+			if !ok {
+				// 数组里混入非字符串：整体保留原值，让上游明确拒绝，不能只
+				// 转发其中一部分而改变调用方语义。
+				return
+			}
+			if s != "" {
+				out = append(out, s)
+			}
+		}
+		if len(out) == 0 {
+			delete(obj, "stop")
+			return
+		}
+		obj["stop"] = out
+	case nil:
+		delete(obj, "stop")
+	default:
+		// 非法类型原样保留：上游会以 400 明确指出 stop 类型错误，调用方能看到
+		// 自己的 bug，而不是我们悄悄改写成空数组后继续消耗账号额度。
 	}
 }
 

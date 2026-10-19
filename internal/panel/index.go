@@ -35,13 +35,30 @@ func staticETag(b []byte) string {
 }
 
 var (
-	indexETag = staticETag(indexHTML)
-	appETag   = staticETag(appJS)
+	appETag = staticETag(appJS)
+	// indexPage 是带 app.js 内容指纹的页面体。放在包初始化阶段计算，保证
+	// 未压缩与预压缩两个表示内容一致；不能在 handler 里只替换原文却继续发送
+	// 旧 indexGzip，否则 gzip 客户端仍会拿到不带版本号的脚本地址。
+	indexPage = bytes.Replace(indexHTML, []byte(`<script src="app.js"></script>`),
+		[]byte(`<script src="app.js?v=`+strings.Trim(appETag, `"`)+`"></script>`), 1)
+	// ETag 必须对最终响应体取指纹，而不是对注入前的模板取。此前 indexETag 来自
+	// indexHTML，浏览器若缓存了 ETag 相同的旧页面，服务端会回 304，客户端继续
+	// 用旧 DOM 配新 app.js，直接触发 `null.innerHTML`。
+	indexETag = staticETag(indexPage)
 	// 预压缩一次、常驻进程：面板 JS 约 280 KB，压缩后通常 <70 KB。请求热路径
 	// 只写内存字节，不做每请求压缩。压缩失败时回落原文（例如极小/不可压缩体）。
-	indexGzip = gzipStatic(indexHTML)
+	indexGzip = gzipStatic(indexPage)
 	appGzip   = gzipStatic(appJS)
 )
+
+// init 在启动期校验 app.js 版本注入确实命中：升级时若模板改写漏掉该锚点，
+// 浏览器会继续复用旧脚本，与新的 DOM 组合成空引用异常。启动即失败比线上
+// 错配可查。
+func init() {
+	if !bytes.Contains(indexPage, []byte(`app.js?v=`)) {
+		panic(`panel: index.html must contain <script src="app.js"></script>`)
+	}
+}
 
 // gzipStatic 预压缩嵌入资源；失败返回 nil，serveStatic 回落未压缩原文。
 func gzipStatic(body []byte) []byte {
@@ -59,17 +76,16 @@ func gzipStatic(body []byte) []byte {
 	return buf.Bytes()
 }
 
-// serveStatic 输出嵌入的静态资源并支持条件 GET。面板页面本身不含秘密，但
-// 仍使用 no-cache + ETag：浏览器每次先校验，命中 304 时只回响应头，既不会
-// 在升级后继续跑旧脚本，也避免重复下载数百 KB 的前端代码。
-func serveStatic(w http.ResponseWriter, r *http.Request, contentType, etag string, body, gzipped []byte) {
+// serveStatic 输出嵌入的静态资源并支持条件 GET。cacheControl 由调用方按
+// 资源类型给出：页面必须每次回源校验，带内容指纹的脚本可以长期缓存。
+func serveStatic(w http.ResponseWriter, r *http.Request, contentType, etag, cacheControl string, body, gzipped []byte) {
 	h := w.Header()
 	responseETag := etag
 	if len(gzipped) > 0 && acceptsGzip(r.Header.Get("Accept-Encoding")) {
 		responseETag = gzipETag(etag)
 	}
 	h.Set("ETag", responseETag)
-	h.Set("Cache-Control", "no-cache")
+	h.Set("Cache-Control", cacheControl)
 	// 同一 ETag 对应两种编码。Vary 只在实际返回压缩体时写入（见下方），
 	// 避免未压缩响应被 Vary 过宽导致中间缓存放弃存储。
 	if match := r.Header.Get("If-None-Match"); match != "" && etagMatches(match, responseETag) {
@@ -165,11 +181,20 @@ func setSecurityHeaders(w http.ResponseWriter) {
 // index 输出面板页面（静态无秘密；数据接口 /panel/api/* 才走鉴权）。
 func (p *Panel) index(w http.ResponseWriter, r *http.Request) {
 	setSecurityHeaders(w)
-	serveStatic(w, r, "text/html; charset=utf-8", indexETag, indexHTML, indexGzip)
+	serveStatic(w, r, "text/html; charset=utf-8", indexETag, "no-cache", indexPage, indexGzip)
 }
 
 // appScript 输出前端逻辑（同源脚本，供 CSP script-src 'self' 加载）。
+//
+// 页面引用的是 app.js?v=<内容指纹>。只有版本号与当前二进制一致的 URL 才能
+// 长期缓存：升级后页面会换新 URL，反向代理/浏览器无需再猜测何时失效，也不可能
+// 把旧脚本配到新 DOM 上（线上 app.js:2706 的 null.innerHTML 就是这种错配）。
+// 无版本号的直连地址仍走 no-cache，避免旧页面引用裸 app.js 时被永久钉在旧内容。
 func (p *Panel) appScript(w http.ResponseWriter, r *http.Request) {
 	setSecurityHeaders(w)
-	serveStatic(w, r, "text/javascript; charset=utf-8", appETag, appJS, appGzip)
+	cacheControl := "no-cache"
+	if v := strings.TrimSpace(r.URL.Query().Get("v")); v != "" && v == strings.Trim(appETag, `"`) {
+		cacheControl = "public, max-age=31536000, immutable"
+	}
+	serveStatic(w, r, "text/javascript; charset=utf-8", appETag, cacheControl, appJS, appGzip)
 }

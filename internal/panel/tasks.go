@@ -35,6 +35,15 @@ func (p *Panel) accountTasks(w http.ResponseWriter, r *http.Request) {
 	if a == nil {
 		return
 	}
+	// 企业版没有个人成长任务体系：上游列表端点一律 403。直接返回空列表并说明
+	// 原因，而不是把必然失败的请求打到上游（外部脚本/旧缓存前端仍可能调用）。
+	if a.IsEnterprise() {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok": true, "tasks": []any{}, "enterprise": true,
+			"message": "企业账号无个人成长任务体系",
+		})
+		return
+	}
 	tasks, err := p.cfg.Upstream.ListTasks(a)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, "list tasks: "+err.Error())
@@ -62,6 +71,10 @@ func (p *Panel) accountTaskAccept(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
 	a := p.accountByUID(w, uid)
 	if a == nil {
+		return
+	}
+	if a.IsEnterprise() {
+		writeErr(w, http.StatusBadRequest, "企业账号无个人成长任务体系，不支持接受任务")
 		return
 	}
 	// per-account 互斥：与 auto_all / 任务队列共用同一把账号锁，避免同一账号上
@@ -97,6 +110,13 @@ func (p *Panel) taskAcceptAll(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
 	a := p.accountByUID(w, uid)
 	if a == nil {
+		return
+	}
+	if a.IsEnterprise() {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok": true, "accepted": 0, "enterprise": true,
+			"message": "企业账号无个人成长任务体系，无需接受任务",
+		})
 		return
 	}
 	// 与 accountTaskAccept 同源：批量接受会连续多次调上游（含批间节流），
@@ -173,6 +193,11 @@ func (p *Panel) accountTaskClaim(w http.ResponseWriter, r *http.Request) {
 	if a == nil {
 		return
 	}
+	// 企业版没有个人成长任务体系：领奖端点同样不能把必然失败的上游调用打出去。
+	if a.IsEnterprise() {
+		writeErr(w, http.StatusBadRequest, "企业账号无个人成长任务体系，不支持领取任务")
+		return
+	}
 	var body struct {
 		TaskCode string `json:"task_code"`
 	}
@@ -180,6 +205,13 @@ func (p *Panel) accountTaskClaim(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "task_code required")
 		return
 	}
+	// 与 accept / auto / 队列共用账号锁：领奖也可能触发上游任务状态变更，
+	// 不能与同一账号上的其它动作并发。
+	if !p.tryLockAccount(uid) {
+		writeErr(w, http.StatusConflict, "already_running")
+		return
+	}
+	defer p.unlockAccount(uid)
 	// 小程序口径任务走 chat 域 mp 头领奖（缺头实测不可领）；其余 Web 端接口。
 	var credit, energy int64
 	var err error

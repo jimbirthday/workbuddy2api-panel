@@ -423,6 +423,12 @@ func (c *Client) globalModelsOnce(a *auth.Auth, path string) ([]string, []ModelI
 	c.CommonHeaders(req, a) // 共享请求头（Origin/Referer/UA），与 FetchModels 同款
 	// AccessToken 加锁快照（见 auth.AccessTokenValue：keepalive 刷新在 a.mu 内改写）。
 	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
+	// 企业模型目录与企业聊天/billing 同口径：两个租户头必须同时带。只带
+	// Authorization 时上游按默认租户返回目录，企业私有模型会缺失或返回空表。
+	if eid := a.EnterpriseIDValue(); eid != "" {
+		req.Header.Set("X-Enterprise-Id", eid)
+		req.Header.Set("X-Tenant-Id", eid)
+	}
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		return nil, nil, err

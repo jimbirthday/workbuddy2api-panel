@@ -627,6 +627,10 @@ func (p *Panel) accountTaskAuto(w http.ResponseWriter, r *http.Request) {
 	if a == nil {
 		return
 	}
+	if a.IsEnterprise() {
+		writeErr(w, http.StatusBadRequest, "企业账号无个人成长任务体系，不支持自动完成任务")
+		return
+	}
 	var body struct {
 		TaskCode string `json:"task_code"`
 	}
@@ -1279,6 +1283,13 @@ func (p *Panel) accountTaskAutoAll(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
 	a := p.accountByUID(w, uid)
 	if a == nil {
+		return
+	}
+	if a.IsEnterprise() {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok": true, "results": []any{}, "enterprise": true,
+			"message": "企业账号无个人成长任务体系，无可自动完成任务",
+		})
 		return
 	}
 	// per-account 互斥（与单任务动作共用一把锁）：重复点击 409。

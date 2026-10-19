@@ -3,6 +3,7 @@
 package auth
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -35,8 +36,16 @@ type Auth struct {
 	realm        string
 	UID          string
 	EnterpriseID string
-	Nickname     string
-	FilePath     string // 来源文件；refresh 后原子写回此处
+	// enterpriseToken 记录上次解析 EnterpriseID 所用的 accessToken。refresh 后
+	// token 可能切换到个人空间或另一企业空间；若只按「EnterpriseID 非空优先」
+	// 就会一直沿用旧租户，导致企业额度端点、X-Enterprise-Id 与任务门控错位。
+	enterpriseToken string
+	// enterpriseFromClaim 记录当前 EnterpriseID 是否来自 JWT claim。token 变化且
+	// 新 token 没有企业 claim 时，只有 claim 来源的旧值必须清空；文件/API 显式
+	// 给出的企业 ID（旧版凭据常见）在初次加载时仍可作为回退。
+	enterpriseFromClaim bool
+	Nickname            string
+	FilePath            string // 来源文件；refresh 后原子写回此处
 
 	// Weight 手动调度权重（1-100，1 = 不干预）。与 hub 语义一致：>1 的账号优先
 	// 接单，多个高权重按权重比分流；落盘在 auth 文件的 weight 键，导出/导入照常
@@ -97,6 +106,105 @@ func (a *Auth) RefreshTokenValue() string {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.RefreshToken
+}
+
+// EnterpriseIDValue 加锁读取企业 ID。契据文件里的 enterpriseId 可能为空，而企业
+// 空间只在 accessToken 的 JWT claim 里（登录时切到企业空间换来的 token）。这里在
+// 首次读取时懒回填，并按需重新解析新 token，保证所有调用方看到同一身份。
+func (a *Auth) EnterpriseIDValue() string {
+	if a == nil {
+		return ""
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.enterpriseIDLocked()
+}
+
+// ReparseEnterpriseID 在 refresh 写回新 token 后重算企业身份。调用方必须
+// 已持有 a.mu（RefreshToken 的写回段就是这样）；不会再次加锁。
+//
+// 不能在锁内调用 EnterpriseIDValue：sync.Mutex 不可重入。refresh 的写回段
+// 用本函数把「新 token 是否还有企业 claim」与 token 写入放在同一临界区，
+// 避免出站头/额度端点在下一次请求里读到旧租户。
+func (a *Auth) ReparseEnterpriseID() {
+	if a == nil {
+		return
+	}
+	// refresh 响应是身份权威来源：新 token 没有企业 claim 就说明已切到个人空间，
+	// 即使旧文件里留有 explicit enterpriseId 也必须清空，避免串租户。
+	claim := jwtEnterpriseID(a.AccessToken)
+	a.EnterpriseID = claim
+	a.enterpriseFromClaim = claim != ""
+	a.enterpriseToken = a.AccessToken
+}
+
+// InitEnterpriseIdentity 在构造 Auth 后、首次入池前按当前 token 初始化企业身份。
+// 与 Parse 同规则：JWT 有 claim 时 claim 权威；无 claim 时保留调用方给出的显式值
+// （兼容旧版凭据文件/登录 API 只提供 enterpriseId 的形态）。不需要持锁（对象尚未
+// 发布），导入与登录路径应在 Pool.Add 之前调用。
+func (a *Auth) InitEnterpriseIdentity() {
+	if a == nil {
+		return
+	}
+	a.applyTokenEnterpriseIDLocked(false)
+	a.enterpriseToken = a.AccessToken
+}
+
+// enterpriseIDLocked 企业 ID 的无锁实现：显式字段优先；为空时从 accessToken 的
+// JWT payload 读取 enterprise_id/enterpriseId。只解码不验签——该值用于选中正确的
+// 出站端点和任务门控，不是信任边界；鉴权仍由上游校验签名。
+func (a *Auth) enterpriseIDLocked() string {
+	// accessToken 变化即重新解析。有 claim 时 claim 权威（覆盖文件/API 的显式值）；
+	// 无 claim 时，若旧值来自 claim 则清空（企业→个人），否则保留显式值（旧版
+	// 凭据文件/登录 API 只给 enterpriseId 的形态）。
+	if a.enterpriseToken != a.AccessToken {
+		a.applyTokenEnterpriseIDLocked(false)
+		a.enterpriseToken = a.AccessToken
+	}
+	return strings.TrimSpace(a.EnterpriseID)
+}
+
+// applyTokenEnterpriseIDLocked 按当前 accessToken 的企业 claim 更新身份。
+// authoritative=false 用于首次加载：无 claim 时保留显式值；authoritative=true
+// 用于 refresh：无 claim 即清空。调用方必须已持有 a.mu。
+func (a *Auth) applyTokenEnterpriseIDLocked(authoritative bool) {
+	claim := jwtEnterpriseID(a.AccessToken)
+	switch {
+	case claim != "":
+		a.EnterpriseID = claim
+		a.enterpriseFromClaim = true
+	case authoritative || a.enterpriseFromClaim:
+		a.EnterpriseID = ""
+		a.enterpriseFromClaim = false
+	default:
+		// 首次加载且没有 claim：保留文件/登录 API 的显式 EnterpriseID。
+		a.enterpriseFromClaim = false
+	}
+}
+
+// jwtEnterpriseID 从 JWT payload 提取企业 ID。畸形 token/缺 claim 返回空串。
+func jwtEnterpriseID(token string) string {
+	parts := strings.Split(strings.TrimSpace(token), ".")
+	if len(parts) < 2 || parts[1] == "" {
+		return ""
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		if payload, err = base64.URLEncoding.DecodeString(parts[1]); err != nil {
+			return ""
+		}
+	}
+	var claims struct {
+		EnterpriseID      string `json:"enterprise_id"`
+		EnterpriseIDCamel string `json:"enterpriseId"`
+	}
+	if json.Unmarshal(payload, &claims) != nil {
+		return ""
+	}
+	if id := strings.TrimSpace(claims.EnterpriseID); id != "" {
+		return id
+	}
+	return strings.TrimSpace(claims.EnterpriseIDCamel)
 }
 
 // globalEnabled 全局开关：global realm 是否路由（D5 双保险）。
@@ -213,9 +321,8 @@ func (a *Auth) IsGlobal() bool { return a.Realm() == "global" }
 // 不受影响的能力：选号派发、保活（token 刷新）、额度查询（企业额度改走
 // /v2/billing/meter/get-enterprise-user-usage，见 upstream.enterpriseResource）。
 //
-// 直读字段（EnterpriseID 自 Parse 后不再改写，与 upstream 读取方式一致），
-// 无需加锁——Realm() 加锁是因为 realm/Domain 会被 RefreshToken 在锁内改写。
-func (a *Auth) IsEnterprise() bool { return strings.TrimSpace(a.EnterpriseID) != "" }
+// EnterpriseID 会在 RefreshToken 换到新 token 时回填，故读取必须加锁。
+func (a *Auth) IsEnterprise() bool { return a.EnterpriseIDValue() != "" }
 
 // WeightValue 返回归一化后的手动调度权重：1 = 不干预，2-100 = 更高优先级。
 func (a *Auth) WeightValue() int { return normalizeWeight(a.Weight) }
@@ -357,6 +464,11 @@ func Parse(raw []byte) (*Auth, error) {
 	if strings.TrimSpace(a.AccessToken) == "" {
 		return nil, fmt.Errorf("parse_error: missing accessToken")
 	}
+	// 企业号凭据文件的 enterpriseId 常为空，真实标识只在 JWT claim 里；Parse 时
+	// 一并补齐，让面板、调度器和出站头从加载后的第一刻就是同一口径。JWT 有企业
+	// claim 时以 claim 为准（显式值可能是旧租户）；无 claim 时保留显式值，兼容
+	// 旧版凭据文件。refresh 换 token 后的规则见 ReparseEnterpriseID。
+	a.InitEnterpriseIdentity()
 	return &a, nil
 }
 

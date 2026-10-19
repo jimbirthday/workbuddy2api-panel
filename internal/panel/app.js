@@ -54,7 +54,10 @@ let perfSeq = 0, perfCtrl = null;
 let creditHistSeq = 0, creditCtrl = null;
 let creditGrantSeq = 0, creditGrantCtrl = null;
 
-let remReq = false, remSeq = 0, remCtrl = null, remData = null;
+// remDim 是「剩余额度」的维度状态（account/model）。此前只在渲染函数里读取、
+// 切换回调里赋值，却没有任何声明：脚本以严格模式运行时首次 renderRemaining
+// 就抛 ReferenceError: remDim is not defined，直接中断整个 loadRemaining。
+let remReq = false, remSeq = 0, remCtrl = null, remData = null, remDim = 'account';
 let cxSeq = 0, cxData = null;
 let scanReattachReq = false;
 const busyKeys = new Set();
@@ -119,27 +122,60 @@ function syncTopbarHeight() {
   } catch (_) { /* inert/测试 DOM：保持 CSS 默认偏移 */ }
 }
 syncTopbarHeight();
+// 脚本在 <body> 末尾执行时字体/导航可能还没完成布局，offsetHeight 会偏小；
+// 首帧和 load 后再测一次，避免移动端两行顶栏下的 secnav 贴错位置。
+if (typeof requestAnimationFrame === 'function') requestAnimationFrame(syncTopbarHeight);
+addEventListener('load', syncTopbarHeight, { passive: true });
 addEventListener('resize', syncTopbarHeight, { passive: true });
 
 /* ── 主题 ─────────────────────────────────────────────────────────── */
-/* 两态翻转（浅/深），首次访问跟随系统偏好；点击总是切换可见外观，符合直觉。 */
+/* Hub 同款三态主题：浅色 / 深色 / 跟随系统。旧实现是单按钮在浅深之间翻转，
+   用户无法回到“跟随系统”，与 Hub 的行为不一致。这里保留 localStorage 键，
+   只把选择改成下拉菜单，并同步 aria-expanded 与当前项。 */
 function effTheme() {
   return theme === 'auto' ? (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark') : theme;
+}
+function setThemeMenu(open) {
+  const menu = $('themeDropdown');
+  const btn = $('btnTheme');
+  if (menu) menu.classList.toggle('open', !!open);
+  if (btn) btn.setAttribute('aria-expanded', open ? 'true' : 'false');
 }
 function applyTheme() {
   const eff = effTheme();
   document.documentElement.dataset.theme = eff;
-  $('icoTheme').innerHTML = eff === 'light'
-    ? '<circle cx="8" cy="8" r="3"/><path d="M8 1v2M8 13v2M1 8h2M13 8h2M3.2 3.2l1.4 1.4M11.4 11.4l1.4 1.4M12.8 3.2l-1.4 1.4M4.6 11.4l-1.4 1.4"/>'
-    : '<path d="M13.2 9.6A5.6 5.6 0 0 1 6.4 2.8a5.6 5.6 0 1 0 6.8 6.8z"/>';
-  $('btnTheme').title = eff === 'light' ? '切换到深色' : '切换到浅色';
+  const icon = $('icoTheme');
+  if (icon) icon.innerHTML = theme === 'auto'
+    ? '<rect x="2" y="3" width="12" height="9" rx="1.5"/><path d="M6 14h4M8 12v2"/>'
+    : eff === 'light'
+      ? '<circle cx="8" cy="8" r="3"/><path d="M8 1v2M8 13v2M1 8h2M13 8h2M3.2 3.2l1.4 1.4M11.4 11.4l1.4 1.4M12.8 3.2l-1.4 1.4M4.6 11.4l-1.4 1.4"/>'
+      : '<path d="M13.2 9.6A5.6 5.6 0 0 1 6.4 2.8a5.6 5.6 0 1 0 6.8 6.8z"/>';
+  document.querySelectorAll('#themeDropdown [data-theme-opt]').forEach(el => {
+    el.classList.toggle('active', el.dataset.themeOpt === theme);
+    el.setAttribute('aria-checked', el.dataset.themeOpt === theme ? 'true' : 'false');
+  });
 }
 addEventListener('change', applyTheme);
-$('btnTheme').onclick = () => {
-  theme = effTheme() === 'light' ? 'dark' : 'light';
+const themeBtn = $('btnTheme');
+if (themeBtn) themeBtn.onclick = ev => {
+  if (ev) { ev.preventDefault(); ev.stopPropagation(); }
+  const menu = $('themeDropdown');
+  setThemeMenu(!!menu && !menu.classList.contains('open'));
+};
+const themeDropdown = $('themeDropdown');
+if (themeDropdown) themeDropdown.addEventListener('click', ev => {
+  const b = ev.target && ev.target.closest ? ev.target.closest('[data-theme-opt]') : null;
+  if (!b) return;
+  theme = b.dataset.themeOpt;
   localStorage.setItem(LS_THEME, theme);
   applyTheme();
-};
+  setThemeMenu(false);
+});
+addEventListener('click', ev => {
+  const wrap = $('themeDropdownWrap');
+  if (wrap && ev.target && !wrap.contains(ev.target)) setThemeMenu(false);
+});
+addEventListener('keydown', ev => { if (ev.key === 'Escape') setThemeMenu(false); });
 applyTheme();
 
 /* ── 请求 ─────────────────────────────────────────────────────────── */
@@ -152,17 +188,52 @@ function authHeaders(extra) {
 async function api(path, opts = {}) {
   const h = authHeaders(opts.headers);
   if (opts.body) h['Content-Type'] = 'application/json';
-  const r = await fetch('/panel/api/' + path, Object.assign({}, opts, { headers: h }));
+  // 状态轮询必须有自己的截止时间：后端偶发挂住时，fetch 可能长时间不返回，
+  // 扫描/队列按钮会永久停在「扫描中…」。调用方显式 abort 的请求沿用原 signal，
+  // 其余请求在 15s 后中止并给出可重试的错误文案。
+  let signal = opts.signal;
+  let timer = null;
+  let timed = false;
+  if (!signal && typeof AbortController === 'function') {
+    const ctl = new AbortController();
+    signal = ctl.signal;
+    timer = setTimeout(() => { timed = true; try { ctl.abort(); } catch (e) { /* ignore */ } }, 15000);
+  }
+  const o = Object.assign({}, opts, { headers: h });
+  if (signal) o.signal = signal;
+  let r;
+  try {
+    r = await fetch('/panel/api/' + path, o);
+  } catch (e) {
+    if (timed) throw new Error('请求超时（15 秒），请稍后重试');
+    throw e;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
   if (r.status === 401) { openKey(); throw new Error('密钥无效或未填写'); }
   const d = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
+    if (!r.ok) {
+      // 调用方用 status 区分 501/403 等可操作状态；只带 message 会让专门的
+      // 空态文案永远不可达，用户只看到技术错误。
+      const err = new Error(d.error || ('HTTP ' + r.status));
+      err.status = r.status;
+      throw err;
+    }
   return d;
+}
+// isAbortError 判断一次请求是否被「新一轮请求」主动取消。取消不是失败：
+// 它只代表结果已过期，调用方必须静默返回，不能把上一轮刚渲染好的表清空，
+// 更不能把它当网络错误弹给用户（快速切时间范围/连点刷新时必现）。
+function isAbortError(e) {
+  return !!e && (e.name === 'AbortError' || e.code === 20 || e.code === 'ABORT_ERR');
 }
 function toast(msg, cls) {
   const el = document.createElement('div');
   el.className = 'tst ' + (cls || '');
   el.textContent = msg;
-  $('toasts').appendChild(el);
+  const host = $('toasts');
+  if (host) host.appendChild(el);
+  else if (typeof document !== 'undefined' && document.body) document.body.appendChild(el);
   setTimeout(() => el.remove(), 3600);
 }
 // esc 文本/属性双安全转义。不能只用 div.innerHTML（它转义 <>& 但不转义引号），
@@ -341,6 +412,7 @@ function trangeRender(id) {
   const fromEl = host.querySelector('.tr-from');
   const toEl = host.querySelector('.tr-to');
   const readCustom = () => {
+    if (!fromEl || !toEl) return;
     st.from = dtLocalParse(fromEl.value);
     st.to = dtLocalParse(toEl.value);
     // 起止颠倒就地标红（不静默纠正：用户可能正输到一半）。
@@ -503,17 +575,23 @@ function clearKeyInput() {
   const el = $('keyInput');
   if (el) el.value = '';
 }
-$('btnKey').onclick = async () => {
-  const v = $('keyInput').value.trim();
+if ($('btnKey')) $('btnKey').onclick = async () => {
+  const input = $('keyInput');
+  const v = input ? input.value.trim() : '';
   if (!v) return;
   memKey = v;
   try {
     await api('overview');
     clearKeyInput();
-    $('keyErr').hidden = true;
+    const err = $('keyErr');
+    if (err) err.hidden = true;
     hideModal('keyVeil');
     start();
-  } catch (e) { memKey = ''; $('keyErr').hidden = false; }
+  } catch (e) {
+    memKey = '';
+    const err = $('keyErr');
+    if (err) { err.hidden = false; err.textContent = e && e.message ? e.message : '密钥无效'; }
+  }
 };
 /* 表单提交兜底：阻止隐式提交导航（CSP script-src 'self' 下内联 onsubmit 不生效，
    故统一由同源 JS 兜底）。密钥框是单输入框表单：按 Enter 的默认行为是提交，无兜底
@@ -521,7 +599,9 @@ $('btnKey').onclick = async () => {
    keydown：隐式提交不经过 keydown 逻辑（如焦点在别处时的回车），必须在 submit 上兜底。
    逐 form 绑定（而非某个 id）：不依赖具体 id，新增表单无需再改这里。 */
 document.querySelectorAll('form').forEach(f => f.addEventListener('submit', e => e.preventDefault()));
-$('keyInput').addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); $('btnKey').click(); } });
+if ($('keyInput')) $('keyInput').addEventListener('keydown', e => {
+  if (e.key === 'Enter') { e.preventDefault(); const b = $('btnKey'); if (b) b.click(); }
+});
 
 /* ── 路由 ─────────────────────────────────────────────────────────── */
 /* 积分包明细共享缓存：「积分构成」视图与首页「积分到期提醒」卡片共用同一份
@@ -582,9 +662,12 @@ function go(v) {
     if (on) a.setAttribute('aria-current', 'page');
     else a.removeAttribute('aria-current');
   });
-  $('ttl').textContent = TITLES[v];
+  // Hub 把页面标题与品牌放在同一个顶栏 h1 里；切换视图时更新副标题即可。
+  const navSub = $('navSub');
+  if (navSub) navSub.textContent = TITLES[v] || '控制台';
   setupSectionNav(v);
-  if (v === 'models' && !$('mdBody').children.length) loadModels();
+  const mdBody = $('mdBody');
+  if (v === 'models' && (!mdBody || !mdBody.children || !mdBody.children.length)) loadModels();
   if (v === 'config') loadConfig();
   if (v === 'logs') loadLogs();
   if (v === 'usage') loadUsage();
@@ -597,9 +680,33 @@ function go(v) {
   if (v === 'taskscenter') reattachQueueView();
   return true;
 }
-document.querySelectorAll('.nav a').forEach(a => a.onclick = e => {
-  e.preventDefault();
-  if (go(a.dataset.view) !== false) history.replaceState(null, '', '#' + a.dataset.view);
+// 导航用事件委托而不是逐个 onclick：旧 index.html 可能没有 .nav a，
+// 或脚本在 DOMContentLoaded 之前执行导致 querySelectorAll 为空，之后
+// 所有页签都会失效。委托在 document 上，节点晚到也能工作。
+if (typeof document !== 'undefined' && document.addEventListener) {
+  document.addEventListener('click', e => {
+    const a = e.target && e.target.closest ? e.target.closest('.nav a[data-view]') : null;
+    if (!a) return;
+    e.preventDefault();
+    if (go(a.dataset.view) !== false && history && history.pushState) {
+      history.pushState(null, '', '#' + a.dataset.view);
+    }
+  });
+}
+// hashchange：深链与浏览器前进/后退。此前只有点击委托会 go()，脚本或用户
+// 直接改 location.hash 时页面不切视图，地址栏与内容不一致。
+if (typeof addEventListener === 'function') addEventListener('hashchange', () => {
+  // 页内导航也用 #sec-* 锚点；主路由只认 9 个视图，其他 hash 不能被当成
+  // 切页信号（否则点击区块导航会触发一次无意义的分支/刷新）。
+  const next = (location.hash || '#accounts').slice(1);
+  if (!(next in TITLES)) return;
+  if (next === view) return;
+  go(next);
+});
+if (typeof addEventListener === 'function') addEventListener('popstate', () => {
+  const next = (location.hash || '#accounts').slice(1);
+  if (!(next in TITLES) || next === view) return;
+  go(next);
 });
 if (typeof addEventListener === 'function') addEventListener('beforeunload', e => {
   if (!cfgDirty) return;
@@ -697,6 +804,8 @@ let accRenderSig = '';
 
 function renderAccounts(list) {
   const tb = $('accBody');
+  if (!tb) { noteDOM('accBody'); return; }
+  accAll = list || [];
   // 缓存最近一次全量数据：搜索/排序在已拉到的数据上做，改条件不必重新打 /overview。
   accAll = list || [];
   const shown = accSortList(accAll.filter(s => accMatch(s)));
@@ -724,8 +833,10 @@ function renderAccounts(list) {
   // 移出后再按最新数据重建。accAll 已在上面更新，不会因此显示旧快照。
   // 注意：焦点在表内时只跳过「远端数据未变」的整表重建；若可见数据已变化
   //（动作完成、冷却状态切换），仍需重建，否则表内按钮聚焦期间状态会长期陈旧。
-  const focusInTable = document.activeElement && typeof tb.contains === 'function' &&
-    tb.contains(document.activeElement);
+  // document/activeElement 在旧骨架、无头测试或极早求值阶段可能不存在；这里只是
+  // 焦点保护，缺能力时按「焦点不在表内」处理，不能让它阻断整表渲染。
+  const activeEl = (document && document.activeElement) || null;
+  const focusInTable = !!activeEl && typeof tb.contains === 'function' && tb.contains(activeEl);
   const wrap = (tb.closest && tb.closest('.tbl-wrap')) || tb;
   const scrollTop = wrap.scrollTop || 0;
   const scrollLeft = wrap.scrollLeft || 0;
@@ -781,6 +892,12 @@ function renderAccounts(list) {
     const unlimited = s.credits_total === -1;
     const cred = unlimited ? '不限'
       : (s.credits == null ? '—' : (s.credits_total > 0 ? s.credits + '<span class="of">/' + s.credits_total + '</span>' : String(s.credits)));
+    // 企业版口径与个人不同：credits=本周期剩余、credits_total=分配额度。
+    // 仍写「剩余/总额」会让运维误以为是可结转积分；这里直接标为分配额度。
+    const credLabel = s.enterprise ? '企业额度' : '积分';
+    const credValue = s.enterprise && !unlimited && s.credits != null
+      ? String(s.credits) + (s.credits_total > 0 ? '<span class="of"> / 分配 ' + s.credits_total + '</span>' : '')
+      : cred;
     const pct = unlimited ? 100
       : (s.credits_total > 0
         ? Math.min(100, Math.round((s.credits || 0) / s.credits_total * 100))
@@ -814,7 +931,7 @@ function renderAccounts(list) {
       '<td class="pick" data-label="选择"><input type="checkbox" data-pick="' + esc(s.uid) + '" aria-label="选择 ' + esc(s.nickname || s.uid) + '"' + (accSelected.has(s.uid) ? ' checked' : '') + '></td>' +
       '<td class="who" data-label="账号"><div class="nm">' + (s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + (s.enterprise ? ' <span class="realm-tag">企业版</span>' : '') + weightTag + credTag + '</div><div class="id">' + esc(short) + '</div>' + noteLine + '</td>' +
       '<td data-label="状态">' + tag + note + rateLimits + '</td>' +
-      '<td class="cred" data-label="积分" title="' + esc(credTip) + '"><div class="n">' + cred + '</div><div class="bar"><i style="width:' + pct + '%"></i></div></td>' +
+      '<td class="cred" data-label="' + credLabel + '" title="' + esc(credTip) + '"><div class="n">' + credValue + '</div><div class="bar"><i style="width:' + pct + '%"></i></div></td>' +
       '<td class="num" data-label="成功 / 失败">' + (s.success_count || 0) + ' <span style="color:var(--ink-3)">/</span> <span style="color:var(--bad)">' + (s.err_total || 0) + '</span></td>' +
       '<td class="num" data-label="在途">' + (s.in_flight || 0) + '</td>' +
       '<td class="num usage-cell" data-label="用量" title="' + esc(usageTitle) + '"><span class="usage-line" aria-label="' + esc(usageTitle) + '">' +
@@ -922,10 +1039,10 @@ async function loadOverview(quiet) {
     overviewETag = r.headers.get('ETag') || '';
     overviewFetchedAt = Date.now();
     lastUptimeSec = Number(d.uptime_sec) || 0;
-    $('sTotal').textContent = d.total;
-    $('sHealthy').textContent = d.healthy;
-    $('sCooling').textContent = d.cooling;
-    $('sDisabled').textContent = d.disabled;
+    setText('sTotal', d.total);
+    setText('sHealthy', d.healthy);
+    setText('sCooling', d.cooling);
+    setText('sDisabled', d.disabled);
     // 暂停选号单列（issue #125）：它只关选号、照常签到保活，与禁用是两种状态。
     if ($('sPaused')) $('sPaused').textContent = d.paused == null ? '-' : d.paused;
     // 企业版不限量：credits_total === -1（上游 limitNum=-1）。把它计进总额会得到
@@ -938,16 +1055,27 @@ async function loadOverview(quiet) {
     const remSum = limited.reduce((a, s) => a + (s.credits || 0), 0);
     const totSum = limited.reduce((a, s) => a + (s.credits_total || 0), 0);
     const unlimitedN = accts.length - limited.length;
-    $('sCredits').textContent = (totSum > 0 ? remSum + ' / ' + totSum : String(remSum)) +
+    const creditsText = (totSum > 0 ? remSum + ' / ' + totSum : String(remSum)) +
       (unlimitedN ? ' · 不限量 ' + unlimitedN + ' 个' : '');
-    $('sSticky').textContent = d.sticky_sessions;
-    $('navSub').textContent = 'v' + d.version;
-    $('navVer').textContent = 'v' + d.version;
-    $('navRedis').textContent = d.redis_mode === 'upstash' ? 'Redis 镜像' : '本地内存';
-    $('navState').textContent = d.healthy > 0 ? '服务正常' : (d.total ? '无可用账号' : '待添加账号');
+    setText('sCredits', creditsText);
+    // 统计卡在窄屏会被压到一列；长金额必须可换行并保留完整值，
+    // 不能只靠 CSS ellipsis 静默截断（运维无法据此判断额度）。
+    const creditsEl = $('sCredits');
+    if (creditsEl) {
+      creditsEl.title = creditsText;
+      creditsEl.setAttribute('aria-label', '积分 / 企业已分配：' + creditsText);
+    }
+    setText('sSticky', d.sticky_sessions);
+    if ($('navVer')) $('navVer').textContent = 'v' + d.version;
+    if ($('navRedis')) $('navRedis').textContent = d.redis_mode === 'upstash' ? 'Redis 镜像' : '本地内存';
+    if ($('navState')) $('navState').textContent = d.healthy > 0 ? '服务正常' : (d.total ? '无可用账号' : '待添加账号');
+    const statusDot = $('statusDot');
+    if (statusDot) statusDot.classList.toggle('err', !(d.healthy > 0));
     const p = $('navPulse');
-    p.className = 'pulse' + (d.healthy > 0 ? '' : (d.total ? ' warn' : ' bad'));
-    $('accNote').textContent = d.in_flight_full ? d.in_flight_full + ' 个账号在途占满' : '';
+    if (p) p.className = 'pulse' + (d.healthy > 0 ? '' : (d.total ? ' warn' : ' bad'));
+    const dot = $('statusDot');
+    if (dot) dot.className = 'hub-dot' + (d.healthy > 0 ? '' : ' err');
+    setText('accNote', d.in_flight_full ? d.in_flight_full + ' 个账号在途占满' : '');
     renderUptime(lastUptimeSec);
     renderAccounts(d.accounts || []);
     renderModelLocks(d.model_locks);
@@ -963,7 +1091,14 @@ async function loadOverview(quiet) {
 
 function renderUptime(sec) {
   const up = Math.max(0, Math.floor(Number(sec) || 0));
-  if ($('subMeta')) $('subMeta').textContent = '运行 ' + (up >= 86400 ? Math.floor(up / 86400) + ' 天 ' : '') + Math.floor(up % 86400 / 3600) + ' 时 ' + Math.floor(up % 3600 / 60) + ' 分';
+  const text = '运行 ' + (up >= 86400 ? Math.floor(up / 86400) + ' 天 ' : '') +
+    Math.floor(up % 86400 / 3600) + ' 时 ' + Math.floor(up % 3600 / 60) + ' 分';
+  // Hub 顶栏没有独立页面副标题；把运行时长放进右侧 meta 的版本行，
+  // 既保留可观测信息，也避免用不存在的 #subMeta 触发空节点异常。
+  const sub = $('subMeta');
+  if (sub) sub.textContent = text;
+  const ver = $('navVer');
+  if (ver && !ver.title) ver.title = text;
 }
 
 /* checkAuthGate 在未配置管理密钥时给出明确提示。管理 API fail-closed（403），
@@ -985,7 +1120,13 @@ async function checkAuthGate() {
 let accQTimer = null;
 if ($('accQ')) $('accQ').oninput = () => {
   clearTimeout(accQTimer);
-  accQTimer = setTimeout(() => { accFilter.q = $('accQ').value.trim(); accPage = 1; renderAccounts(accAll); }, 120);
+  accQTimer = setTimeout(() => {
+    const q = $('accQ');
+    if (!q) return;
+    accFilter.q = q.value.trim();
+    accPage = 1;
+    renderAccounts(accAll);
+  }, 120);
 };
 if ($('accSort')) $('accSort').onchange = () => {
   accFilter.sort = $('accSort').value;
@@ -1002,7 +1143,8 @@ if ($('accState')) $('accState').addEventListener('click', ev => {
   if (!b) return;
   accFilter.state = b.dataset.state || '';
   accPage = 1;
-  $('accState').querySelectorAll('button[data-state]').forEach(x => {
+  const accState = $('accState');
+  if (accState) accState.querySelectorAll('button[data-state]').forEach(x => {
     x.setAttribute('aria-pressed', x === b ? 'true' : 'false');
   });
   renderAccounts(accAll);
@@ -1031,10 +1173,11 @@ if ($('accPageSize')) $('accPageSize').onchange = () => {
   try { localStorage.setItem('wb-acc-page-size', String(accPageSize)); } catch (_) { /* ignore */ }
   renderAccounts(accAll);
 };
-if ($('accPageSize')) {
+const accPageSizeEl = $('accPageSize');
+if (accPageSizeEl) {
   try {
     const v = Number(localStorage.getItem('wb-acc-page-size'));
-    if ([0, 50, 100, 200].includes(v)) { accPageSize = v; $('accPageSize').value = String(v); }
+    if ([0, 50, 100, 200].includes(v)) { accPageSize = v; accPageSizeEl.value = String(v); }
   } catch (_) { /* ignore */ }
 }
 if ($('btnAccPrev')) $('btnAccPrev').onclick = () => { if (accPage > 1) { accPage--; renderAccounts(accAll); } };
@@ -1121,13 +1264,16 @@ async function accSelectedAction(kind) {
     invalidatePackagesCache();
     loadOverview(true);
   } catch (e) { toast(e.message, 'err'); }
-  finally { if (btn) { btn.textContent = label; } }
+  // 批量动作失败也要恢复按钮：此前只还原文案、不解除 disabled，一次网络
+  // 错误后「启用/暂停/禁用」在整页生命周期内都点不动（轮询重建账号表也不会
+  // 重建工具栏按钮）。
+  finally { if (btn) { btn.disabled = false; btn.textContent = label; } }
 }
 if ($('btnSelEnable')) $('btnSelEnable').onclick = () => accSelectedAction('enable');
 if ($('btnSelPause')) $('btnSelPause').onclick = () => accSelectedAction('pause');
 if ($('btnSelDisable')) $('btnSelDisable').onclick = () => accSelectedAction('disable');
 
-$('accBody').addEventListener('click', async ev => {
+if ($('accBody')) $('accBody').addEventListener('click', async ev => {
   const pick = ev.target.closest && ev.target.closest('input[data-pick]');
   if (pick) {
     const uid = pick.dataset.pick;
@@ -1158,6 +1304,7 @@ $('accBody').addEventListener('click', async ev => {
     return;
   }
   const u = b.dataset.u, a = b.dataset.a;
+  const acct = (accAll || []).find(x => x && x.uid === u) || null;
   if (a === 'remove' && !confirm('移除账号将删除池状态与 auths/ 下的凭证文件，且不可恢复。确认移除？')) return;
   if (a === 'disable' && !confirm('禁用后该账号不再参与选号（保号任务默认也跳过），需手动解冻才能恢复。若只是想临时让位、仍要保号，请改用「暂停选号」。确认禁用？')) return;
   // 在途键：5 秒轮询重建行时会按 busyKeys 恢复 disabled（易用性修复 5）。
@@ -1171,7 +1318,10 @@ $('accBody').addEventListener('click', async ev => {
       toast('签到完成' + (r.credits != null ? '，积分 ' + r.credits + (r.credits_total > 0 ? '/' + r.credits_total : '') : '') + (r.checkin_message ? '（' + r.checkin_message + '）' : ''), 'ok');
     } else if (a === 'balance') {
       const r = await api('accounts/' + encodeURIComponent(u) + '/balance', { method: 'POST' });
-      toast('余额已更新：' + r.credits + (r.credits_total > 0 ? ' / ' + r.credits_total : ''), 'ok');
+      const ent = acct && acct.enterprise;
+      const amount = r.credits_total === -1 ? '不限'
+        : String(r.credits) + (r.credits_total > 0 ? (ent ? ' / 分配 ' : ' / ') + r.credits_total : '');
+      toast((ent ? '企业额度已更新：' : '余额已更新：') + amount, 'ok');
     } else if (a === 'revive') {
       await api('accounts/' + encodeURIComponent(u) + '/revive', { method: 'POST' });
       toast('已解冻', 'ok');
@@ -1185,7 +1335,7 @@ $('accBody').addEventListener('click', async ev => {
       await api('accounts/' + encodeURIComponent(u) + '/resume', { method: 'POST' });
       toast('已恢复选号', 'ok');
     } else if (a === 'tasks') {
-      openTasks(u);
+      openTasks(u, acct);
     } else if (a === 'remove') {
       try {
         const r = await api('accounts/' + encodeURIComponent(u) + '/remove', { method: 'POST' });
@@ -1230,7 +1380,7 @@ function bindAllAction(id, path, confirmText, okText) {
     el.textContent = label;
   };
 }
-bindAllAction('btnCheckinAll', 'checkin_all', '将对全部账号执行签到（幂等；已签到的会跳过）。确认开始？', '全部签到已开始，结果见日志');
+bindAllAction('btnCheckinAll', 'checkin_all', '将对全部个人账号执行签到（企业账号无签到体系，会自动跳过；已签到的会跳过）。确认开始？', '全部签到已开始（企业账号已跳过），结果见日志');
 bindAllAction('btnTravelAll', 'travel_all', '将对全部账号执行旅行巡检（含领养链路，耗时较长）。确认开始？', '旅行巡检已开始（含领养链路），结果见日志');
 bindAllAction('btnActivityAll', 'activity_all', '将对全部账号执行活跃上报。确认开始？', '活跃上报已开始，结果见日志');
 bindAllAction('btnKeepaliveAll', 'keepalive_all', '将对全部账号执行保活（维持会话活跃）。确认开始？', '全部保活已开始，结果见日志');
@@ -1323,6 +1473,7 @@ async function loadModels() {
 let mdInFlight = null, mdPending = false;
 async function loadModelsRun() {
   const tb = $('mdBody');
+  if (!tb) { noteDOM('mdBody'); return; }
   tb.innerHTML = '<tr><td colspan="7"><div class="empty">正在向上游查询…</div></td></tr>';
   try {
     // 探测数据是可选增强：拉取失败不影响模型列表本身
@@ -1331,20 +1482,24 @@ async function loadModelsRun() {
     mdProbes = pr.probes || {};
     if (!mdAll.length) {
       tb.innerHTML = '<tr><td colspan="7"><div class="empty">上游未返回模型</div></td></tr>';
-      $('mdCount').textContent = '';
-      $('mdNote').textContent = '上游未返回模型';
+      setText('mdCount', '');
+      setText('mdNote', '上游未返回模型');
       return;
     }
     // 探测键带域前缀（cn:glm-5.2），模型表显示裸名，按「精确命中或 :后缀」关联。
     const probeKeys = Object.keys(mdProbes);
     mdProbeOf = id => mdProbes[id] || mdProbes[probeKeys.find(k => k.endsWith(':' + id))];
     const hit = mdAll.filter(m => mdProbeOf(m.id)).length;
-    $('mdNote').textContent = mdAll.length + ' 个模型 · 已刷新降级缓存' + (hit ? ' · ' + hit + ' 个有实测上限' : '');
+    setText('mdNote', mdAll.length + ' 个模型 · 已刷新降级缓存' + (hit ? ' · ' + hit + ' 个有实测上限' : ''));
     renderModels();
   } catch (e) {
     mdAll = [];
-    tb.innerHTML = '<tr><td colspan="7"><div class="empty">' + esc(e.message) + '</div></td></tr>';
-    $('mdCount').textContent = '';
+    // 空池导致的 503 不是“模型接口坏了”，给可操作的空态，而不是上游英文原文。
+    const msg = e && e.status === 503
+      ? '账号池暂无可用于查询模型的账号。请先添加账号，再回到本页点击刷新。'
+      : (e && e.message ? e.message : String(e));
+    tb.innerHTML = '<tr><td colspan="7"><div class="empty">' + esc(msg) + '</div></td></tr>';
+    setText('mdCount', '');
   }
 }
 
@@ -1417,61 +1572,157 @@ function mdRowHtml(m, pr) {
   if (m.supports_tool_call) caps.push('<span class="tag warn">工具</span>');
   if (m.supports_images) caps.push('<span class="tag warn">视觉</span>');
   if (m.supports_reasoning && !m.can_disable_thinking) caps.push('<span class="tag warn">思考常开</span>');
-  const capHtml = caps.length ? '<div class="id" style="margin-top:2px">' + caps.join(' ') + '</div>' : '';
+  const capHtml = caps.length ? caps.join(' ') : '<span style="color:var(--ink-3)">—</span>';
   const tip = m.description ? ' title="' + esc(m.description) + '"' : '';
-  return '<tr><td class="mark" aria-hidden="true"><i></i></td><td class="who"' + tip + '><div class="nm">' + esc(m.id) + '</div><div class="id">' + esc(m.name || '') + '</div>' + capHtml + '</td>' +
-    '<td class="num">' + rateCell(m) + '</td>' +
-    '<td>' + (m.default_effort ? '<span class="tag ok">' + esc(m.default_effort) + '</span>' : '<span style="color:var(--ink-3)">—</span>') + '</td>' +
-    '<td class="efs" style="white-space:normal">' + effs + '</td>' +
-    '<td class="num">' + (m.context_length ? Math.round(m.context_length / 1000) + 'K' : '—') + '</td>' +
-    outCell(m, pr) + '</tr>';
+  // Hub 的模型表把「名称 / 模型 ID / 能力」拆成独立列，窄屏再靠 data-label 卡片化；
+  // 旧版把三者堆在「模型」一列，长名称会把倍率和上下文挤到换行。
+  // 名称列用模型 ID 作为硬兜底；能力列独立一行，避免把倍率挤到下一行。
+  return '<tr><td class="mark" aria-hidden="true"><i></i></td>' +
+    '<td class="who"' + tip + ' data-label="名称"><div class="nm">' + esc(m.name || '—') + '</div>' +
+      (m.vendor ? '<div class="id">' + esc(m.vendor) + '</div>' : '') + '</td>' +
+    '<td class="mono" data-label="模型 ID"><div class="nm">' + esc(m.id) + '</div></td>' +
+    '<td class="num" data-label="积分倍率">' + rateCell(m) + '</td>' +
+    '<td data-label="能力"><div class="id" style="margin-top:0">' + capHtml + '</div></td>' +
+    '<td data-label="默认档">' + (m.default_effort ? '<span class="tag ok">' + esc(m.default_effort) + '</span>' : '<span style="color:var(--ink-3)">—</span>') + '</td>' +
+    '<td class="efs" style="white-space:normal" data-label="支持的思考档位">' + effs + '</td>' +
+    '<td class="num" data-label="上下文">' + (m.context_length ? Math.round(m.context_length / 1000) + 'K' : '—') + '</td>' +
+    outCell(m, pr).replace('<td class="num">', '<td class="num" data-label="最大输出">') + '</tr>';
 }
 
 function renderModels() {
   const tb = $('mdBody');
+  if (!tb) { noteDOM('mdBody'); return; }
   const list = mdSortList(mdAll.filter(m => mdMatch(m)));
   if (!list.length) {
-    tb.innerHTML = '<tr><td colspan="7"><div class="empty">没有符合当前筛选条件的模型</div></td></tr>';
+    tb.innerHTML = '<tr><td colspan="9"><div class="empty">没有符合当前筛选条件的模型</div></td></tr>';
   } else {
     tb.innerHTML = list.map(m => mdRowHtml(m, mdProbeOf(m.id))).join('');
   }
   const filtered = list.length !== mdAll.length;
-  $('mdCount').textContent = !mdAll.length ? ''
-    : filtered ? '命中 ' + list.length + ' / ' + mdAll.length + ' 个模型'
-    : mdAll.length + ' 个模型';
-  $('mdCount').className = filtered ? 'note src-off' : 'note';
+  const count = $('mdCount');
+  if (count) {
+    count.textContent = !mdAll.length ? ''
+      : filtered ? '命中 ' + list.length + ' / ' + mdAll.length + ' 个模型'
+      : mdAll.length + ' 个模型';
+    count.className = filtered ? 'note src-off' : 'note';
+  }
 }
 
 function resetModelFilter() {
   mdFilter = { q: '', realm: '', cap: '', effort: '', promo: '', sort: 'default' };
-  $('mdQ').value = ''; $('mdRealm').value = ''; $('mdCap').value = '';
-  $('mdEffort').value = ''; $('mdPromo').value = ''; $('mdSort').value = 'default';
+  for (const id of ['mdQ', 'mdRealm', 'mdCap', 'mdEffort', 'mdPromo']) {
+    const el = $(id); if (el) el.value = '';
+  }
+  const sort = $('mdSort'); if (sort) sort.value = 'default';
   renderModels();
 }
 
 // 筛选控件：输入框防抖 120ms（长列表逐字符重排不必每键一次），下拉即时。
 let mdQTimer = null;
-$('mdQ').oninput = () => {
+if ($('mdQ')) $('mdQ').oninput = () => {
   clearTimeout(mdQTimer);
-  mdQTimer = setTimeout(() => { mdFilter.q = $('mdQ').value.trim(); renderModels(); }, 120);
+  mdQTimer = setTimeout(() => { const el = $('mdQ'); mdFilter.q = el ? el.value.trim() : ''; renderModels(); }, 120);
 };
 for (const [id, key] of [['mdRealm', 'realm'], ['mdCap', 'cap'], ['mdEffort', 'effort'], ['mdPromo', 'promo'], ['mdSort', 'sort']]) {
   const el = $(id);
   if (!el) continue;
   el.onchange = () => { mdFilter[key] = el.value; renderModels(); };
 }
-$('mdReset').onclick = resetModelFilter;
-$('btnModels').onclick = loadModels;
+if ($('mdReset')) $('mdReset').onclick = resetModelFilter;
+if ($('btnModels')) $('btnModels').onclick = loadModels;
 
-/* ── 日志（频道：全部/任务/对话/系统） ─────────────────────────────── */
+/* ── 日志（频道：全部/任务/对话/系统 + 级别 / 关键字） ─────────────── */
 let logCh = 'all';
-$('logChips').addEventListener('click', ev => {
+// logLevel / logQ 是纯前端筛选：服务端只按频道归档，级别和关键字在已拉取的
+// 最近 N 行上过滤即可，避免为了看一条 ERROR 重新扫盘。
+let logLevel = '', logQ = '';
+let logQT = null;
+function logLevelOf(e) {
+  const txt = String((e && e.text) || '');
+  if (/\b(error|fatal|panic)\b|失败|错误/i.test(txt)) return 'ERROR';
+  if (/\bwarn(ing)?\b|冷却|熔断|限流/i.test(txt)) return 'WARN';
+  if (/\bdebug\b|调试/i.test(txt)) return 'DEBUG';
+  return 'INFO';
+}
+function logEntryText(e) {
+  return [e && e.ch, e && e.ts, e && e.text].filter(Boolean).join(' ').toLowerCase();
+}
+function logMatches(e) {
+  const ch = typeof logCh === 'string' ? logCh : 'all';
+  const lvl = typeof logLevel === 'string' ? logLevel : '';
+  const q = typeof logQ === 'string' ? logQ : '';
+  if (ch !== 'all' && (e && e.ch) !== ch) return false;
+  if (lvl && logLevelOf(e) !== lvl) return false;
+  if (q && !logEntryText(e).includes(q.toLowerCase())) return false;
+  return true;
+}
+if ($('logChips')) $('logChips').addEventListener('click', ev => {
   const b = ev.target.closest('button[data-ch]');
   if (!b) return;
   logCh = b.dataset.ch;
   document.querySelectorAll('#logChips .chip').forEach(c => c.classList.toggle('on', c === b));
-  loadLogs(true);
+  renderLogs(lastLogEntries);
 });
+// 级别立即重绘；关键字防抖 120ms，输入长正文时不必每个键都重建 500 行。
+const logLevelEl = $('logLevel');
+if (logLevelEl) logLevelEl.onchange = () => { logLevel = logLevelEl.value; renderLogs(lastLogEntries); };
+const logQEl = $('logQ');
+if (logQEl) logQEl.oninput = () => {
+  clearTimeout(logQT);
+  logQT = setTimeout(() => { logQ = String(logQEl.value || '').trim(); renderLogs(lastLogEntries); }, 120);
+};
+/* logRenderHTML 是日志渲染的唯一模板。loadLogs 和本地筛选都调它：
+   纯函数只依赖入参，便于 loadLogs 单函数切片测试，也避免两份 HTML 慢慢漂移。 */
+function logRenderHTML(allEntries, ch, lvlFilter, q) {
+  const pick = (Array.isArray(allEntries) ? allEntries : []).filter(e => {
+    if (ch !== 'all' && (e && e.ch) !== ch) return false;
+    if (lvlFilter && logLevelOf(e) !== lvlFilter) return false;
+    if (q && !logEntryText(e).includes(String(q).toLowerCase())) return false;
+    return true;
+  });
+  if (!pick.length) {
+    return {
+      html: '<span class="ln" style="color:var(--ink-3)">' +
+        (Array.isArray(allEntries) && allEntries.length ? '没有符合筛选条件的日志' : '暂无日志') + '</span>',
+      count: 0,
+      filtered: !!(q || lvlFilter || ch !== 'all'),
+    };
+  }
+  return {
+    html: pick.map(e => {
+      const lvl = logLevelOf(e);
+      const t = e.ts ? fmtLogTime(e.ts) : '';
+      const chLabel = ({ task: '任务', chat: '对话', sys: '系统' }[e.ch] || e.ch || '系统');
+      return '<span class="ln lvl-' + lvl + '">' +
+        '<i class="lt">' + esc(t) + '</i>' +
+        '<i class="lv lvl-' + lvl + '">' + lvl + '</i>' +
+        '<i class="lch c-' + esc(e.ch || 'sys') + '">' + esc(chLabel) + '</i>' +
+        '<i class="lm">' + esc(e.text || '') + '</i>' +
+        '</span>';
+    }).join(''),
+    count: pick.length,
+    filtered: !!(q || lvlFilter || ch !== 'all'),
+  };
+}
+function renderLogs(allEntries) {
+  const box = $('logBox');
+  if (!box) { if (typeof noteDOM === 'function') noteDOM('logBox'); return; }
+  // 测试/旧骨架会把本函数单独求值：局部回退到模块默认值，不能因缺少
+  // logCh/logLevel/logQ 就抛 ReferenceError 让整页日志停摆。
+  const ch = typeof logCh === 'string' ? logCh : 'all';
+  const lvlFilter = typeof logLevel === 'string' ? logLevel : '';
+  const q = typeof logQ === 'string' ? logQ : '';
+  const view = logRenderHTML(allEntries, ch, lvlFilter, q);
+  box.innerHTML = view.html;
+  if (typeof logPin === 'undefined' || logPin) box.scrollTop = box.scrollHeight;
+  // 空结果只把「已筛选 · 0 行」写在工具条；不要用占位行覆盖日志区，
+  // 否则用户取消筛选时会误以为原始日志已被清空。
+  const note = view.filtered ? '已筛选 · ' + view.count + ' 行' : '';
+  if (typeof setText === 'function') setText('logFilterNote', note);
+  else { const n = $('logFilterNote'); if (n) n.textContent = note; }
+}
+// 最近一次成功拉取的日志，供频道/级别/关键字切换时本地重绘，不重复扫盘。
+let lastLogEntries = [];
 async function loadLogs(manual) {
   // 归档是多个 JSONL 的全量扫描：连点刷新或 5 秒轮询不能在慢盘上叠加多轮。
   if (logsReq) {
@@ -1480,6 +1731,7 @@ async function loadLogs(manual) {
   }
   logsReq = true;
   const box = $('logBox');
+  if (!box) { logsReq = false; noteDOM('logBox'); return; }
   const atEnd = box.scrollTop + box.clientHeight >= box.scrollHeight - 24;
   const limit = ($('reqLimit') && $('reqLimit').value) || 100;
   // 时间范围由归档侧过滤（不是前端筛已拉取的条目）：区间落在更早的时间段时，
@@ -1504,23 +1756,33 @@ async function loadLogs(manual) {
     if (lr.e) {
       // 运行日志自己的错误态；请求指标/归档仍会独立渲染。
       box.innerHTML = '<span class="ln e">日志加载失败：' + esc(lr.e.message) + '</span>';
-      $('logNote').textContent = '加载失败';
+      setText('logNote', '加载失败');
     } else {
       const d = lr.d || {};
-      const entries = (d.entries || []).filter(e => logCh === 'all' || e.ch === logCh);
+      lastLogEntries = d.entries || [];
       // 日志容器整体 innerHTML 替换会把正在向上翻阅的用户拉回旧位置，也产生无谓
       // 的 DOM/布局开销。签名未变（同一批行）时跳过重绘；滚动位置只在用户仍位于
       // 底部（或显式开启自动滚动）时跟随。
-      const sig = entries.map(e => [e.ts || '', e.ch || '', e.text || ''].join('\u0001')).join('\u0002');
+      const sig = lastLogEntries.map(e => [e.ts || '', e.ch || '', e.text || ''].join('\u0001')).join('\u0002');
       // 首次渲染时容器里是空内容（或占位提示），不能只凭签名跳过；用初始哨兵
       // 区分「尚未画过」与「画过同一批」。否则首屏日志会一直是空白占位。
+      // 旧版单测只求值 loadLogs 这一段，不能依赖外部的 logRenderHTML /
+      // logLevelOf；这里保留自包含模板，renderLogs 只服务本地筛选控件。
       if (sig !== logSig || !logSig) {
-        box.innerHTML = entries.length
-        ? entries.map(e => {
-          const lvl = /error|失败|错误/.test(e.text) ? ' e' : /warn|冷却|熔断/.test(e.text) ? ' w' : '';
+        box.innerHTML = lastLogEntries.length
+        ? lastLogEntries.map(e => {
+          const txt = String(e.text || '');
+          const lvl = /\b(error|fatal|panic)\b|失败|错误/i.test(txt) ? 'ERROR'
+            : /\bwarn(ing)?\b|冷却|熔断|限流/i.test(txt) ? 'WARN'
+            : /\bdebug\b|调试/i.test(txt) ? 'DEBUG' : 'INFO';
           const t = e.ts ? fmtLogTime(e.ts) : '';
-          const ch = logCh === 'all' ? '<i class="lch c-' + esc(e.ch) + '">' + ({ task: '任务', chat: '对话', sys: '系统' }[e.ch] || e.ch) + '</i>' : '';
-          return '<span class="ln' + lvl + '">' + ch + esc(t + ' ' + e.text) + '</span>';
+          const chLabel = ({ task: '任务', chat: '对话', sys: '系统' }[e.ch] || e.ch || '系统');
+          return '<span class="ln lvl-' + lvl + '">' +
+            '<i class="lt">' + esc(t) + '</i>' +
+            '<i class="lv lvl-' + lvl + '">' + lvl + '</i>' +
+            '<i class="lch c-' + esc(e.ch || 'sys') + '">' + esc(chLabel) + '</i>' +
+            '<i class="lm">' + esc(txt) + '</i>' +
+            '</span>';
         }).join('')
         : '<span style="color:var(--ink-3)">暂无日志</span>';
         logSig = sig;
@@ -1530,9 +1792,19 @@ async function loadLogs(manual) {
       }
       const counts = {};
       for (const e of (d.entries || [])) counts[e.ch] = (counts[e.ch] || 0) + 1;
-      $('logNote').textContent = logCh === 'all'
+      const logChCur = typeof logCh === 'string' ? logCh : 'all';
+      const logLvlCur = typeof logLevel === 'string' ? logLevel : '';
+      const logQCur = typeof logQ === 'string' ? logQ : '';
+      // 已筛选时这里不能用 entries：它是请求指标/归档区块的局部变量，直到
+      // 两个 await 之后才声明。此前一开筛选或频道就抛 ReferenceError，
+      // 整页日志停摆。筛选计数应以当前日志窗口为准，且只用本作用域已有的值。
+      const filtered = logChCur !== 'all' || !!logLvlCur || !!logQCur;
+      const visibleCount = filtered && typeof logRenderHTML === 'function'
+        ? logRenderHTML(lastLogEntries, logChCur, logLvlCur, logQCur).count
+        : lastLogEntries.length;
+      setText('logNote', logChCur === 'all' && !logLvlCur && !logQCur
         ? '任务 ' + (counts.task || 0) + ' · 对话 ' + (counts.chat || 0) + ' · 系统 ' + (counts.sys || 0)
-        : (logCh === 'task' ? '任务' : logCh === 'chat' ? '对话' : '系统') + ' ' + entries.length + ' 行';
+        : visibleCount + ' 行 / 共 ' + lastLogEntries.length + ' 行');
     }
 
     const [mr, ar] = await Promise.all([pMetrics, pArchive]);
@@ -1559,7 +1831,7 @@ async function loadLogs(manual) {
     // 兜底：上面的分区错误已就地处理，这里只兜意外异常。失败必须可见：此前
     // catch 是空块，读取失败时日志区保持「暂无日志」，用户以为"确实没有记录"。
     box.innerHTML = '<span class="ln e">日志加载失败：' + esc(e.message) + '</span>';
-    $('logNote').textContent = '加载失败';
+    setText('logNote', '加载失败');
     lastLogErrors = { metrics: e, archive: e };
     renderRequestMetrics(lastLogMetrics, lastLogRows.entries || []);
   } finally {
@@ -1572,12 +1844,12 @@ function renderRequestMetrics(m, entries, rowsChanged) {
   m = m || {};
   const a = m.archive || {};
   const errors = lastLogErrors || {};
-  $('reqSummary').textContent =
+  setText('reqSummary',
     '已完成 ' + fmtTok(m.completed) +
     ' · 成功 ' + (m.success_rate == null ? '—' : Number(m.success_rate).toFixed(1) + '%') +
     ' · HTTP ' + (m.http_success_rate == null ? '—' : Number(m.http_success_rate).toFixed(1) + '%') +
     ' · 平均 ' + fmtMs(m.avg_duration_ms) +
-    ' · 进行中 ' + String(m.in_flight || 0);
+    ' · 进行中 ' + String(m.in_flight || 0));
   const parts = [];
   if (errors.metrics) parts.push('指标读取失败：' + errors.metrics.message);
   if (errors.archive) parts.push('归档读取失败：' + errors.archive.message);
@@ -1587,10 +1859,13 @@ function renderRequestMetrics(m, entries, rowsChanged) {
   } else {
     parts.push('仅内存指标，JSONL 归档已关闭');
   }
-  $('reqNote').textContent = parts.join(' · ');
   // 读取失败必须是错误态，不能与“归档已关闭”共用灰色说明——后者会让用户
   // 以为确实没有请求记录（P1 假成功）。
-  $('reqNote').className = errors.metrics || errors.archive ? 'note err' : 'note';
+  const reqNote = $('reqNote');
+  if (reqNote) {
+    reqNote.textContent = parts.join(' · ');
+    reqNote.className = errors.metrics || errors.archive ? 'note err' : 'note';
+  }
 
   reqEntries = entries || [];
   // rowsChanged=false 时保留现有表格 DOM：数据完全一致，重建只会丢滚动/选中态。
@@ -1698,10 +1973,11 @@ function renderRequestTable() {
   // 归档里的旧条目没有来源字段（该功能上线前写入）：这时提示开关/历史原因，
   // 而不是让人以为筛选坏了。
   const hasSource = reqEntries.some(e => e && (e.client_ip || e.user_agent));
-  $('reqCount').textContent = !reqEntries.length ? ''
+  const reqCount = $('reqCount');
+  if (reqCount) reqCount.textContent = !reqEntries.length ? ''
     : (filtered ? '命中 ' + list.length + ' / ' + reqEntries.length + ' 条' : reqEntries.length + ' 条') +
       (hasSource ? '' : ' · 来源未记录');
-  $('reqCount').className = (filtered || !hasSource) ? 'note src-off' : 'note';
+  if (reqCount) reqCount.className = (filtered || !hasSource) ? 'note src-off' : 'note';
   const page = $('reqPage');
   if (page) page.textContent = list.length ? (reqPage + ' / ' + pages) : '—';
   const prev = $('btnReqPrev'), next = $('btnReqNext');
@@ -1744,20 +2020,26 @@ function syncRequestKeyOptions() {
    这段顶层绑定放在 requestLogText 之前，是为了让"纯函数切片"式前端测试
    （slice requestLogText → fmtBytes）只拿到无副作用的格式化函数。 */
 let reqQTimer = null;
-if ($('reqQ')) $('reqQ').oninput = () => {
+const reqQEl = $('reqQ');
+if (reqQEl) reqQEl.oninput = () => {
   clearTimeout(reqQTimer);
-  reqQTimer = setTimeout(() => { reqFilter.q = $('reqQ').value.trim(); reqPage = 1; renderRequestTable(); }, 150);
+  reqQTimer = setTimeout(() => { reqFilter.q = reqQEl.value.trim(); reqPage = 1; renderRequestTable(); }, 150);
 };
-if ($('reqOutcome')) $('reqOutcome').onchange = () => {
-  reqFilter.outcome = $('reqOutcome').value;
+const reqOutcomeEl = $('reqOutcome');
+if (reqOutcomeEl) reqOutcomeEl.onchange = () => {
+  reqFilter.outcome = reqOutcomeEl.value;
   reqPage = 1;
   renderRequestTable();
 };
-if ($('reqLimit')) $('reqLimit').onchange = () => { reqPage = 1; loadLogs(); };
-if ($('btnReqReload')) $('btnReqReload').onclick = loadLogs;
-if ($('reqKey')) $('reqKey').onchange = () => { reqFilter.key = $('reqKey').value; reqPage = 1; renderRequestTable(); };
-if ($('reqPageSize')) $('reqPageSize').onchange = () => {
-  reqPageSize = Math.max(0, Number($('reqPageSize').value) || 0);
+const reqLimitEl = $('reqLimit');
+if (reqLimitEl) reqLimitEl.onchange = () => { reqPage = 1; loadLogs(); };
+const reqReloadEl = $('btnReqReload');
+if (reqReloadEl) reqReloadEl.onclick = () => loadLogs();
+const reqKeyEl = $('reqKey');
+if (reqKeyEl) reqKeyEl.onchange = () => { reqFilter.key = reqKeyEl.value; reqPage = 1; renderRequestTable(); };
+const reqPageSizeEl = $('reqPageSize');
+if (reqPageSizeEl) reqPageSizeEl.onchange = () => {
+  reqPageSize = Math.max(0, Number(reqPageSizeEl.value) || 0);
   reqPage = 1;
   renderRequestTable();
 };
@@ -1799,7 +2081,8 @@ function exportURL(path, params) {
 }
 function requestExportQuery() {
   const q = trangeQuery('reqRange', false);
-  q.set('limit', ($('reqLimit') && $('reqLimit').value) || 100);
+  const limitEl = $('reqLimit');
+  q.set('limit', (limitEl && limitEl.value) || 100);
   if (reqFilter.outcome) q.set('outcome', reqFilter.outcome);
   if (reqFilter.key) q.set('key_id', reqFilter.key === '__empty__' ? '' : reqFilter.key);
   return q;
@@ -1871,9 +2154,10 @@ function fmtBytes(bytes) {
   if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
   return (n / 1024 / 1024).toFixed(1) + ' MB';
 }
-$('btnLogPin').onclick = () => {
+if ($('btnLogPin')) $('btnLogPin').onclick = () => {
   logPin = !logPin;
-  $('btnLogPin').textContent = '自动滚动：' + (logPin ? '开' : '关');
+  const b = $('btnLogPin');
+  if (b) b.textContent = '自动滚动：' + (logPin ? '开' : '关');
 };
 
 /* ── 配置 ─────────────────────────────────────────────────────────── */
@@ -1941,15 +2225,15 @@ function apiKeyRows(list) {
     const hasKey = !!k.key_set || (k.key && k.key !== MASKED_SECRET);
     const enabled = apiKeyEnabled(k.enabled);
     return '<tr class="ki-row" data-key-id="' + esc(id) + '" data-key-set="' + (hasKey ? '1' : '') + '">' +
-      '<td class="k-act"><button type="button" class="xs danger" data-ki="del" data-idx="' + i + '">删除</button></td>' +
-      '<td class="k-id"><input class="ki-id" value="' + esc(id) + '" placeholder="client-a" aria-label="Key ID"></td>' +
-      '<td><input class="ki-name" value="' + esc(k.name || '') + '" placeholder="可选" aria-label="Key 名称"></td>' +
-      '<td><input class="ki-key" type="password" value="" placeholder="' + (hasKey ? '留空 = 保持不变' : '至少 4 位') + '" autocomplete="new-password" aria-label="Key 密钥"></td>' +
-      '<td><select class="ki-realm" aria-label="限制 Realm">' +
+      '<td class="k-act" data-label="操作"><button type="button" class="xs danger" data-ki="del" data-idx="' + i + '">删除</button></td>' +
+      '<td class="k-id" data-label="ID"><input class="ki-id" value="' + esc(id) + '" placeholder="client-a" aria-label="Key ID"></td>' +
+      '<td data-label="名称"><input class="ki-name" value="' + esc(k.name || '') + '" placeholder="可选" aria-label="Key 名称"></td>' +
+      '<td data-label="Key"><input class="ki-key" type="password" value="" placeholder="' + (hasKey ? '留空 = 保持不变' : '至少 4 位') + '" autocomplete="new-password" aria-label="Key 密钥"></td>' +
+      '<td data-label="Realm"><select class="ki-realm" aria-label="限制 Realm">' +
         API_KEY_REALMS.map(([v, label]) => '<option value="' + v + '"' + (String(k.realm || '') === v ? ' selected' : '') + '>' + label + '</option>').join('') +
       '</select></td>' +
-      '<td><input class="ki-models" value="' + esc(apiKeyModelsText(k.models)) + '" placeholder="留空 = 不限模型" aria-label="模型白名单"></td>' +
-      '<td><input class="ki-enabled" type="checkbox"' + (enabled ? ' checked' : '') + ' aria-label="启用"></td>' +
+      '<td data-label="模型白名单"><input class="ki-models" value="' + esc(apiKeyModelsText(k.models)) + '" placeholder="留空 = 不限模型" aria-label="模型白名单"></td>' +
+      '<td data-label="启用"><input class="ki-enabled" type="checkbox"' + (enabled ? ' checked' : '') + ' aria-label="启用"></td>' +
     '</tr>';
   }).join('');
 }
@@ -2032,8 +2316,9 @@ async function loadConfig() {
     try {
       const d = await api('config');
       cfgLoaded = d.config;
-      $('cfgPath').textContent = d.path || '';
+      setText('cfgPath', d.path || '');
       const f = $('cfgForm');
+      if (!f) { noteDOM('cfgForm'); return; }
       for (const [name, path] of Object.entries(CFG_MAP)) {
         const el = f.elements[name];
         if (!el) continue;
@@ -2053,7 +2338,7 @@ async function loadConfig() {
       renderAPIKeys(cfgLoaded && cfgLoaded.api_keys);
       markDurationFields(); // 回填后重置校验态（清掉残留红框；现值来自后端必然合法）
       markHoursFields();
-      $('cfgNote').textContent = '';
+      setText('cfgNote', '');
       cfgDirty = false;
     } catch (e) { toast('读取配置失败：' + e.message, 'err'); }
     finally { if (cfgReq === run) cfgReq = null; }
@@ -2063,7 +2348,8 @@ async function loadConfig() {
 }
 let cfgReq = null;
 if ($('btnAddAPIKey')) $('btnAddAPIKey').onclick = addAPIKeyRow;
-if ($('apiKeysBody')) $('apiKeysBody').addEventListener('click', ev => {
+const apiKeysBody = $('apiKeysBody');
+if (apiKeysBody) apiKeysBody.addEventListener('click', ev => {
   const b = ev.target.closest('button[data-ki="del"]');
   if (!b) return;
   const row = b.closest('.ki-row');
@@ -2073,16 +2359,17 @@ if ($('apiKeysBody')) $('apiKeysBody').addEventListener('click', ev => {
   const label = (idEl && String(idEl.value || '').trim()) || '这一行';
   if (typeof confirm === 'function' && !confirm('删除 API Key「' + label + '」？保存配置后该 Key 立即失效。')) return;
   if (row) row.remove();
-  if (!($('apiKeysBody').querySelector('.ki-row'))) renderAPIKeys([]);
+  if (!apiKeysBody.querySelector('.ki-row')) renderAPIKeys([]);
   if (typeof cfgMarkDirty === 'function') cfgMarkDirty();
 });
-if ($('apiKeysBody')) $('apiKeysBody').addEventListener('change', ev => {
+if (apiKeysBody) apiKeysBody.addEventListener('change', ev => {
   // 启用勾选/Realm 下拉/密钥输入都走 change；input 事件只覆盖文本输入，
   // 勾选框在部分浏览器不触发 input，离开保护必须同时听 change。
   if (ev.target && ev.target.closest && ev.target.closest('.ki-row') && typeof cfgMarkDirty === 'function') cfgMarkDirty();
 });
 function collectConfig() {
   const f = $('cfgForm'), out = {};
+  if (!f) { noteDOM('cfgForm'); return out; }
   for (const [name, path] of Object.entries(CFG_MAP)) {
     const el = f.elements[name];
     if (!el) continue;
@@ -2113,7 +2400,8 @@ function collectConfig() {
 const HOURS_FIELDS = ['checkin_hours', 'growth_hours', 'travel_hours', 'activity_hours', 'blackcat_hours', 'keepalive_hours'];
 const HOURS_TIP = '格式应为小时列表：9,21 或 9 21（每个 0–23 的整数）';
 function hoursBad(name) {
-  const el = $('cfgForm').elements[name];
+  const form = $('cfgForm');
+  const el = form && form.elements ? form.elements[name] : null;
   if (!el) return false;
   const raw = el.value.trim();
   if (raw === '') return false;                       // 空 = 沿用现值
@@ -2124,8 +2412,10 @@ function hoursBad(name) {
   return parts.some(p => !/^\d+$/.test(p) || Number(p) > 23);
 }
 function markHoursFields() {
+  const form = $('cfgForm');
+  if (!form || !form.elements) return;
   for (const name of HOURS_FIELDS) {
-    const el = $('cfgForm').elements[name];
+    const el = form.elements[name];
     if (!el) continue;
     const bad = hoursBad(name);
     el.classList.toggle('invalid', bad);
@@ -2141,21 +2431,24 @@ const DURATION_FIELDS = ['soft_rate', 'soft_rate_max', 'breaker_cooldown', 'brea
   'degrade_cooldown', 'degrade_cooldown_max', 'cost_explore_interval', 'expiring_soon', 'ttl'];
 const DURATION_TIP = '格式应为 Go 时长：30m / 2h / 600s / 1h30m';
 function durationBad(name) {
-  const el = $('cfgForm').elements[name];
+  const form = $('cfgForm');
+  const el = form && form.elements ? form.elements[name] : null;
   if (!el) return false;
   const v = el.value.trim();
   return v !== '' && !DURATION_RE.test(v);
 }
 function markDurationFields() {
+  const form = $('cfgForm');
+  if (!form || !form.elements) return;
   for (const name of DURATION_FIELDS) {
-    const el = $('cfgForm').elements[name];
+    const el = form.elements[name];
     if (!el) continue;
     const bad = durationBad(name);
     el.classList.toggle('invalid', bad);
     el.title = bad ? DURATION_TIP : '';
   }
 }
-$('cfgForm').addEventListener('input', ev => {
+if ($('cfgForm')) $('cfgForm').addEventListener('input', ev => {
   if (DURATION_FIELDS.includes(ev.target.name)) markDurationFields();
   if (HOURS_FIELDS.includes(ev.target.name)) markHoursFields();
 });
@@ -2198,43 +2491,48 @@ function cfgMarkDirty() {
   if (note) { note.textContent = '有未保存的修改'; note.className = 'restart-note pending'; }
 }
 if ($('cfgForm')) $('cfgForm').addEventListener('input', cfgMarkDirty);
-$('btnEye').onclick = () => {
+if ($('btnEye')) $('btnEye').onclick = () => {
   const el = $('cfgKey');
+  if (!el) return;
   const show = el.type === 'password';
   el.type = show ? 'text' : 'password';
-  $('btnEye').textContent = show ? '隐藏' : '显示';
+  const b = $('btnEye');
+  if (b) b.textContent = show ? '隐藏' : '显示';
 };
-$('btnCfgReload').onclick = loadConfig;
+if ($('btnCfgReload')) $('btnCfgReload').onclick = loadConfig;
 // 放弃修改：有脏值时先确认，避免误触把当前编辑整页丢弃。
 if ($('btnCfgReload')) {
-  const original = $('btnCfgReload').onclick;
-  $('btnCfgReload').onclick = () => {
+  const reloadBtn = $('btnCfgReload');
+  const original = reloadBtn.onclick;
+  reloadBtn.onclick = () => {
     if (cfgDirty && !confirm('放弃所有未保存的配置修改？')) return;
     cfgDirty = false;
     if (typeof original === 'function') original();
   };
 }
-$('cfgForm').onsubmit = async ev => {
+const cfgForm = $('cfgForm');
+if (cfgForm) cfgForm.onsubmit = async ev => {
   ev.preventDefault();
   // 时长字段脏值拦截：标红 + toast 点名，不发保存请求（后端同样会拒，这里前置）。
   markDurationFields();
   markHoursFields();
   const firstBad = DURATION_FIELDS.find(durationBad);
   if (firstBad) {
-    const el = $('cfgForm').elements[firstBad];
-    el.focus();
-    toast('「' + (el.closest('.fld')?.querySelector('.lb')?.textContent || firstBad) + '」' + DURATION_TIP, 'err');
+    const el = cfgForm.elements[firstBad];
+    if (el) el.focus();
+    toast('「' + (el && el.closest('.fld')?.querySelector('.lb')?.textContent || firstBad) + '」' + DURATION_TIP, 'err');
     return;
   }
   // 小时列表字段同口径前置拦截（易用性修复 3）。
   const firstBadHours = HOURS_FIELDS.find(hoursBad);
   if (firstBadHours) {
-    const el = $('cfgForm').elements[firstBadHours];
-    el.focus();
-    toast('「' + (el.closest('.fld')?.querySelector('.lb')?.textContent || firstBadHours) + '」' + HOURS_TIP, 'err');
+    const el = cfgForm.elements[firstBadHours];
+    if (el) el.focus();
+    toast('「' + (el && el.closest('.fld')?.querySelector('.lb')?.textContent || firstBadHours) + '」' + HOURS_TIP, 'err');
     return;
   }
   const btn = $('btnCfgSave');
+  if (!btn) { toast('页面缺少保存按钮，请刷新页面', 'err'); return; }
   let sent = false;
   try {
     let body;
@@ -2260,54 +2558,66 @@ $('cfgForm').onsubmit = async ev => {
     const saveBtn = $('btnCfgSave');
     if (saveBtn) saveBtn.textContent = '已保存';
     // 密钥可能已改：本次会话沿用新值，避免下一次轮询被 401。
-    const k = $('cfgKey').value.trim();
+    const keyEl = $('cfgKey');
+    const k = keyEl ? keyEl.value.trim() : '';
     if (k && k !== MASKED_SECRET) memKey = k;
     // 保存成功不立即回读：用户在保存请求期间继续输入时，回读会把新输入
     // 覆盖成服务端快照。需要重新载入时由「放弃修改」或重新进入配置页触发。
     cfgDirty = false;
     loadOverview(true);
   } catch (e) { toast('保存失败：' + e.message, 'err'); }
-  finally { if (sent || btn.textContent === '保存中…') { btn.disabled = false; btn.textContent = '保存配置'; } }
+  finally {
+    const saveBtn = $('btnCfgSave');
+    if (saveBtn && (sent || saveBtn.textContent === '保存中…')) {
+      saveBtn.disabled = false;
+      saveBtn.textContent = '保存配置';
+    }
+  }
 };
 
 /* ── 添加账号 ─────────────────────────────────────────────────────── */
+/* setHidden 只改存在的节点，供弹窗这类旧骨架可能缺块的可选区域使用。 */
+function setHidden(id, v) { const el = $(id); if (el) el.hidden = v; }
 function openAdd() {
   showModal('addVeil', 'btnStartLogin');
   // 重置到登录标签
   switchAddTab('login');
-  $('addPick').hidden = false;
-  $('addLoad').hidden = true; $('addReady').hidden = true;
-  $('addDone').hidden = true; $('addErr').hidden = true;
-  $('importDone').hidden = true; $('importErr').hidden = true;
-  $('btnCopyUrl').hidden = true; $('btnOpenUrl').hidden = true;
-  $('btnStartLogin').hidden = false; $('btnStartLogin').disabled = false;
+  setHidden('addPick', false);
+  setHidden('addLoad', true); setHidden('addReady', true);
+  setHidden('addDone', true); setHidden('addErr', true);
+  setHidden('importDone', true); setHidden('importErr', true);
+  setHidden('btnCopyUrl', true); setHidden('btnOpenUrl', true);
+  setHidden('btnStartLogin', false);
+  const start = $('btnStartLogin'); if (start) start.disabled = false;
   stopPoll();
 }
 function switchAddTab(tab) {
   document.querySelectorAll('#addTabs .tab').forEach(b => b.classList.toggle('on', b.dataset.tab === tab));
-  $('addTabLogin').hidden = tab !== 'login';
-  $('addTabImport').hidden = tab !== 'import';
+  const login = $('addTabLogin'), imp = $('addTabImport');
+  if (login) login.hidden = tab !== 'login';
+  if (imp) imp.hidden = tab !== 'import';
 }
 document.querySelectorAll('#addTabs .tab').forEach(b => {
   b.onclick = () => switchAddTab(b.dataset.tab);
 });
 function startAddLogin() {
   const realm = (document.querySelector('input[name="addRealm"]:checked') || {}).value || 'cn';
-  $('btnStartLogin').disabled = true;
-  $('addLoad').hidden = false; $('addErr').hidden = true;
+  const start = $('btnStartLogin');
+  if (start) start.disabled = true;
+  setHidden('addLoad', false); setHidden('addErr', true);
   api('login/start', { method: 'POST', body: JSON.stringify({ realm }) }).then(r => {
     loginState = r.state;
-    $('addUrl').textContent = r.url;
-    $('addPick').hidden = true; // 选域锁定（会话已按该域发起）
-    $('addLoad').hidden = true; $('addReady').hidden = false;
-    $('btnStartLogin').hidden = true;
-    $('btnCopyUrl').hidden = false; $('btnOpenUrl').hidden = false;
+    setText('addUrl', r.url);
+    setHidden('addPick', true); // 选域锁定（会话已按该域发起）
+    setHidden('addLoad', true); setHidden('addReady', false);
+    setHidden('btnStartLogin', true);
+    setHidden('btnCopyUrl', false); setHidden('btnOpenUrl', false);
     loginTimer = setInterval(pollLogin, 3000);
   }).catch(e => {
-    $('addLoad').hidden = true;
-    $('btnStartLogin').disabled = false;
-    $('addErr').hidden = false;
-    $('addErr').textContent = e.message;
+    setHidden('addLoad', true);
+    if (start) start.disabled = false;
+    setHidden('addErr', false);
+    setText('addErr', e.message);
   });
 }
 function stopPoll() { if (loginTimer) { clearInterval(loginTimer); loginTimer = null; } }
@@ -2318,24 +2628,28 @@ async function pollLogin() {
     if (r.done) {
       stopPoll();
       invalidatePackagesCache();   // 新账号入池：旧快照里没有它（易用性修复 8）
-      $('addReady').hidden = true;
-      $('addDone').hidden = false;
-      $('addDone').textContent = '已添加 ' + (r.nickname || r.uid) + (r.realm === 'global' ? '（国际版）' : '') + (r.credits >= 0 ? ' · 积分 ' + r.credits + (r.credits_total > 0 ? '/' + r.credits_total : '') : '') + '，账号已载入池中';
+      setHidden('addReady', true);
+      setHidden('addDone', false);
+      setText('addDone', '已添加 ' + (r.nickname || r.uid) + (r.realm === 'global' ? '（国际版）' : '') + (r.credits >= 0 ? ' · 积分 ' + r.credits + (r.credits_total > 0 ? '/' + r.credits_total : '') : '') + '，账号已载入池中');
       setTimeout(() => { closeAdd(); loadOverview(true); }, 1600);
     }
   } catch (e) {
     stopPoll();
-    $('addReady').hidden = true;
-    $('addErr').hidden = false;
-    $('addErr').textContent = e.message + '（关闭后重新添加）';
+    setHidden('addReady', true);
+    setHidden('addErr', false);
+    setText('addErr', e.message + '（关闭后重新添加）');
   }
 }
 function closeAdd() { stopPoll(); loginState = null; hideModal('addVeil'); }
-$('btnCloseAdd').onclick = closeAdd;
-$('btnStartLogin').onclick = startAddLogin;
-$('btnOpenUrl').onclick = () => open($('addUrl').textContent, '_blank');
-$('btnCopyUrl').onclick = () => navigator.clipboard.writeText($('addUrl').textContent)
-  .then(() => toast('链接已复制', 'ok'), () => toast('复制失败，请手动选择复制', 'err'));
+if ($('btnCloseAdd')) $('btnCloseAdd').onclick = closeAdd;
+if ($('btnStartLogin')) $('btnStartLogin').onclick = startAddLogin;
+if ($('btnOpenUrl')) $('btnOpenUrl').onclick = () => { const el = $('addUrl'); if (el) open(el.textContent, '_blank'); };
+if ($('btnCopyUrl')) $('btnCopyUrl').onclick = () => {
+  const el = $('addUrl');
+  if (!el || !navigator.clipboard) { toast('复制失败，请手动选择复制', 'err'); return; }
+  navigator.clipboard.writeText(el.textContent)
+    .then(() => toast('链接已复制', 'ok'), () => toast('复制失败，请手动选择复制', 'err'));
+};
 /* 导入摘要：dry-run 必须明确标“预览”，不能被当成已完成。 */
 function importPreviewText(d) {
   d = d || {};
@@ -2345,9 +2659,10 @@ function importPreviewText(d) {
     ' · 无效 ' + Number(d.invalid || 0);
 }
 async function importCockpitFile() {
-  const file = $('importFile').files[0];
+  const input = $('importFile');
+  const file = input && input.files && input.files[0];
   if (!file) return;
-  $('importDone').hidden = true; $('importErr').hidden = true;
+  setHidden('importDone', true); setHidden('importErr', true);
   // 先 dry-run 只做分类，再把摘要交给用户确认；确认后才真正写入。
   const fd = new FormData();
   fd.append('file', file);
@@ -2359,12 +2674,12 @@ async function importCockpitFile() {
     let r = await fetch('/panel/api/import/cockpit', { method: 'POST', body: fd, headers: h });
     const d = await r.json();
     if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
-    $('importErr').hidden = true;
-    $('importDone').hidden = false;
-    $('importDone').textContent = importPreviewText(d);
+    setHidden('importErr', true);
+    setHidden('importDone', false);
+    setText('importDone', importPreviewText(d));
     const canCommit = (d.added || 0) + (d.updated || 0) > 0;
     if (!canCommit) {
-      if (d.invalid) $('importDone').textContent += '；没有可写入的账号';
+      if (d.invalid) { const el = $('importDone'); if (el) el.textContent += '；没有可写入的账号'; }
       return;
     }
     if (!confirm(importPreviewText(d) + '\n\n确认导入这些账号？')) return;
@@ -2376,27 +2691,28 @@ async function importCockpitFile() {
     if (!r.ok) throw new Error(committed.error || ('HTTP ' + r.status));
     if (d.imported) invalidatePackagesCache();   // 导入即入池（易用性修复 8）
     if (committed.imported) invalidatePackagesCache();
-    $('importDone').textContent = importPreviewText(committed);
+    setText('importDone', importPreviewText(committed));
     loadOverview(true);
   } catch (e) {
-    $('importErr').hidden = false;
-    $('importErr').textContent = '导入失败：' + e.message;
+    setHidden('importErr', false);
+    setText('importErr', '导入失败：' + e.message);
   }
-  $('importFile').value = '';
+  const fileInput = $('importFile');
+  if (fileInput) fileInput.value = '';
 }
 if ($('importFile')) $('importFile').onchange = importCockpitFile;
 
 /* ── 顶部动作 ─────────────────────────────────────────────────────── */
-$('btnAdd').onclick = openAdd;
-$('btnRefresh').onclick = async () => {
+if ($('btnAdd')) $('btnAdd').onclick = openAdd;
+if ($('btnRefresh')) $('btnRefresh').onclick = async () => {
   const b = $('btnRefresh');
-  b.disabled = true; b.textContent = '刷新中…';
+  if (b) { b.disabled = true; b.textContent = '刷新中…'; }
   try {
     await api('balance_all', { method: 'POST' });
     await loadOverview(true);
     toast('余额已从上游刷新', 'ok');
   } catch (e) { toast('刷新失败：' + e.message, 'err'); await loadOverview(true); }
-  finally { b.disabled = false; b.textContent = '刷新'; }
+  finally { if (b) { b.disabled = false; b.textContent = '刷新'; } }
   if (view === 'logs') loadLogs();
 };
 
@@ -2476,24 +2792,35 @@ const AUTO_TASKS = {
   'Sequential_Tasks_7': '体验灵感功能（预留，疑 PC 口径）：accept → 灵感事件组（PC+mp 双形态）→ 领奖（判据待解锁验证）'
 };
 
-function openTasks(uid) {
+function openTasks(uid, account) {
   taskUID = uid;
-  $('taskWho').textContent = uid.slice(0, 16);
+  openTasks.account = account || null;
+  setText('taskWho', String(uid || '').slice(0, 16));
+  // 企业号没有个人成长体系。打开弹窗时就按账号属性预隐藏批量操作，避免慢响应
+  // 期间按钮闪现、被误点后打出一轮注定 403 的请求；个人号仍恢复显示。
+  const ent = !!(account && account.enterprise);
+  ['btnTaskAcceptAll', 'btnTaskAutoAll'].forEach(id => { const b = $(id); if (b) b.hidden = ent; });
+  const veil = $('taskVeil');
+  // 旧骨架没有任务弹窗时，不能在这里继续 loadTasks 后对空的表格写内层 HTML；
+  // 统一提示页面版本不一致，由用户刷新，避免一次缺块中断整页任务入口。
+  if (!veil) { noteDOM('taskVeil'); return; }
   showModal('taskVeil', 'btnCloseTask');
-  $('btnTaskReload').hidden = false;
+  const reload = $('btnTaskReload');
+  if (reload) reload.hidden = false;
   loadTasks();
 }
 function closeTasks() { hideModal('taskVeil'); taskUID = null; }
-$('btnCloseTask').onclick = closeTasks;
+if ($('btnCloseTask')) $('btnCloseTask').onclick = closeTasks;
 
 // 账号设置弹窗：备注 + 手动调度权重。只提交这两个字段；weight=1 即不干预。
 let profileUID = null;
 function openProfile(s) {
   if (!s) return;
   profileUID = s.uid;
-  $('profileWho').textContent = (s.nickname || s.uid.slice(0, 16));
-  $('profileNote').value = s.note || '';
-  $('profileWeight').value = String(s.weight || 1);
+  setText('profileWho', s.nickname || String(s.uid || '').slice(0, 16));
+  const noteEl = $('profileNote'), weightEl = $('profileWeight');
+  if (noteEl) noteEl.value = s.note || '';
+  if (weightEl) weightEl.value = String(s.weight || 1);
   const err = $('profileErr');
   if (err) { err.hidden = true; err.textContent = ''; }
   const ops = $('accountOpsResult');
@@ -2505,17 +2832,19 @@ if ($('btnProfileClose')) $('btnProfileClose').onclick = closeProfile;
 
 if ($('btnProfileSave')) $('btnProfileSave').onclick = async () => {
   if (!profileUID) return;
-  const w = Number($('profileWeight').value || 1);
+  const weightEl = $('profileWeight');
+  if (!weightEl) { noteDOM('profileWeight'); return; }
+  const w = Number(weightEl.value || 1);
   if (!Number.isInteger(w) || w < 1 || w > 100) {
     const err = $('profileErr');
     if (err) { err.hidden = false; err.textContent = '权重必须是 1-100 的整数'; }
     return;
   }
   const btn = $('btnProfileSave');
-  btn.disabled = true; btn.textContent = '保存中…';
+  if (btn) { btn.disabled = true; btn.textContent = '保存中…'; }
   try {
     const r = await api('accounts/' + encodeURIComponent(profileUID) + '/profile', {
-      method: 'POST', body: JSON.stringify({ weight: w, note: $('profileNote').value })
+      method: 'POST', body: JSON.stringify({ weight: w, note: ($('profileNote') || {}).value || '' })
     });
     toast(r.saved === false ? '已应用；凭证文件写入失败，请检查挂载权限' : '账号设置已保存', r.saved === false ? 'err' : 'ok');
     closeProfile();
@@ -2524,7 +2853,7 @@ if ($('btnProfileSave')) $('btnProfileSave').onclick = async () => {
     const err = $('profileErr');
     if (err) { err.hidden = false; err.textContent = e.message; }
   }
-  finally { btn.disabled = false; btn.textContent = '保存'; }
+  finally { if (btn) { btn.disabled = false; btn.textContent = '保存'; } }
 };
 
 /* 账号运维：连通性测试与昵称同步都在设置弹窗内完成，避免账号行按钮继续膨胀。
@@ -2569,15 +2898,16 @@ if ($('btnAccountSyncProfile')) $('btnAccountSyncProfile').onclick = () => accou
     box.className = 'state ok';
     box.textContent = r.updated ? '昵称已更新为「' + (r.nickname || '') + '」' : '昵称未变化：「' + (r.nickname || '') + '」';
   }
-  $('profileWho').textContent = r.nickname || $('profileWho').textContent;
+    if ($('profileWho')) $('profileWho').textContent = r.nickname || $('profileWho').textContent || '';
   loadOverview(true);
 });
-$('btnTaskReload').onclick = loadTasks;
+if ($('btnTaskReload')) $('btnTaskReload').onclick = loadTasks;
 
 // 全部接受：把该账号未接受的任务一次性报名（幂等，跳过已接受/已领取）。
-$('btnTaskAcceptAll').onclick = async () => {
+if ($('btnTaskAcceptAll')) $('btnTaskAcceptAll').onclick = async () => {
   if (!taskUID) return;
   const btn = $('btnTaskAcceptAll');
+  if (!btn) return;
   btn.disabled = true; btn.textContent = '接受中…';
   try {
     const r = await api('accounts/' + encodeURIComponent(taskUID) + '/tasks/accept_all', { method: 'POST' });
@@ -2592,9 +2922,10 @@ $('btnTaskAcceptAll').onclick = async () => {
 };
 
 // 一键完成全部可自动任务（耗时较长：含真实对话，逐项回读验证）。
-$('btnTaskAutoAll').onclick = async () => {
+if ($('btnTaskAutoAll')) $('btnTaskAutoAll').onclick = async () => {
   if (!taskUID) return;
   const btn = $('btnTaskAutoAll');
+  if (!btn) return;
   if (!confirm('将依次执行：补报对话事件、领取 Buddy、glm-5.2 对话、尝试上报。\n过程约 1-2 分钟（含真实对话），确认继续？')) return;
   btn.disabled = true; btn.textContent = '执行中…';
   try {
@@ -2613,6 +2944,7 @@ async function loadTasks() {
   // 任务表覆盖回旧账号的（易用性修复 2）。
   const my = ++tasksSeq;
   const st = $('taskState'), tb = $('taskTable');
+  if (!st || !tb) { noteDOM(!st ? 'taskState' : 'taskTable'); return; }
   st.hidden = false;
   st.className = 'state';
   st.innerHTML = '<span class="dots">查询中</span>';
@@ -2621,14 +2953,27 @@ async function loadTasks() {
     const d = await api('accounts/' + encodeURIComponent(taskUID) + '/tasks');
     if (my !== tasksSeq) return;
     const list = d.tasks || [];
+    const enterprise = !!d.enterprise || !!(openTasks.account && openTasks.account.enterprise);
+    const acts = ['btnTaskAcceptAll', 'btnTaskAutoAll'];
+    acts.forEach(id => { const b = $(id); if (b) b.hidden = enterprise; });
     if (!list.length) {
       st.className = 'state';
-      st.textContent = '该账号暂无任务';
+      // 企业号没有个人成长体系：后端会返回空列表与 enterprise=true。这里明确
+      // 说明原因，避免用户把“空任务”误以为接口坏了；同时隐藏对它无意义的操作。
+      st.textContent = enterprise
+        ? (d.message || '企业账号无个人成长任务体系，请用「额度」刷新企业已分配额度')
+        : '该账号暂无任务';
+      return;
+    }
+    if (enterprise) {
+      // 代理/旧缓存可能返回非空任务列表；企业属性仍以打开弹窗时的账号快照为准。
+      st.hidden = true;
+      tb.hidden = true;
       return;
     }
     // 有进度或可领取的排前面，已领取沉底——一眼看到"现在该做什么"。
     list.sort((a, b) => (a.claimed - b.claimed) || (b.claimable - a.claimable) || String(a.task_code).localeCompare(String(b.task_code)));
-    $('taskBody').innerHTML = list.map(t => {
+    if (!setHTML('taskBody', list.map(t => {
       // 进度：current 可能缺失（0 或被上游省略）——用 ?? 兜底，避免渲染成 "undefined / N"
       const cur = t.current ?? 0, tgt = t.target ?? 0;
       const prog = tgt ? cur + ' / ' + tgt : (tgt === 0 && cur > 0 ? String(cur) : '—');
@@ -2655,7 +3000,7 @@ async function loadTasks() {
         '<td class="num">' + esc(reward) + '</td>' +
         '<td>' + badge + '</td>' +
         '<td class="acts">' + acted + '</td></tr>';
-    }).join('');
+    }).join(''))) return;
     st.hidden = true;
     tb.hidden = false;
   } catch (e) {
@@ -2665,7 +3010,7 @@ async function loadTasks() {
   }
 }
 
-$('taskBody').addEventListener('click', async ev => {
+if ($('taskBody')) $('taskBody').addEventListener('click', async ev => {
   const b = ev.target.closest('button[data-t]');
   if (!b || !taskUID) return;
   const kind = b.dataset.t, code = b.dataset.c;
@@ -2904,9 +3249,10 @@ function vcCard(v) {
 
 async function loadSchoolVouchers() {
   const body = $('vcBody');
+  if (!body) { noteDOM('vcBody'); return; }
   showModal('vcVeil', 'btnVcClose');
   body.innerHTML = '<div class="state"><span class="dots">查询中</span></div>';
-  $('vcNote').textContent = '';
+  if ($('vcNote')) $('vcNote').textContent = '';
   try {
     const d = await api('school/vouchers');
     const arr = d.accounts || [];
@@ -2917,7 +3263,7 @@ async function loadSchoolVouchers() {
       '<span>' + a.vouchers.length + ' 张</span></div>' +
       a.vouchers.map(vcCard).join('')
     ).join('') || '<div class="empty"><div class="big">🎟️</div>还没有抽到券</div>';
-    $('vcNote').textContent = total ? total + ' 张券 · ' + ok.filter(a => !(a.vouchers || []).length).length + ' 个账号未抽中' : '';
+    if ($('vcNote')) $('vcNote').textContent = total ? total + ' 张券 · ' + ok.filter(a => !(a.vouchers || []).length).length + ' 个账号未抽中' : '';
     const errs = arr.filter(a => a.error);
     if (errs.length) {
       body.insertAdjacentHTML('beforeend', '<div class="note" style="color:var(--warn);margin-top:8px">查询失败：' +
@@ -2942,8 +3288,8 @@ async function loadSchoolVouchers() {
     body.innerHTML = '<div class="state err">' + esc(e.message) + '</div>';
   }
 }
-$('btnSchoolVouchers').onclick = loadSchoolVouchers;
-$('btnVcClose').onclick = () => hideModal('vcVeil');
+if ($('btnSchoolVouchers')) $('btnSchoolVouchers').onclick = loadSchoolVouchers;
+if ($('btnVcClose')) $('btnVcClose').onclick = () => hideModal('vcVeil');
 
 /* Esc 关闭最上层弹窗（易用性修复 10）。「最上层」= DOM 里最后一个可见的 .veil
    （同一 z-index 下后写者覆盖先写者）。data-lock="1" 的是鉴权网关（keyVeil），
@@ -2960,7 +3306,7 @@ document.addEventListener('keydown', ev => {
   else if (top.id === 'addVeil') closeAdd();
   else hideModal(top.id);
 });
-$('btnVcRefresh').onclick = loadSchoolVouchers;
+if ($('btnVcRefresh')) $('btnVcRefresh').onclick = loadSchoolVouchers;
 
 /* 成长任务队列。lastQueueSeq 记录本页启动过的队列代次：执行结束后的残留 items
    （running=false 但 seq 停在旧值）不再回写视图——否则扫描结果 3 秒后被上一轮
@@ -2999,12 +3345,35 @@ function groupItems(d) {
   return groups;
 }
 function renderScanResult(d) {
+  // 后端从未扫描过时也会返回 running=false 的零值快照（accounts 为 nil）。
+  // 此时不能渲染「全部完成」，否则首次进入任务中心就误报今日无待办。
+  if (!d || !Array.isArray(d.accounts)) {
+    renderQueue([], null);
+    setText('qcSummary', '');
+    const failBox = $('qcScanFail');
+    if (failBox) { failBox.hidden = true; failBox.textContent = ''; }
+    return;
+  }
   const groups = groupItems(d);
   // error_count>0：本次扫描有账号查不到任务（上游超时/风控/mp 列表失败）。
   // 后端契约（panel/taskcenter.go）：pending_count==0 && error_count==0 才是
   // 「全部完成」；有查询失败时必须区分——否则把「没查到」显示成「全做完了」，
   // 用户以为今日无待办、实际是漏扫。
   const errN = Number(d.error_count || 0);
+  const failBox = $('qcScanFail');
+  if (failBox) {
+    const failed = (d.accounts || []).filter(a => a && a.growth_error);
+    if (failed.length) {
+      failBox.hidden = false;
+      failBox.textContent = '以下账号任务查询失败：' + failed.map(a =>
+        (a.nickname || String(a.uid || '').slice(0, 8) || '未知账号') +
+        (a.uid && a.nickname ? '（' + String(a.uid).slice(0, 8) + '）' : '') +
+        '：' + String(a.growth_error || '未知错误').slice(0, 160)).join('；');
+    } else {
+      failBox.hidden = true;
+      failBox.textContent = '';
+    }
+  }
   if (!groups.length && errN > 0) {
     renderQueue([], null, '扫描不完整（' + errN + ' 个账号查询失败）',
       '这些账号的成长任务没拉到（上游超时/风控等），不代表没有待办。请稍后重新扫描。');
@@ -3059,6 +3428,7 @@ function startScanPolling() {
       if (seq !== scanPollSeq) return;
       if (scanTimer) { clearTimeout(scanTimer); scanTimer = null; }
       b.disabled = false; b.textContent = '扫描待办';
+      setScanProgress({}, false);
       toast(e.message, 'err');
       return;
     }
@@ -3120,11 +3490,18 @@ function reattachScanView() {
         }
       }
     } catch (e) { /* 静默：轮询/手动点击会再次暴露错误 */ }
-    finally { if (req === scanReqSeq) scanReqSeq = 0; }
+    finally {
+      if (req === scanReqSeq) scanReqSeq = 0;
+      if (seq === scanPollSeq && !scanTimer && view === 'taskscenter') {
+        const b = $('btnScanAll');
+        if (b) { b.disabled = false; b.textContent = '扫描待办'; }
+      }
+    }
   })();
 }
-$('btnScanAll').onclick = async () => {
+if ($('btnScanAll')) $('btnScanAll').onclick = async () => {
   const b = $('btnScanAll');
+  if (!b) return;
   // 停掉队列轮询：显式扫描 = 切到待办视图。否则在途队列的下一 tick 会把扫描
   // 结果冲掉重渲染回队列视图（服务端执行不受影响，只是不再实时回写本视图）。
   stopQueuePolling(true);
@@ -3145,16 +3522,25 @@ $('btnScanAll').onclick = async () => {
   }
   startScanPolling();
 };
-$('btnRunQueue').onclick = async () => {
-  const conc = Number($('qcConc').value) || 1;
+if ($('btnRunQueue')) $('btnRunQueue').onclick = async () => {
+  const concEl = $('qcConc');
+  const conc = Number(concEl && concEl.value) || 1;
   if (!confirm('扫描全部账号待办并排队执行（账号并发 ' + conc + '，账号内串行）。\n含真实对话的任务耗时较长，确认继续？')) return;
   const b = $('btnRunQueue');
+  if (!b) { toast('页面缺少队列按钮，请刷新页面', 'err'); return; }
   b.disabled = true; b.textContent = '启动中…';
   try {
     const r = await api('tasks/run_queue', { method: 'POST', body: JSON.stringify({ concurrency: conc }) });
-    if (!r.started) { toast(r.message || '没有待办任务', 'ok'); return; }
+    if (!r.started) {
+      const msg = r.message || '没有待办任务';
+      toast(msg, /失败|不完整|不可用|超时/.test(msg) ? 'err' : 'warn');
+      setQueueRunBusy(false);
+      return;
+    }
     lastQueueSeq = r.seq || 0;
-    toast('队列已启动：' + r.total + ' 项（并发 ' + conc + '）', 'ok');
+    // 异步预扫阶段后端返回 total=0；不要谎报「队列已启动：0 项」。
+    toast(r.total > 0 ? '队列已启动：' + r.total + ' 项（并发 ' + conc + '）'
+      : '正在预扫账号任务，完成后自动开始执行（并发 ' + conc + '）', 'ok');
     startQueuePolling();
   } catch (e) { toast(e.message, 'err'); }
   finally { if (!queueTimer) setQueueRunBusy(false); }
@@ -3188,27 +3574,35 @@ function queueSig(groups) {
 }
 let queueRenderSig = '';
 function renderQueue(groups, progress, emptyTitle, emptyDesc) {
+  groups = Array.isArray(groups) ? groups : [];
   const empty = $('tcEmpty'), list = $('qcList');
   if (!groups.length) {
-    empty.style.display = '';
-    if (emptyTitle) empty.querySelector('.t').textContent = emptyTitle;
-    if (emptyDesc) empty.querySelector('.d').textContent = emptyDesc;
-    list.innerHTML = '';
-    $('qProg').hidden = true; $('qcSummary').textContent = '';
+    if (empty) empty.style.display = '';
+    if (emptyTitle) {
+      const t = empty && empty.querySelector ? empty.querySelector('.t') : null;
+      if (t) t.textContent = emptyTitle;
+    }
+    if (emptyDesc) {
+      const d = empty && empty.querySelector ? empty.querySelector('.d') : null;
+      if (d) d.textContent = emptyDesc;
+    }
+    if (list) list.innerHTML = '';
+    const prog = $('qProg'); if (prog) prog.hidden = true;
+    setText('qcSummary', '');
     queueRenderSig = '';
     return;
   }
-  empty.style.display = 'none';
+  if (empty) empty.style.display = 'none';
   const sig = queueSig(groups);
   const total = groups.reduce((n, g) => n + g.rows.length, 0);
-  if (sig !== queueRenderSig || !list.childNodes || !list.childNodes.length) {
+  if (list && (sig !== queueRenderSig || !list.childNodes || !list.childNodes.length)) {
     list.innerHTML = groups.map(g => {
-      return '<div class="qgroup"><header><span class="nm">' + esc(g.nick || g.uid.slice(0, 12)) + '</span><span class="cnt">' + g.rows.length + ' 项待办</span></header>' +
+      return '<div class="qgroup"><header><span class="nm">' + esc(g.nick || String(g.uid || '').slice(0, 12)) + '</span><span class="cnt">' + g.rows.length + ' 项待办</span></header>' +
         g.rows.map(qrowHTML).join('') + '</div>';
     }).join('');
     queueRenderSig = sig;
   }
-  $('qcSummary').textContent = total + ' 项';
+  setText('qcSummary', total + ' 项');
   updateProgress(progress);
 }
 // setQueueRunBusy 统一维护「执行全部待办」的禁用态。队列是后台任务：
@@ -3221,31 +3615,37 @@ function setQueueRunBusy(busy) {
   b.textContent = busy ? '执行中…' : '执行全部待办';
 }
 function updateProgress(q) {
-  if (!q) { $('qProg').hidden = true; return; }
+  const prog = $('qProg');
+  if (!q) { if (prog) prog.hidden = true; return; }
   // 执行队列的预扫阶段：items 尚未产生，进度来自 pre_done/pre_total。
   // 旧实现看到空 items 就直接隐藏进度条，用户会误以为扫描卡住。
   if (q.phase === 'scan' && Number(q.pre_total || 0) > 0) {
     const pd = Number(q.pre_done || 0), pt = Number(q.pre_total || 0);
-    $('qProg').hidden = false;
-    $('qBarFill').style.width = Math.min(100, Math.round(pd / pt * 100)) + '%';
-    $('qProgText').textContent = '正在扫描账号 ' + pd + ' / ' + pt + '（读取任务列表）';
-    if (q.pre_warn) $('qProgText').textContent += ' · ' + q.pre_warn;
+    if (prog) prog.hidden = false;
+    const fill = $('qBarFill');
+    if (fill && fill.style) fill.style.width = Math.min(100, Math.round(pd / pt * 100)) + '%';
+    const progText = $('qProgText');
+    if (progText) progText.textContent = '正在扫描账号 ' + pd + ' / ' + pt + '（读取任务列表）' +
+      (q.pre_warn ? ' · ' + q.pre_warn : '');
     return;
   }
-  if (!q.items) { $('qProg').hidden = true; return; }
-  const total = q.items.length;
-  const ok = q.items.filter(it => it.status === 'done').length;
-  const bad = q.items.filter(it => it.status === 'error' || it.status === 'skipped').length;
+  const items = Array.isArray(q.items) ? q.items : null;
+  if (!items) { if (prog) prog.hidden = true; return; }
+  const total = items.length;
+  const ok = items.filter(it => it.status === 'done').length;
+  const bad = items.filter(it => it.status === 'error' || it.status === 'skipped').length;
   const finished = ok + bad;
-  $('qProg').hidden = false;
-  $('qBarFill').style.width = (total ? Math.round(finished / total * 100) : 0) + '%';
-  $('qProgText').textContent = (q.running ? '执行中 ' : '已结束 ') +
-    finished + ' / ' + total + (bad ? '（成功 ' + ok + '，失败/跳过 ' + bad + '）' : '');
+  if (prog) prog.hidden = false;
+  const fill = $('qBarFill');
+  if (fill && fill.style) fill.style.width = (total ? Math.round(finished / total * 100) : 0) + '%';
+  const progText = $('qProgText');
+  if (!progText) return;
+  progText.textContent = (q.running ? '执行中 ' : '已结束 ') +
+    finished + ' / ' + total + (bad ? '（成功 ' + ok + '，失败/跳过 ' + bad + '）' : '') +
+    (q.pre_warn ? ' · ' + q.pre_warn : '');
   // 部分账号预扫失败时队列仍会启动；持续显示漏扫警告，避免把“已启动”
   // 误读成“所有账号都已纳入”。空态/终态 toast 仍由调用方负责。
-  const progText = $('qProgText');
   if (q.pre_warn) {
-    progText.textContent += ' · ' + q.pre_warn;
     progText.dataset = progText.dataset || {};
     progText.dataset.warn = '1';
   } else if (progText.dataset) {
@@ -3487,7 +3887,6 @@ function renderCreditHistory(d) {
   const records = Array.isArray(d.records) ? d.records : [];
   const table = $('usCreditHistTable');
   const empty = $('usCreditHistEmpty');
-  const body = $('usCreditHistBody');
   const note = $('usCreditHistNote');
   const kinds = { spend: '仅扣减', all: '全部扣减' };
   const kindLabel = kinds[usCreditKind] || '全部扣减';
@@ -3499,8 +3898,7 @@ function renderCreditHistory(d) {
     empty.hidden = !!records.length;
     empty.textContent = '当前时间窗暂无积分扣减记录。旧版仅有 Token 的历史不会伪造积分；聚合桶也不会被拆成逐请求行。';
   }
-  if (!body) return;
-  body.innerHTML = records.map(r => {
+  const bodyHtml = records.map(r => {
     const when = String(r.time || '').replace('T', ' ').slice(0, 16);
     const gran = CREDIT_GRAN_LABEL[r.granularity] || CREDIT_GRAN_LABEL[r.scope] || '聚合';
     const amount = Number(r.credit || 0);
@@ -3514,6 +3912,11 @@ function renderCreditHistory(d) {
       '<td data-label="Token" class="num">' + fmtTok(r.tokens) + '</td>' +
       '</tr>';
   }).join('');
+  // 局部兜底：本函数会被前端切片测试单独求值，不能假定全局 setHTML 已定义。
+  const written = typeof setHTML === 'function'
+    ? setHTML('usCreditHistBody', bodyHtml)
+    : (() => { const el = $('usCreditHistBody'); if (!el) return false; el.innerHTML = bodyHtml; return true; })();
+  if (!written && typeof noteUsageDomMismatch === 'function') noteUsageDomMismatch('usCreditHistBody');
 }
 async function loadCreditHistory() {
   if (usCreditKind === 'grant') { return loadCreditGrants(); }
@@ -3587,11 +3990,11 @@ function renderCreditGrants(d) {
   const rows = Array.isArray(d.rows) ? d.rows : [];
   const table = $('usCreditHistTable');
   const empty = $('usCreditHistEmpty');
-  const head = $('usCreditHistHead');
-  const body = $('usCreditHistBody');
   const note = $('usCreditHistNote');
-  if (head) head.innerHTML = '<tr><th>发放时间</th><th>账号</th><th>包 / 来源</th>' +
-    '<th class="num">面额</th><th class="num">剩余 / 已用</th><th>到期</th><th>关联动作</th></tr>';
+  // 整个聚合流水块在旧骨架里可能整块缺失：表头/表体都走 setHTML，
+  // 缺任一节点只落一次版本提示，绝不能对 null 写 innerHTML。
+  setHTML('usCreditHistHead', '<tr><th>发放时间</th><th>账号</th><th>包 / 来源</th>' +
+    '<th class="num">面额</th><th class="num">剩余 / 已用</th><th>到期</th><th>关联动作</th></tr>');
   if (note) {
     const stamp = d.fetched_at || d.generated_at;
     const shown = d.returned == null ? rows.length : Number(d.returned);
@@ -3605,19 +4008,15 @@ function renderCreditGrants(d) {
     empty.hidden = !!rows.length;
     empty.textContent = '当前没有可展示的积分包快照。请先到「积分构成」刷新余额/套餐，或等待后台余额刷新后再试。';
   }
-  const stats = $('usCreditStats');
-  if (stats) {
-    const count = Number(d.count == null ? rows.length : d.count);
-    const returned = Number(d.returned == null ? rows.length : d.returned);
-    stats.innerHTML =
-      usKpi(fmtCredit(d.total_size), '累计面额', 'c-accent', '快照内全部积分包面额') +
-      usKpi(fmtCredit(d.total_remain), '剩余积分', 'c-ok', '当前仍可用的部分') +
-      usKpi(fmtCredit(d.total_used), '已用积分', 'c-mute', '面额 − 剩余') +
-      usKpi(String(count), '积分包', 'c-soft',
-        (d.has_more ? '当前展示最近 ' + returned + ' 个' : returned + ' 行逐包明细'));
-  }
-  if (!body) return;
-  body.innerHTML = rows.map(r => {
+  const count = Number(d.count == null ? rows.length : d.count);
+  const returned = Number(d.returned == null ? rows.length : d.returned);
+  setHTML('usCreditStats',
+    usKpi(fmtCredit(d.total_size), '累计面额', 'c-accent', '快照内全部积分包面额') +
+    usKpi(fmtCredit(d.total_remain), '剩余积分', 'c-ok', '当前仍可用的部分') +
+    usKpi(fmtCredit(d.total_used), '已用积分', 'c-mute', '面额 − 剩余') +
+    usKpi(String(count), '积分包', 'c-soft',
+      (d.has_more ? '当前展示最近 ' + returned + ' 个' : returned + ' 行逐包明细')));
+  if (!setHTML('usCreditHistBody', rows.map(r => {
     const status = CREDIT_GRANT_STATUS[r.status] || ['', 'mute'];
     const name = creditGrantName(r);
     const uidTitle = creditGrantUIDTitle(r);
@@ -3637,7 +4036,9 @@ function renderCreditGrants(d) {
       '<td data-label="到期">' + creditGrantExpiry(r) + statusTag + '</td>' +
       '<td data-label="关联动作">' + creditGrantAction(r.action) + '</td>' +
       '</tr>';
-  }).join('');
+  }).join(''))) {
+    noteUsageDomMismatch('usCreditHistBody');
+  }
 }
 
 
@@ -3709,19 +4110,21 @@ function usPct(part, total) {
 /* usRow 生成一行。mid 是插在「名称」之后、请求数之前的额外单元格（如「域」列）。
    withPerf 控制延迟/速率两列；列开关显式传入，避免调用方改动后与表头错列。 */
 function usRow(name, sub, a, mid, withPerf) {
+  // 每格都带 data-label：窄屏 .cardify 靠它把宽表变成逐行卡片（Hub data-cards 同款）。
+  // mid 由调用方提供，必须自带 data-label；账号维度的「域」列在这里统一标注。
   return '<tr>' +
     '<td class="mark" aria-hidden="true"></td>' +
-    '<td>' + esc(name) + (sub ? '<div class="note">' + esc(sub) + '</div>' : '') + '</td>' +
-    (mid || '') +
-    '<td class="num">' + fmtTok(a.requests) + '</td>' +
-    '<td class="num">' + (a.errors ? '<span style="color:var(--warn)">' + fmtTok(a.errors) + '</span>' : '—') + '</td>' +
-    '<td class="num">' + fmtTok(a.prompt_tokens) + '</td>' +
-    '<td class="num">' + fmtTok(a.completion_tokens) + '</td>' +
-    '<td class="num">' + fmtTok(a.total_tokens) +
+    '<td data-label="名称">' + esc(name) + (sub ? '<div class="note">' + esc(sub) + '</div>' : '') + '</td>' +
+    (mid ? mid.replace('<td class="num">', '<td class="num" data-label="域">') : '') +
+    '<td class="num" data-label="请求">' + fmtTok(a.requests) + '</td>' +
+    '<td class="num" data-label="失败">' + (a.errors ? '<span style="color:var(--warn)">' + fmtTok(a.errors) + '</span>' : '—') + '</td>' +
+    '<td class="num" data-label="Prompt">' + fmtTok(a.prompt_tokens) + '</td>' +
+    '<td class="num" data-label="Completion">' + fmtTok(a.completion_tokens) + '</td>' +
+    '<td class="num" data-label="合计">' + fmtTok(a.total_tokens) +
       usMixBar(a.prompt_tokens, a.completion_tokens, a.total_tokens) + '</td>' +
     (withPerf
-      ? '<td class="num">' + fmtMs(a.avg_latency_ms) + '</td>' +
-        '<td class="num">' + fmtRate(a.avg_tokens_per_second) + '</td>'
+      ? '<td class="num" data-label="均延迟">' + fmtMs(a.avg_latency_ms) + '</td>' +
+        '<td class="num" data-label="均速率">' + fmtRate(a.avg_tokens_per_second) + '</td>'
       : '') +
     '</tr>';
 }
@@ -3770,14 +4173,210 @@ function usDimHead(dim) {
     '</tr>';
 }
 
-/* usTabsHtml 维度切换按钮（带条数徽标）。整段 innerHTML 重写而不是逐个改 class：
-   容器的 click 监听是委托式的，换掉子节点不会丢事件，代码也更短。 */
+/* usTabsHtml 维度切换按钮（带条数徽标）。
+   容器 #usDimTabs 是页面骨架里固定的 <span>，只允许重写它的子按钮，绝不能
+   反过来把容器当成按钮生成——线上 2706 行的 innerHTML-null 就是升级后骨架
+   与脚本版本不一致时，这里直接对不存在的容器写属性炸出来的。 */
 function usTabsHtml(dims, active, counts) {
   return dims.map(([k, label]) => {
     const n = counts ? counts[k] : null;
-    return '<button data-dim="' + k + '"' + (k === active ? ' class="on"' : '') + '>' +
+    return '<button data-dim="' + k + '" aria-pressed="' + (k === active ? 'true' : 'false') + '"' +
+      (k === active ? ' class="on"' : '') + '>' +
       esc(label) + (n == null ? '' : '<span class="cnt">' + n + '</span>') + '</button>';
   }).join('');
+}
+
+/* ── DOM 契约防护 ───────────────────────────────────────────────────
+   面板是 go:embed 的二进制内资源，但升级时浏览器可能仍缓存旧 index.html，
+   反向代理也可能只替换了二进制而没有同步 HTML。新版 app.js 跑在旧骨架上时，
+   任何 `$('id').innerHTML = ...` 都会抛 TypeError，随后整个用量视图与按钮
+   绑定都停摆。这里提供统一的探测/写入入口：缺节点时只提示一次，绝不让一次
+   缺块变成整页未处理异常。
+
+   注意：这里不自动 reload。页面版本错配时浏览器可能持续拿到旧 HTML，自动
+   刷新会形成「刷新→仍缺块→再刷新」的循环；提示用户手动刷新（或清缓存）才
+   可控。CSP 不允许内联脚本，也无法在旧页面里注入版本探测。 */
+/* setHTML / setText 缺节点时返回 false，由调用方决定是否继续；不抛异常。 */
+function setHTML(id, html) {
+  const el = $(id);
+  if (!el) { noteUsageDomMismatch(id); return false; }
+  el.innerHTML = html;
+  return true;
+}
+function setText(id, text) {
+  const el = $(id);
+  if (!el) { noteUsageDomMismatch(id); return false; }
+  el.textContent = text;
+  return true;
+}
+/* 页面升级时浏览器可能缓存旧 index.html，或反代只替换了二进制。任何
+   `if ($(id)) $(id).innerHTML = ...` 都有“两次查询之间节点被移除”的窗口：
+   第一次拿到节点、第二次却拿到 null，于是仍然抛 TypeError。所有清理逻辑
+   必须只取一次节点；applyNode 只负责这一次写入，缺节点时安静跳过。 */
+function applyNode(id, apply) {
+  const el = $(id);
+  if (!el) return false;
+  try { apply(el); } catch (_) { /* inert DOM / 页面正在卸载 */ }
+  return true;
+}
+function clearNode(id, key) {
+  return applyNode(id, el => { el[key] = key === 'innerHTML' ? '' : '—'; });
+}
+/* expectNode 只用于「缺了它整份脚本就不可用」的顶层绑定。 */
+function expectNode(id) {
+  const el = $(id);
+  if (el) return el;
+  noteDOM(id);
+  return null;
+}
+function domVersionTip() {
+  return '页面版本与脚本不一致，请刷新页面（Ctrl/Cmd+Shift+R 可强制刷新）。';
+}
+function noteDOM(id) {
+  // 去重必须按「节点」而不是整页：升级错配时通常缺多个区块，但页面提示
+  // 只需一次；反之，若先出现的是可选块（例如旧骨架缺 usNote），之后的
+  // 关键入口（accBody、taskVeil）缺失不能被同一个布尔值静默吞掉。早期
+  // 实现用 noteDOM.shown 全局短路，结果第二个真实故障只剩控制台报错。
+  if (!noteDOM.seen) noteDOM.seen = new Set();
+  if (id) {
+    if (noteDOM.seen.has(id)) return;
+    noteDOM.seen.add(id);
+  }
+  if (noteDOM.shown) return;
+  noteDOM.shown = true;
+  const msg = domVersionTip() + '（缺少 ' + id + '）';
+  // 提示必须落在用户当前看得见的地方。旧骨架在账号页缺 accBody 时，
+  // #usError/#view-usage 往往存在但 hidden；写进去等于“静默失败”。
+  // 先用可见视图/顶栏，最后才退回 toast（toast 本身由 body 承载）。
+  // 用量页在旧骨架里可能整块缺失。此时不要退到 toast：noteUsageDomMismatch
+  // 还会为同一个缺块再提示一次，用户会看到两条同义告警。visibleDomHost 已经
+  // 只选择当前可见视图/顶栏；都找不到时由调用方决定是否另发 toast。
+  const top = $('topbar');
+  const visible = typeof document !== 'undefined' && document.querySelector
+    ? document.querySelector('.view:not([hidden])') : null;
+  const host = visible || top;
+  if (host) {
+    try {
+      const tip = document.createElement('div');
+      tip.className = 'auth-gate inline';
+      tip.setAttribute('role', 'alert');
+      tip.textContent = msg;
+      if (visible && visible.parentNode && typeof visible.parentNode.insertBefore === 'function') {
+        visible.parentNode.insertBefore(tip, visible);
+      } else if (visible && typeof visible.prepend === 'function') {
+        visible.prepend(tip);
+      } else if (host.id === 'topbar' && typeof host.appendChild === 'function') {
+        host.appendChild(tip);
+      } else {
+        host.textContent = msg;
+      }
+    } catch (_) { /* inert DOM */ }
+  }
+}
+
+/* noteUsageDomMismatch 把「页面骨架与 app.js 不匹配」收敛成一条页面级提示。
+   浏览器可能缓存了旧 index.html、反向代理也可能只替换了二进制而没刷新静态
+   资源；这类错误不应反复弹 toast，也不该静默丢掉整页用量。提示挂在用量页
+   仍存在的主容器/图表上，并由 noteDOM 统一触发一次自动刷新。 */
+let usageDomMismatch = false;
+let usageDomMismatchHost = null;
+let usageDomMismatchTip = null;
+let usageDomMismatchTipEl = null;
+// visibleDomHost 选择用户当前能看到的提示落点。用量页专用错误位只有在用量页
+// 可见时才可用；否则账号页缺 accBody 的告警会被写进隐藏的 #usError，用户只看到
+// 空白页。优先当前可见视图，其次顶栏，最后才交给 toast（body 级）。
+function visibleDomHost() {
+  if (typeof document === 'undefined' || !document.querySelector) return null;
+  const v = document.querySelector('.view:not([hidden])');
+  if (v) return v;
+  const top = $('topbar');
+  if (top) return top;
+  return typeof toast === 'function' ? { id: 'toasts' } : null;
+}
+/* domQuarantine 记录本次页面生命周期内确认「模板与脚本不匹配」的节点。
+   旧 index.html 往往缺多个可选区块；若每个缺失都各自插入提示，用量页会堆出
+   多条同义告警。记录后，同一节点只提示一次，同时让调用方可以明确区分
+   「本次写入被跳过」与「写入成功」，不再靠 innerHTML 之外的空节点判断。 */
+const domQuarantine = new Set();
+function usageDomHost() {
+  // 只有当前确实在用量页时才写用量页节点；否则退到可见视图/顶栏/toast。
+  const usage = $('view-usage');
+  const onUsage = !!usage && !usage.hidden;
+  if (onUsage) return $('usError') || $('usChart') || usage || $('usNote');
+  return visibleDomHost();
+}
+function noteUsageDomMismatch(id) {
+  if (domQuarantine.has(id)) return;
+  domQuarantine.add(id);
+  // 页面级版本提示是否已发过，由下方 usageDomMismatch / domQuarantine 自己
+  // 判断。这里不能复用 noteDOM.shown：那是「入口级缺节点」的全局标记，
+  // 一旦被某个可选块提前置位，后续真正缺少用量页节点的提示会被静默吞掉。
+  const host = usageDomHost();
+  if (!host || typeof document === 'undefined') {
+    // 页面连任何可用落点都没有：不要永久锁死提示，否则后续渲染出容器时
+    // 用户仍然看不到可操作信息（只剩控制台 TypeError）。
+    if (host && host.id === 'toasts' && typeof toast === 'function') {
+      const message = domVersionTip() + '（缺少 ' + id + '）';
+      if (!usageDomMismatchTip) {
+        usageDomMismatchTip = message;
+        usageDomMismatch = true;
+        toast(message, 'err');
+      }
+    }
+    return;
+  }
+  // 同一落点只保留一条提示，但不同缺块要补充节点名：升级错配时用户需要
+  // 知道是哪个区块没渲染，而不是只看到第一条（可能是可选块）后就再无下文。
+  // 同一节点重复写入仍由 domQuarantine 短路，避免每轮渲染刷屏。
+  if (usageDomMismatch && usageDomMismatchHost === host) {
+    const base = domVersionTip();
+    if (host.id === 'usError') {
+      const next = host.textContent || base;
+      if (!next.includes(id)) host.textContent = next + '；另缺 ' + id;
+    } else if (usageDomMismatchTip) {
+      if (!usageDomMismatchTip.includes(id)) usageDomMismatchTip += '；另缺 ' + id;
+      if (usageDomMismatchTipEl && 'textContent' in usageDomMismatchTipEl) {
+        usageDomMismatchTipEl.textContent = usageDomMismatchTip;
+      }
+    }
+    return;
+  }
+  // 页面入口已用 noteDOM 报过同一次错配（缺 view-usage 等关键节点），这里
+  // 不再为可选块叠加第二条视觉告警，但仍记录节点，避免同一缺块反复探测。
+  if (noteDOM.shown && !usageDomMismatch) return;
+  usageDomMismatch = true;
+  usageDomMismatchHost = host;
+  const message = domVersionTip() + '（缺少 ' + id + '）';
+  // 首选专用错误位（直接写内容），其余容器插入到它前面，避免打乱表格/图表结构。
+  if (host.id === 'usError') {
+    host.textContent = message;
+    if ('hidden' in host) host.hidden = false;
+    usageDomMismatchTipEl = host;
+    return;
+  }
+  if (host.id === 'toasts' && typeof toast === 'function') {
+    toast(message, 'err');
+    return;
+  }
+  // createElement 在最小 DOM 桩、被冻结的旧页面里也可能不可用或抛错。
+  // 缺块提示本身就是异常退路，不能反过来成为新的未处理异常源。
+  try {
+    if (typeof document.createElement !== 'function') throw new Error('createElement unavailable');
+    const tip = document.createElement('div');
+    tip.className = 'auth-gate inline';
+    tip.setAttribute('role', 'alert');
+    tip.textContent = message;
+    usageDomMismatchTip = message;
+    usageDomMismatchTipEl = tip;
+    if (host.parentNode && typeof host.parentNode.insertBefore === 'function') {
+      host.parentNode.insertBefore(tip, host);
+    } else {
+      host.textContent = message;
+    }
+  } catch (_) {
+    // 落点无法插入时退回纯文本；仍失败则保留去重标记，避免连续刷屏。
+    try { host.textContent = message; } catch (_) { /* inert DOM */ }
+  }
 }
 
 const US_DIM_TABS = [['account', '按账号'], ['key', '按 Key'], ['model', '按模型'], ['realm', '按域']];
@@ -3797,6 +4396,14 @@ function usKeyLabel(id) {
 
 function renderUsageDim() {
   const d = usageData || {};
+  // 升级后最危险的调用链是 go('usage') → loadUsage() → renderUsage() →
+  // renderUsageDim()：旧页面骨架若缺少下表任一节点，直接 `$('id').innerHTML`
+  // 会在 async 渲染里抛出未处理异常，按钮后续也不再可用。这里把整块渲染视为
+  // 可选增强：先在入口确认表头/表体存在，缺块只提示一次并返回。
+  if (!$('usDimHead') || !$('usDimBody')) {
+    noteUsageDomMismatch(!$('usDimHead') ? 'usDimHead' : 'usDimBody');
+    return;
+  }
   // 数据对象身份变化（手动刷新/筛选结果被替换）时必须失效；只比较行数会让
   // server 返回同长度但不同内容的新快照继续用旧缓存。
   if (renderUsageDim.data !== d) {
@@ -3817,14 +4424,16 @@ function renderUsageDim() {
   if (usDimPage < 1) usDimPage = 1;
   const start = (usDimPage - 1) * size;
   const pageRows = rows.slice(start, start + size);
-  $('usDimTabs').innerHTML = usTabsHtml(US_DIM_TABS, usDim, {
+  // 注意：不能把 usTabsHtml 的结果写进不存在的容器；setHTML 会返回 false 并
+  // 触发一次版本提示，但不会中断下面已经确认存在的表头/表体更新。
+  setHTML('usDimTabs', usTabsHtml(US_DIM_TABS, usDim, {
     account: (d.by_account || []).length,
     key: (d.by_key || []).length,
     model: (d.by_model || []).length,
     realm: (d.by_realm || []).length,
-  });
-  $('usDimHead').innerHTML = usDimHead(usDim);
-  $('usDimBody').innerHTML = pageRows.map(x =>
+  }));
+  setHTML('usDimHead', usDimHead(usDim));
+  setHTML('usDimBody', pageRows.map(x =>
     usRow(usDim === 'account' ? String(x.key || '').slice(0, 8)
         : usDim === 'key' ? usKeyLabel(x.key).name : x.key,
       usDim === 'account' ? (x.extra || '')
@@ -3832,9 +4441,10 @@ function renderUsageDim() {
       x,
       usDim === 'account' ? '<td class="num">' + esc(x.realm || '') + '</td>' : '',
       m.withPerf)
-  ).join('') || '<tr><td colspan="' + m.span + '" class="empty">暂无数据</td></tr>';
+  ).join('') || '<tr><td colspan="' + m.span + '" class="empty">暂无数据</td></tr>');
   const totalRows = (d[m.key] || []).length;
-  $('usDimNote').textContent = (rows.length === totalRows ? rows.length + ' 行' : '命中 ' + rows.length + ' / ' + totalRows + ' 行') +
+  const dimNote = $('usDimNote');
+  if (dimNote) dimNote.textContent = (rows.length === totalRows ? rows.length + ' 行' : '命中 ' + rows.length + ' / ' + totalRows + ' 行') +
     ' · 请求数含失败尝试';
   const page = $('usDimPage');
   if (page) page.textContent = rows.length ? (usDimPage + ' / ' + pages) : '';
@@ -3869,47 +4479,65 @@ function cacheRateCell(hit, miss) {
 
 function renderCreditDim() {
   const d = usageData || {};
-  $('usCreditHead').innerHTML = usCreditHead(usCreditDim);
+  // 积分扣减汇总在「积分流水」里是可选折叠区：旧二进制/旧缓存版本可能没有
+  // #usCreditHead / #usCreditBody。缺块时整块跳过，不能把可选展示变成必需契约。
+  if (!$('usCreditHead') || !$('usCreditBody')) {
+    noteUsageDomMismatch(!$('usCreditHead') ? 'usCreditHead' : 'usCreditBody');
+    return;
+  }
+  setHTML('usCreditHead', usCreditHead(usCreditDim));
   const empty = '暂无积分扣除记录；升级前仅含 Token 的历史不会伪造积分。';
   if (usCreditDim === 'model') {
     const models = d.credit_by_model || [];
-    $('usCreditBody').innerHTML = models.map(row =>
+    setHTML('usCreditBody', models.map(row =>
       '<tr>' +
         '<td class="mark" aria-hidden="true"></td>' +
-        '<td>' + esc(row.key || '—') + '</td>' +
-        '<td>' + esc(fmtModelRate(row.rate)) + '</td>' +
-        '<td class="num">' + fmtTok(row.requests) + '</td>' +
-        '<td class="num">' + fmtCredit(row.credits) + '</td>' +
-        '<td class="num">' + fmtTok(row.credit_tokens) + '</td>' +
-        '<td class="num">' + fmtCreditRatio(row.credits_per_1m_tokens, row.credit_samples, row.credit_tokens) + '</td>' +
-        '<td class="num">' + cacheRateCell(row.cache_hit_tokens, row.cache_miss_tokens) + '</td>' +
+        '<td data-label="模型">' + esc(row.key || '—') + '</td>' +
+        '<td data-label="积分倍率">' + esc(fmtModelRate(row.rate)) + '</td>' +
+        '<td class="num" data-label="请求">' + fmtTok(row.requests) + '</td>' +
+        '<td class="num" data-label="扣除积分">' + fmtCredit(row.credits) + '</td>' +
+        '<td class="num" data-label="有效样本 Token">' + fmtTok(row.credit_tokens) + '</td>' +
+        '<td class="num" data-label="积分 / 1M Token">' + fmtCreditRatio(row.credits_per_1m_tokens, row.credit_samples, row.credit_tokens) + '</td>' +
+        '<td class="num" data-label="缓存命中率">' + cacheRateCell(row.cache_hit_tokens, row.cache_miss_tokens) + '</td>' +
       '</tr>'
-    ).join('') || '<tr><td colspan="8" class="empty">' + empty + '</td></tr>';
+    ).join('') || '<tr><td colspan="8" class="empty">' + empty + '</td></tr>');
   } else {
     const accounts = d.credit_by_account || [];
-    $('usCreditBody').innerHTML = accounts.map(row => {
+    setHTML('usCreditBody', accounts.map(row => {
       const uid = String(row.key || '');
       const account = row.nickname || uid.slice(0, 8) || '—';
       return '<tr>' +
         '<td class="mark" aria-hidden="true"></td>' +
-        '<td>' + esc(account) + '<div class="note">' + esc(row.realm || '') + ' · ' + esc(uid.slice(0, 8)) + '</div></td>' +
-        '<td class="num">' + fmtTok(row.requests) + '</td>' +
-        '<td class="num">' + fmtCredit(row.credits) + '</td>' +
-        '<td class="num">' + fmtTok(row.credit_tokens) + '</td>' +
-        '<td class="num">' + fmtCreditRatio(row.credits_per_1m_tokens, row.credit_samples, row.credit_tokens) + '</td>' +
-        '<td class="num">' + cacheRateCell(row.cache_hit_tokens, row.cache_miss_tokens) + '</td>' +
+        '<td data-label="账号">' + esc(account) + '<div class="note">' + esc(row.realm || '') + ' · ' + esc(uid.slice(0, 8)) + '</div></td>' +
+        '<td class="num" data-label="请求">' + fmtTok(row.requests) + '</td>' +
+        '<td class="num" data-label="扣除积分">' + fmtCredit(row.credits) + '</td>' +
+        '<td class="num" data-label="有效样本 Token">' + fmtTok(row.credit_tokens) + '</td>' +
+        '<td class="num" data-label="积分 / 1M Token">' + fmtCreditRatio(row.credits_per_1m_tokens, row.credit_samples, row.credit_tokens) + '</td>' +
+        '<td class="num" data-label="缓存命中率">' + cacheRateCell(row.cache_hit_tokens, row.cache_miss_tokens) + '</td>' +
         '</tr>';
-    }).join('') || '<tr><td colspan="7" class="empty">' + empty + '</td></tr>';
+    }).join('') || '<tr><td colspan="7" class="empty">' + empty + '</td></tr>');
   }
-  const tabs = $('usCreditTabs');
-  if (tabs) tabs.innerHTML = usTabsHtml([['account', '按账号'], ['model', '按模型']], usCreditDim, {
+  setHTML('usCreditTabs', usTabsHtml([['account', '按账号'], ['model', '按模型']], usCreditDim, {
     account: (d.credit_by_account || []).length,
     model: (d.credit_by_model || []).length,
-  });
+  }));
 }
 
 function renderUsage(d) {
   usageData = d || {};
+  // 成功渲染即清除上一轮失败横幅；否则网络恢复后用户仍会看到旧错误。
+  const errBox = $('usError');
+  if (errBox) { errBox.hidden = true; errBox.textContent = ''; }
+  // renderUsage 是成功路径的入口。旧 index.html 可能只保留部分用量节点；
+  // 除最外层 #view-usage 外，其余区块都是可选增强：缺哪块只提示一次，其他
+  // 仍存在的卡片/图表照常渲染。绝不能把“缺一块”升级成整页放弃或 null 写入。
+  if (!document.querySelector || !document.querySelector('#view-usage')) {
+    noteUsageDomMismatch('view-usage');
+    return;
+  }
+  for (const id of ['usStats', 'usChart', 'usNote', 'usDimHead', 'usDimBody', 'usCreditHead', 'usCreditBody', 'usCreditStats']) {
+    if (!$(id)) noteUsageDomMismatch(id);
+  }
   const t = usageData.totals || {};
   const total = Number(t.total_tokens || 0);
   const pt = Number(t.prompt_tokens || 0);
@@ -3921,7 +4549,7 @@ function renderUsage(d) {
   const pctW = (part) => total ? Math.max(0, Math.min(100, Number(part || 0) / total * 100)).toFixed(2) + '%' : '0%';
   // 六张卡：主指标用强调色，completion 用成功色（与图表里的绿柱呼应），
   // 失败/延迟只在有值时上语义色——全绿全黄的仪表盘等于没有重点。
-  $('usStats').innerHTML =
+  setHTML('usStats',
     usKpi(fmtTok(reqs), '请求数', 'c-accent',
       errs ? '其中失败 ' + errs + ' 次' : '全部成功') +
     usKpi(fmtTok(total), '总 token', 'c-accent',
@@ -3933,7 +4561,7 @@ function renderUsage(d) {
     usKpi(String(errs), '失败尝试', errs ? 'c-warn' : 'c-mute',
       okRate == null ? '—' : (errs ? '成功率 ' + okRate.toFixed(1) + '%' : '成功率 100%')) +
     usKpi(fmtMs(t.avg_latency_ms), '平均延迟', 'c-soft',
-      t.avg_tokens_per_second ? '吐字 ' + fmtRate(t.avg_tokens_per_second) : '无速率样本');
+      t.avg_tokens_per_second ? '吐字 ' + fmtRate(t.avg_tokens_per_second) : '无速率样本'));
 
   // 卡片、明细表与时序图全部按所选窗口统计（切窗口数字随之变化）；
   // 「全部历史」含 90 天前折叠出的日桶。这里标注当前口径与数据起点。
@@ -3948,8 +4576,13 @@ function renderUsage(d) {
     (usageData.buckets || 0) + ' 个分桶' +
     (usageData.since ? ' · 数据自 ' + usageData.since.replace('T', ' ') : '') +
     (usageData.file_bytes ? ' · 文件 ' + (usageData.file_bytes / 1024).toFixed(1) + ' KB' : '');
-  $('usNote').textContent = note;
-  $('usNote').title = note; // 窄屏单行截断时靠悬停看全
+  const noteEl = $('usNote');
+  if (noteEl) {
+    noteEl.textContent = note;
+    noteEl.title = note; // 窄屏单行截断时靠悬停看全
+  } else {
+    noteUsageDomMismatch('usNote');
+  }
 
   // 积分扣除的四张卡片与说明。
   creditSpendStatsHtml =
@@ -3964,36 +4597,60 @@ function renderUsage(d) {
     (usageData.credit_by_account || []).length + ' 个账号 · ' +
     (usageData.credit_by_model || []).length + ' 个模型倍率分组 · 仅统计与积分同时观测到的 Token';
   if (usCreditKind !== 'grant') {
-    $('usCreditStats').innerHTML = creditSpendStatsHtml;
-    $('usCreditNote').textContent = creditSpendNote;
+    setHTML('usCreditStats', creditSpendStatsHtml);
+    const spendNote = $('usCreditNote');
+    if (spendNote) spendNote.textContent = creditSpendNote;
+    else noteUsageDomMismatch('usCreditNote');
   }
 
-  renderUsageDim();
-  renderCreditDim();
-  renderUsageChart(usageData.series || []);
+  // 总览已经成功写入后，明细/流水/图表是可选增强块：任何一块因旧骨架缺节点
+  // 抛错，都只能影响它自己，不能冒泡到 loadUsage 的 catch 把统计卡清空。
+  const optionalRender = (name, fn) => {
+    try { fn(); } catch (e) {
+      // 缺块由各渲染函数自己调用 noteUsageDomMismatch；这里只兜住意外异常，
+      // 保留控制台线索但不改写已成功渲染的总览。
+      if (typeof console !== 'undefined' && console.warn) console.warn('[usage] ' + name + ' render failed', e);
+    }
+  };
+  optionalRender('dim', renderUsageDim);
+  optionalRender('credit', renderCreditDim);
+  optionalRender('chart', () => renderUsageChart(usageData.series || []));
 }
 
 // 维度切换 / 排序控件。
 if ($('usDimTabs')) $('usDimTabs').addEventListener('click', ev => {
-  const b = ev.target.closest('button[data-dim]');
+  const target = ev.target && ev.target.closest ? ev.target.closest('button[data-dim]') : null;
+  const b = target || (ev.currentTarget && ev.currentTarget.querySelector ? ev.currentTarget.querySelector('button[data-dim]') : null);
   if (!b) return;
   usDim = b.dataset.dim;
   usDimPage = 1;
   renderUsageDim();
 });
 if ($('usCreditTabs')) $('usCreditTabs').addEventListener('click', ev => {
-  const b = ev.target.closest('button[data-dim]');
+  const target = ev.target && ev.target.closest ? ev.target.closest('button[data-dim]') : null;
+  const b = target || (ev.currentTarget && ev.currentTarget.querySelector ? ev.currentTarget.querySelector('button[data-dim]') : null);
   if (!b) return;
   usCreditDim = b.dataset.dim;
   renderCreditDim();
 });
 if ($('usCreditKindTabs')) $('usCreditKindTabs').addEventListener('click', ev => {
-  const b = ev.target.closest('button[data-kind]');
+  const target = ev.target && ev.target.closest ? ev.target.closest('button[data-kind]') : null;
+  const b = target || (ev.currentTarget && ev.currentTarget.querySelector ? ev.currentTarget.querySelector('button[data-kind]') : null);
   if (!b) return;
   const kind = b.dataset.kind;
   if (kind === usCreditKind) return;
   usCreditKind = kind;
-  document.querySelectorAll('#usCreditKindTabs button[data-kind]').forEach(x => x.classList.toggle('on', x === b));
+  // 两类流水共用同一张表：切换时必须同时作废另一个请求。否则“获取”的迟到
+  // 响应会在“扣减”页签下覆盖表头与行，看起来像数据串档。
+  creditHistSeq++;
+  creditGrantSeq++;
+  if (creditCtrl) { try { creditCtrl.abort(); } catch (e) { /* ignore */ } }
+  if (creditGrantCtrl) { try { creditGrantCtrl.abort(); } catch (e) { /* ignore */ } }
+  // 只改已有按钮的选中态；旧骨架/最小化 DOM 可能没有 querySelectorAll，
+  // 不能因为一次 UI 同步把整次数据刷新打断。
+  if (document && typeof document.querySelectorAll === 'function') {
+    document.querySelectorAll('#usCreditKindTabs button[data-kind]').forEach(x => x.classList.toggle('on', x === b));
+  }
   const head = $('usCreditHistHead');
   const table = $('usCreditHistTable');
   const empty = $('usCreditHistEmpty');
@@ -4016,8 +4673,10 @@ if ($('usCreditKindTabs')) $('usCreditKindTabs').addEventListener('click', ev =>
   if (agg) agg.hidden = false;
   if (empty) { empty.hidden = true; empty.textContent = ''; }
   if (usCreditKind === 'spend' || usCreditKind === 'all') {
-    $('usCreditStats').innerHTML = creditSpendStatsHtml;
-    $('usCreditNote').textContent = creditSpendNote;
+    setHTML('usCreditStats', creditSpendStatsHtml);
+    const spendNote = $('usCreditNote');
+    if (spendNote) spendNote.textContent = creditSpendNote;
+    else noteUsageDomMismatch('usCreditNote');
     if (head) head.innerHTML = '<tr><th>时间</th><th>粒度</th><th>账号</th><th>模型</th>' +
       '<th class="num">请求</th><th class="num">扣减积分</th><th class="num">Token</th></tr>';
   }
@@ -4081,6 +4740,8 @@ function fmtTokTimeLabel(p) {
 
 function renderUsageChart(series) {
   const host = $('usChart');
+  const noteEl = $('usChartNote');
+  if (!host) { noteDOM('usChart'); return; }
 
   // 丢掉时间解析不出来的点，而不是让 NaN 传染整张图。
   const pts = [];
@@ -4094,7 +4755,7 @@ function renderUsageChart(series) {
   }
   if (!pts.length) {
     host.innerHTML = '<div class="us-empty">暂无用量数据。发起一次对话后再刷新。</div>';
-    $('usChartNote').textContent = '—';
+    if (noteEl) noteEl.textContent = '—';
     return;
   }
 
@@ -4108,7 +4769,7 @@ function renderUsageChart(series) {
   const max = Math.max(1, ...pts.map(p => p.tt));
   const peak = pts.reduce((a, b) => (b.tt > a.tt ? b : a), pts[0]);
   const avg = pts.reduce((s, p) => s + p.tt, 0) / pts.length;
-  $('usChartNote').textContent =
+  if (noteEl) noteEl.textContent =
     pts.length + ' 个点 · 峰值 ' + fmtTok(peak.tt) + ' @ ' + fmtTokTimeLabel(peak) +
     ' · 均值 ' + fmtTok(avg);
 
@@ -4253,6 +4914,21 @@ async function loadUsage() {
   // 请求序号守卫：用户快速切时间范围时多个请求在飞，先发的慢响应可能后到，
   // 把新窗口的数字覆盖回旧窗口（"越刷新越旧"）。只有最新一次请求可以渲染。
   const my = ++usageSeq;
+  const btn = $('btnUsage');
+  const btnLabel = btn ? btn.textContent : '';
+  if (btn) { btn.disabled = true; btn.textContent = '读取中…'; btn.setAttribute('aria-busy', 'true'); }
+  // 入口先确认用量页骨架存在：旧 index.html + 新 app.js 时整页都可能没有
+  // #view-usage。此时既不该打上游，也不该在失败分支对 null 写 innerHTML；
+  // 只提示一次版本错配并安静返回。旧版 2706 行就是这么炸出未处理异常的。
+  if (!$('view-usage') && !$('usChart') && !$('usError') && !$('usNote')) {
+    // 直接调用缺节点提示：本函数就是探针本身，若委托给 noteUsageDomMismatch
+    // 会被它内部的「连提示落点都没有」分支静默吞掉，旧骨架反而没有任何反馈。
+    noteDOM('view-usage');
+    if (btn) { btn.disabled = false; btn.textContent = btnLabel; btn.removeAttribute('aria-busy'); }
+    return;
+  }
+  // 入口级缺节点提示只发一次，但按钮仍保持可用：用户修复后（反代恢复/硬刷新）
+  // 再点一次就能恢复；禁用按钮只会让页面看起来永久坏掉。
   if (usageCtrl) { try { usageCtrl.abort(); } catch (e) { /* 旧浏览器没有 abort 时忽略 */ } }
   usageCtrl = typeof AbortController === 'function' ? new AbortController() : null;
   // 子区块使用各自世代：切窗后旧的分位/流水请求不能晚到回写。先作废它们，
@@ -4270,6 +4946,8 @@ async function loadUsage() {
     const d = await api('usage?' + q.toString(), usageCtrl ? { signal: usageCtrl.signal } : {});
     if (my !== usageSeq) return;
     if (typeof view === 'string' && view !== 'usage') return;
+    // renderUsage 内部按块隔离：缺一个可选节点只是跳过该块，不再让成功响应
+    // 变成未处理异常。若整块骨架都不在，入口已经提前返回。
     renderUsage(d);
     loadRemaining();
     loadPerf();
@@ -4278,26 +4956,61 @@ async function loadUsage() {
     warmUsageModelRates();
   } catch (e) {
     if (my !== usageSeq) return;
+    // 被下一次 loadUsage 取消的旧请求不是错误：它没有拿到数据，也不该覆盖
+    // 新请求即将渲染的内容。AbortError 若继续走下面的失败清理，会在
+    // 「快速切范围」时先把 usDimTable/usCreditTable 写成失败行；新请求随后
+    // 成功也会短暂闪一下错误，若新请求先失败则留下错误来源错位的提示。
+    if (isAbortError(e)) return;
+    // 只有请求本身失败才清空总览。renderUsage 内部已经按块隔离渲染异常；
+    // 若异常从这里冒出来而非 network/API 错误，保留已有的成功数字比整页清空
+    // 更符合用户预期，也避免旧骨架缺一个可选块就丢掉整张统计卡。
+    // 这里也可能是旧脚本片段/最小沙箱：未声明 usageData 时读取同样会抛
+    // ReferenceError。用 typeof 探针，绝不能把“清理失败态”变成新异常。
+    if (typeof usageData !== 'undefined' && usageData && e && e.__render) return;
     // 失败时三块都要清干净：只改图表会留下上一次窗口的数字，看起来像"刷新成功"。
-    usageData = null;
-    const put = (id, key, val) => { const el = $(id); if (el) el[key] = val; };
-    put('usChart', 'innerHTML', '<div class="us-empty">读取用量失败：' + esc(e.message) + '</div>');
-    put('usChartNote', 'textContent', '—');
-    put('usStats', 'innerHTML', '');
-    put('usCreditStats', 'innerHTML', '');
-    put('usNote', 'textContent', '—');
-    put('usCreditNote', 'textContent', '—');
-    put('usDimNote', 'textContent', '—');
-    put('usDimHead', 'innerHTML', '');
-    put('usCreditHead', 'innerHTML', '');
-    put('usDimTabs', 'innerHTML', usTabsHtml(US_DIM_TABS, usDim, null));
-    if ($('usCreditTabs')) $('usCreditTabs').innerHTML = usTabsHtml([['account', '按账号'], ['model', '按模型']], usCreditDim, null);
-    put('usDimBody', 'innerHTML', '<tr><td colspan="10" class="empty">读取用量失败</td></tr>');
-    put('usCreditBody', 'innerHTML', '<tr><td colspan="7" class="empty">读取用量失败</td></tr>');
+    // 失败清理也必须在旧骨架/最小化测试沙箱里自保：usageData 是顶层 let，
+    // 若脚本被按片段求值（或旧版本尚未声明该变量），直接赋值会抛
+    // ReferenceError，反而把一次可恢复的读取失败变成未处理异常。
+    try { usageData = null; } catch (e) { /* 片段/旧骨架环境：没有该状态变量 */ }
+    // 所有写入都经过空节点保护：升级后的页面可能没有旧版用量区块（或浏览器
+    // 缓存了旧 index.html）。失败清理本身绝不能成为新的 innerHTML-null 崩溃源。
+    const failHTML = '<div class="us-empty">读取用量失败：' + esc(e && e.message ? e.message : String(e)) + '</div>';
+    // 错误只落在仍存在的专用错误位/图表上；旧骨架没有这些区块时，用一次页面级
+    // 版本提示代替「对 null 写 innerHTML」。这里复用一个探针函数，保证新增
+    // 区块时不会再漏掉空节点判断。
+    let shown = false;
+    shown = applyNode('usError', el => { el.innerHTML = failHTML; el.hidden = false; }) || shown;
+    shown = applyNode('usChart', el => { el.innerHTML = failHTML; }) || shown;
+    if (!shown) noteUsageDomMismatch('usage-error');
+    clearNode('usChartNote', 'textContent');
+    clearNode('usStats', 'innerHTML');
+    clearNode('usCreditStats', 'innerHTML');
+    clearNode('usNote', 'textContent');
+    clearNode('usCreditNote', 'textContent');
+    clearNode('usDimNote', 'textContent');
+    clearNode('usDimHead', 'innerHTML');
+    clearNode('usCreditHead', 'innerHTML');
+    // 页签按钮按维度重绘；只用一次节点引用，成功后不再写 innerHTML。
+    applyNode('usDimTabs', el => { el.innerHTML = usTabsHtml(US_DIM_TABS, usDim, null); });
+    applyNode('usCreditTabs', el => { el.innerHTML = usTabsHtml([['account', '按账号'], ['model', '按模型']], usCreditDim, null); });
+    applyNode('usDimBody', el => { el.innerHTML = '<tr><td colspan="10" class="empty">读取用量失败</td></tr>'; });
+    applyNode('usCreditBody', el => { el.innerHTML = '<tr><td colspan="7" class="empty">读取用量失败</td></tr>'; });
+  } finally {
+    // 按钮状态属于本次请求而非全局：只有仍是最新请求才恢复，避免旧请求的
+    // finally 把新请求的“读取中…”提前清掉。取消/失败/成功都走同一出口。
+    if (my === usageSeq && btn) {
+      btn.disabled = false;
+      btn.textContent = btnLabel || '刷新';
+      btn.removeAttribute('aria-busy');
+    }
   }
 }
 
+// 页面骨架与脚本版本错配时（浏览器缓存旧 index.html、反代只替换二进制等），
+// 直接 `$('id').onclick=` 会在顶层抛 TypeError，整份 app.js 停止执行，后续
+// 所有视图都不再可用。入口绑定一律先判断元素是否存在。
 if ($('btnUsage')) $('btnUsage').onclick = loadUsage;
+if ($('btnUsageReload')) $('btnUsageReload').onclick = loadUsage;
 if ($('btnPerfReload')) $('btnPerfReload').onclick = loadPerf;
 if ($('btnCreditHist')) $('btnCreditHist').onclick = loadCreditHistory;
 // 时间范围控件绑定：任何改动（预设切换 / 自定义起止）都重新拉一次用量。
@@ -4325,11 +5038,14 @@ function actRowHtml(r) {
     (r.realm ? '<div class="note">' + esc(r.realm) + '</div>' : '') + '</td>' +
     '<td data-label="任务">' + esc(task) + '</td><td data-label="触发">' + esc(trigger) + '</td>' +
     '<td data-label="结果"><span class="tag ' + (ok ? 'ok' : 'bad') + '">' + (ok ? '成功' : '失败') + '</span></td>' +
-    '<td data-label="消息" title="' + esc(msg) + '">' + esc(msg || '—') + '</td></tr>';
+    '<td data-label="消息" title="' + esc(msg) + '"><span class="msg-clip">' + esc(msg || '—') + '</span></td></tr>';
 }
 function actEmptyHtml(d) {
-  return '<tr><td colspan="7" class="empty">' +
-    (d.total ? '没有符合筛选条件的记录' : '暂无活动记录') + '</td></tr>';
+  // 空态分两种：有历史但筛选无命中 vs 从未执行任务。后者给下一步动作，
+  // 避免用户把「筛选条件太窄」误判成功能坏了。
+  const txt = d.total ? '没有符合筛选条件的记录，试试放宽时间或任务类型'
+    : '暂无活动记录；执行签到 / 活跃上报 / 保活后会在这里留下每次尝试';
+  return '<tr><td colspan="7" class="empty">' + txt + '</td></tr>';
 }
 function renderActivity(d, opts) {
   d = d || {};
@@ -4462,6 +5178,34 @@ const SECNAV_LABELS = {
   usage: { '用量总览': '总览', '用量明细': '明细', '剩余额度': '额度', '性能分位': '性能', '积分流水': '流水' },
   config: { '服务': '服务', '客户端 API Key': '客户端 Key', '定时任务': '定时', '账号池与流量治理': '选号', '上游与高级': '上游', '日志': '日志' },
 };
+// 侧栏收起偏好与「有导航」状态：只有 items >= 2 才给 .main 加 has-secnav，
+// 否则宽屏正文不留 174px 空栏。收起状态持久化到 localStorage，缺失时默认展开。
+const SIDEBAR_COLLAPSE_KEY = 'wb-panel-sidebar-collapsed';
+function sidebarCollapsedPref() {
+  try { return localStorage.getItem(SIDEBAR_COLLAPSE_KEY) === '1'; } catch (e) { return false; }
+}
+function applySidebarCollapsed(main, collapsed) {
+  if (!main || !main.classList || typeof main.classList.toggle !== 'function') return;
+  main.classList.toggle('sidebar-collapsed', !!collapsed);
+  const btn = $('btnPageSidebarToggle');
+  if (btn) {
+    btn.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+    btn.title = collapsed ? '展开本页导航' : '收起本页导航';
+    btn.textContent = collapsed ? '›' : '‹';
+  }
+}
+function toggleSidebarCollapsed() {
+  const main = document.querySelector ? document.querySelector('.main') : null;
+  const next = !(main && main.classList && main.classList.contains('sidebar-collapsed'));
+  applySidebarCollapsed(main, next);
+  try { localStorage.setItem(SIDEBAR_COLLAPSE_KEY, next ? '1' : '0'); } catch (e) { /* ignore */ }
+}
+if ($('btnPageSidebarToggle')) $('btnPageSidebarToggle').onclick = toggleSidebarCollapsed;
+if ($('btnPageTop')) $('btnPageTop').onclick = () => {
+  const t = $('topbar');
+  const top = t && typeof t.getBoundingClientRect === 'function' ? t.getBoundingClientRect().bottom + 12 : 0;
+  if (typeof window !== 'undefined' && typeof window.scrollTo === 'function') window.scrollTo({ top, behavior: 'smooth' });
+};
 let secNavView = '', secNavTimer = null;
 // 滚动监听用 rAF 合并：一次滚动事件里对每个区块 getBoundingClientRect 会触发
 // 多次布局；高频触控滚动时还会反复改 nav.scrollLeft。合并到每帧最多一次，
@@ -4469,20 +5213,37 @@ let secNavView = '', secNavTimer = null;
 let secNavFrame = 0, secNavActive = '';
 function setupSectionNav(v) {
   const nav = $('secNav');
-  if (!nav) return;
+  const sidebar = $('pageSidebar');
+  const main = document.querySelector ? document.querySelector('.main') : null;
+  // #secNav 是必需契约；缺它时只提示一次，不能让页内导航把整页切路由打断。
+  if (!nav) { noteDOM('secNav'); return; }
   const host = document.getElementById ? document.getElementById('view-' + v) : null;
+  // 旧 index.html 可能没有 .page-sidebar 包裹层；此时仍把导航当作 doc flow 内的
+  // 顶部胶囊（nav 自身保留 .secnav 样式），不要因为缺父容器整块跳过。
   const boxes = host && host.querySelectorAll ? Array.from(host.querySelectorAll('.box')) : [];
   const items = [];
   boxes.forEach((box, i) => {
     const h = box.querySelector ? box.querySelector('header h3') : null;
-    const label = String((h && h.textContent) || '').trim().split('\n')[0].trim();
+    // 只取 h3 自身的标题文本，不能混入 .hint：用量卡片的说明很长，混进来会
+    // 被侧栏当成标题换行成一整段正文（截图里「剩余额度」就是这样溢出的）。
+    const label = sectionNavTitle(h);
     if (!label) return;
     if (!box.id) box.id = 'sec-' + v + '-' + i;
     const short = (SECNAV_LABELS[v] || {})[label] || label;
     items.push({ id: box.id, label: short });
   });
-  if (!host || items.length < 2) { nav.hidden = true; nav.innerHTML = ''; secNavView = v; return; }
+  if (!host || items.length < 2) {
+    nav.hidden = true; nav.innerHTML = '';
+    if (sidebar) sidebar.hidden = true;
+    if (main && main.classList) main.classList.remove('has-secnav');
+    secNavView = v; return;
+  }
   nav.hidden = false;
+  if (sidebar) sidebar.hidden = false;
+  if (main && main.classList) {
+    main.classList.add('has-secnav');
+    applySidebarCollapsed(main, sidebarCollapsedPref());
+  }
   nav.innerHTML = items.map(it => '<a href="#' + esc(it.id) + '" data-sec="' + esc(it.id) + '">' +
     esc(it.label) + '</a>').join('');
   const links = nav.querySelectorAll ? Array.from(nav.querySelectorAll('a[data-sec]')) : [];
@@ -4511,7 +5272,8 @@ function setupSectionNav(v) {
       mark(a.dataset.sec);
       const top = Math.max(0, el.getBoundingClientRect().top - 122);
       if (window.scrollTo) window.scrollTo({ top: top, behavior: 'smooth' });
-      if (history && history.replaceState) history.replaceState(null, '', '#' + a.dataset.sec);
+      // 区块锚点只用于滚动，不写进 URL：主路由只认 9 个视图，刷新 #sec-*
+      // 会回落到账号页，看起来像导航丢失。
     };
   });
   const spy = () => {
@@ -4544,6 +5306,18 @@ function setupSectionNav(v) {
   secNavActive = '';
   if (typeof requestAnimationFrame === 'function') secNavFrame = requestAnimationFrame(spy);
   else spy();
+}
+
+/* sectionNavTitle 取区块标题的纯文本：复制 h3 并移除 .hint/.note 后再读
+   textContent。直接读 h3.textContent 会把补充说明一起拼进导航项。 */
+function sectionNavTitle(h) {
+  if (!h) return '';
+  const clone = h.cloneNode ? h.cloneNode(true) : null;
+  if (clone && clone.querySelectorAll) {
+    clone.querySelectorAll('.hint, .note').forEach(x => x.remove());
+  }
+  const text = String((clone ? clone.textContent : h.textContent) || '').replace(/\s+/g, ' ').trim();
+  return text;
 }
 
 /* ── 接入页 ───────────────────────────────────────────────────────── */
@@ -4583,7 +5357,9 @@ function renderConnect(d) {
   const modelsText = models.join(', ');
   set('cxModels', modelsText);
   const modelsBox = $('cxModels');
-  if (modelsBox) modelsBox.innerHTML = esc(modelsText);
+  // input 只写 value：对 <input> 写 innerHTML 在部分浏览器无效或触发解析，
+  // 会导致展示值与复制值不一致。set() 已按元素类型写入 value。
+  if (modelsBox && modelsBox.value !== modelsText) modelsBox.value = modelsText;
   const note = $('cxNote');
   if (note) note.textContent = d.auth_required
     ? '客户端需要 API Key（Bearer 或 x-api-key）'
@@ -4939,7 +5715,9 @@ function renderExpiryDistribution(list, now) {
   ).map(a => '<span><i style="background:' + (colors.get(String(a.uid)) || 'var(--accent)') +
     '"></i>' + esc(a.nickname || String(a.uid).slice(0, 8)) + '</span>').join('');
   const hdr = '<div class="pk-expiry-hdr"><span>剩余天数</span><span style="text-align:center">各账号该批剩余</span><b>剩余积分</b></div>';
-  $('pkExpiry').innerHTML = (rows
+  const expiryHost = $('pkExpiry');
+  if (!expiryHost) { noteDOM('pkExpiry'); return; }
+  expiryHost.innerHTML = (rows
     ? hdr + '<div class="pk-expiry-chart">' + rows + '</div>'
     : '<div class="pk-expiry-empty">暂无可汇总积分</div>') +
     (legend ? '<div class="pk-expiry-legend">' + legend + '</div>' : '') +
@@ -4955,8 +5733,8 @@ function renderPackages(d, detailLimit) {
   const expiryColors = pkAccountColorMap(list);
   renderExpiryDistribution(all, now);
   if (!list.length) {
-    $('pkSummary').innerHTML = '<div class="empty">没有账号' + (q ? '符合“' + esc(pkQuery) + '”' : '') + '</div>';
-    $('pkDetail').innerHTML = '';
+    setHTML('pkSummary', '<div class="empty">没有账号' + (q ? '符合“' + esc(pkQuery) + '”' : '') + '</div>');
+    setHTML('pkDetail', '');
     if ($('pkDetailCount')) $('pkDetailCount').textContent = '';
     return;
   }
@@ -4992,7 +5770,7 @@ function renderPackages(d, detailLimit) {
 
   const maxRemain = Math.max(1, ...list.map(a => Number(a.remain || 0)));
 
-  $('pkSummary').innerHTML = list.map(a => {
+  setHTML('pkSummary', list.map(a => {
     if (a.error) {
       return '<div class="pk-card"><div class="who"><span class="nm">' +
         esc((a.nickname || a.uid.slice(0, 8))) + '</span>' +
@@ -5032,11 +5810,11 @@ function renderPackages(d, detailLimit) {
       expiryBar +
       '<div class="pk-legend">' + legend + '</div>' +
       '</div>';
-  }).join('');
+  }).join(''));
 
   // 缓存时间戳（易用性修复 8）：有缓存时告知"缓存于 HH:MM"，让用户知道看到的
   // 是不是最新数据；没有时间戳（理论不会发生，走了 renderPackages 就有缓存）退回原文案。
-  $('pkNote').textContent = list.length + ' 个账号 · ' + (lastPackagesAt ? '缓存于 ' + fmtClock(lastPackagesAt) : '实时查询上游');
+  if ($('pkNote')) $('pkNote').textContent = list.length + ' 个账号 · ' + (lastPackagesAt ? '缓存于 ' + fmtClock(lastPackagesAt) : '实时查询上游');
 
   // 逐包明细：每个账号一个表，排序规则由视图顶部的选择器决定（默认到期近的在前）。
   // 默认只渲染前 PK_DETAIL_ACCOUNT_PAGE 个账号，避免 470 账号 × 数十包把 DOM 撑爆；
@@ -5044,9 +5822,9 @@ function renderPackages(d, detailLimit) {
   const detailList = pkDetailAll ? list : list.slice(0, PK_DETAIL_ACCOUNT_PAGE);
   const more = list.length - detailList.length;
   if ($('pkDetailCount')) {
-    $('pkDetailCount').textContent = detailList.length + ' / ' + list.length + ' 个账号' +
+    setText('pkDetailCount', detailList.length + ' / ' + list.length + ' 个账号' +
       (more > 0 ? '（还有 ' + more + ' 个未渲染）' : '') +
-      (q ? ' · 筛选“' + pkQuery.trim() + '”' : '');
+      (q ? ' · 筛选“' + pkQuery.trim() + '”' : ''));
   }
   const toggle = $('btnPkDetailToggle');
   if (toggle) {
@@ -5054,7 +5832,7 @@ function renderPackages(d, detailLimit) {
     toggle.textContent = pkDetailAll ? '收起明细' : '展开全部账号';
     toggle.setAttribute('aria-expanded', String(pkDetailAll));
   }
-  $('pkDetail').innerHTML = detailList.map(a => {
+  setHTML('pkDetail', detailList.map(a => {
     if (a.error) return '';
     const groups = pkDetailGroups(a.packages || [], detailLimit);
     const rowOf = (p, rowGroup) => {
@@ -5102,7 +5880,7 @@ function renderPackages(d, detailLimit) {
       '<th class="num">面额</th><th class="num">剩余</th><th class="num">已用</th>' +
       '<th class="num">发放</th><th class="num">到期</th>' +
       '</tr></thead><tbody>' + rows + restSummary + usedSummary + '</tbody></table></div></div>';
-  }).join('');
+  }).join(''));
 }
 
 if ($('pkDetail')) $('pkDetail').addEventListener('click', ev => {
@@ -5151,14 +5929,15 @@ const PK_SORT_LABELS = { end_asc: '按到期升序 · 近的在前', size_desc: 
 let lastDetailLimit = PK_DEFAULT_DETAIL_LIMIT;
 
 // 排序规则控件：恢复上次选择并绑定切换。
-if ($('pkSort')) {
-  $('pkSort').value = pkSortMode;
-  if ($('pkSort').value !== pkSortMode) {        // localStorage 里存了废弃值：回落默认
+const pkSortEl = $('pkSort');
+if (pkSortEl) {
+  pkSortEl.value = pkSortMode;
+  if (pkSortEl.value !== pkSortMode) {        // localStorage 里存了废弃值：回落默认
     pkSortMode = 'end_asc';
     localStorage.setItem(LS_PK_SORT, pkSortMode);   // 不用 removeItem：harness 桩无此方法
   }
-  $('pkSort').onchange = () => {
-    pkSortMode = $('pkSort').value;
+  pkSortEl.onchange = () => {
+    pkSortMode = pkSortEl.value;
     localStorage.setItem(LS_PK_SORT, pkSortMode);
     if (lastPackages) renderPackages(lastPackages, lastDetailLimit);   // 数据在内存，直接重排
   };
@@ -5190,15 +5969,15 @@ async function loadPackages(force) {
   if (!force && lastPackages) {
     renderPackages(lastPackages, lastDetailLimit);
     const ageMin = Math.floor((Date.now() - lastPackagesAt) / 60000);
-    if (ageMin > 0) $('pkNote').textContent = lastPackages.accounts.length + ' 个账号 · ' + ageMin + ' 分钟前的数据，点「刷新」更新';
+    if (ageMin > 0 && $('pkNote')) $('pkNote').textContent = lastPackages.accounts.length + ' 个账号 · ' + ageMin + ' 分钟前的数据，点「刷新」更新';
     return;
   }
   if (pkInFlight) { pkPending = true; return; }
   pkInFlight = true;
   const seq = ++pkReqSeq;
-  $('pkSummary').innerHTML = '<div class="empty">查询中…（逐账号向上游实时查询）</div>';
-  $('pkDetail').innerHTML = '';
-  $('pkExpiry').innerHTML = '<div class="pk-expiry-empty">查询中…</div>';
+  setHTML('pkSummary', '<div class="empty">查询中…（逐账号向上游实时查询）</div>');
+  setHTML('pkDetail', '');
+  setHTML('pkExpiry', '<div class="pk-expiry-empty">查询中…</div>');
   try {
     const [d, c] = await Promise.all([
       loadPackagesData(),
@@ -5212,10 +5991,10 @@ async function loadPackages(force) {
     if (seq !== pkReqSeq) return;
     // 失败时清空旧明细：否则刷新失败后仍显示上一次的逐包表，用户会误以为是
     // 本次查询结果。摘要与到期卡明确标失败原因。
-    $('pkDetail').innerHTML = '';
-    $('pkSummary').innerHTML = '<div class="empty">读取失败：' + esc(e.message) + '</div>';
-    $('pkExpiry').innerHTML = '<div class="pk-expiry-empty">读取失败：' + esc(e.message) + '</div>';
-    $('pkNote').textContent = '读取失败 · 可点「刷新」重试';
+    setHTML('pkDetail', '');
+    setHTML('pkSummary', '<div class="empty">读取失败：' + esc(e.message) + '</div>');
+    setHTML('pkExpiry', '<div class="pk-expiry-empty">读取失败：' + esc(e.message) + '</div>');
+    setText('pkNote', '读取失败 · 可点「刷新」重试');
   } finally {
     if (seq === pkReqSeq) {
       pkInFlight = false;
@@ -5311,10 +6090,14 @@ function renderExpiry(d) {
     (soon.length ? ' · ' + soon.length + ' 个 4–7 天内' : '') +
     (failed.length ? ' · ' + failed.length + ' 个查询失败' : '') +
     (lastPackagesAt && ageMin > 0 ? ' · ' + ageMin + ' 分钟前' : '');
-  $('expNote').textContent = state;
-  $('expNote').title = '共 ' + list.length + ' 个账号 · ' +
-    (lastPackagesAt && ageMin > 0 ? '缓存数据，可点「实时检查」刷新' : '实时查询上游');
-  $('expBox').hidden = false;
+  const note = $('expNote');
+  if (note) {
+    note.textContent = state;
+    note.title = '共 ' + list.length + ' 个账号 · ' +
+      (lastPackagesAt && ageMin > 0 ? '缓存数据，可点「实时检查」刷新' : '实时查询上游');
+  }
+  const box = $('expBox');
+  if (box) box.hidden = false;
 }
 
 /* 快照版到期提醒：不查上游，直接用 /overview 已有的 credits_earliest_expiry /
@@ -5379,11 +6162,15 @@ function renderExpirySnapshot(d) {
   const headline = (urgent.length ? '<b>' + urgent.length + '</b> 个账号 3 天内到期' : '3 天内无到期') +
     (urgent.length ? ' · 最近 <b>' + esc(localDate(urgent[0].ms)) + '</b>' : '');
   expSetSummary('<div class="headline">' + headline + '</div>', rows.join('') || '<div class="empty">没有账号</div>');
-  $('expNote').textContent = (urgent.length ? urgent.length + ' 个 3 天内有到期' : '3 天内无到期') +
-    (soon.length ? ' · ' + soon.length + ' 个 4–7 天内' : '') +
-    (failed.length ? ' · ' + failed.length + ' 个查询失败' : '') + ' · 快照';
-  $('expNote').title = '共 ' + list.length + ' 个账号 · 数据来自本地状态；点「实时检查」拉取逐包明细';
-  $('expBox').hidden = false;
+  const note = $('expNote');
+  if (note) {
+    note.textContent = (urgent.length ? urgent.length + ' 个 3 天内有到期' : '3 天内无到期') +
+      (soon.length ? ' · ' + soon.length + ' 个 4–7 天内' : '') +
+      (failed.length ? ' · ' + failed.length + ' 个查询失败' : '') + ' · 快照';
+    note.title = '共 ' + list.length + ' 个账号 · 数据来自本地状态；点「实时检查」拉取逐包明细';
+  }
+  const box = $('expBox');
+  if (box) box.hidden = false;
 }
 
 /* 到期提醒默认只显示一句摘要；明细按账号折叠，避免首页一打开就是一堵墙。
@@ -5464,15 +6251,17 @@ async function loadExpiry(force) {
   const fresh = lastPackages && (Date.now() - lastPackagesAt) < EXP_FRESH_MS;
   if (fresh && !force) { renderExpiry(lastPackages); return; }
   expFetching = true;
-  $('expBox').hidden = false;
-  if (!$('expList').children.length) $('expList').innerHTML = '<div class="empty">查询中…（逐账号向上游实时查询）</div>';
-  $('expNote').textContent = '查询中…';
+  const box = $('expBox');
+  if (box) box.hidden = false;
+  const list = $('expList');
+  if (list && (!list.children || !list.children.length)) list.innerHTML = '<div class="empty">查询中…（逐账号向上游实时查询）</div>';
+  setText('expNote', '查询中…');
   try {
     const d = await loadPackagesData();
     renderExpiry(d);
   } catch (e) {
     // textContent 不解引用 HTML 实体：这里再 esc 一次只会让用户看到 &amp; 这类字面量。
-    $('expNote').textContent = '查询失败：' + e.message;
+    setText('expNote', '查询失败：' + (e && e.message ? e.message : String(e)));
   }
   expFetching = false;
 }

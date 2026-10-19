@@ -22,9 +22,10 @@ CONTAINER="workbuddy2api"
 
 mkdir -p "$AUTH_DIR"
 
-# login 工具：不存在才编译（源码改动后手动 go build -o login ./cmd/login）
+# login 工具：不存在或源码/依赖更新时编译。只判断「存在」会让升级后仍用旧
+# 登录逻辑（企业 claim / realm 处理变化不会生效），且脚本没有任何提示。
 LOGIN_BIN="./login"
-if [[ ! -x "$LOGIN_BIN" ]]; then
+if [[ ! -x "$LOGIN_BIN" ]] || [[ -n "$(find cmd/login internal go.mod go.sum -newer "$LOGIN_BIN" -print -quit 2>/dev/null)" ]]; then
     go build -o "$LOGIN_BIN" ./cmd/login
 fi
 

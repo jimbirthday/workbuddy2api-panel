@@ -814,7 +814,7 @@ http://127.0.0.1:7863/panel/
 
 Docker 镜像内 `scripts/` 目录整目录可用（`COPY scripts/ /app/scripts/`），容器内可直接 `python3 /app/scripts/<name>.py`；`login.sh` / `signin.sh` / `credit.sh` 与二进制同处 `/app`。
 
-二进制不在 git 中：脚本首次使用自动 `go build` 对应 `cmd/*`（`login.sh` → `cmd/login`、`signin.sh` → `cmd/signin`、`credit.sh` → `cmd/credit`；Docker 镜像内已预编译，故不会触发构建）。
+二进制不在 git 中：脚本首次使用自动 `go build` 对应 `cmd/*`（`login.sh` → `cmd/login`、`signin.sh` → `cmd/signin`、`credit.sh` → `cmd/credit`）。源码、`internal/`、`go.mod` 或 `go.sum` 比现有二进制新时也会自动重建，升级后不会继续执行旧的签到/积分/登录逻辑；Docker 镜像内已预编译，故不会触发构建。
 
 ### 探测模型真实输出上限
 

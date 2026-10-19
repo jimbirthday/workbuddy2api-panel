@@ -861,6 +861,17 @@ func TestAggregateMetaOnlyNotSuccess(t *testing.T) {
 	}
 }
 
+// TestAggregateChoiceLessButContentLikeNotSuccess 200 帧里即使出现正文形态，
+// 如果没有非空 choices，也不能由聚合器自行合成 choices 后交付。
+func TestAggregateChoiceLessButContentLikeNotSuccess(t *testing.T) {
+	raw := "data: {\"id\":\"x\",\"content\":\"hello\",\"finish_reason\":\"stop\"}\n\ndata: [DONE]\n\n"
+	if resp, err := Aggregate(strings.NewReader(raw)); err == nil {
+		t.Fatalf("choice-less stream must fail, got %#v", resp)
+	} else if !IsEmptyStreamError(err) {
+		t.Fatalf("err=%v want empty-stream", err)
+	}
+}
+
 // TestStreamEmptyFramesCase 覆盖流式空流检测：0 有效帧时写 error 帧（error 字段存活）,
 // 恰好一个 [DONE]，并返回非 nil error。
 func TestStreamEmptyFramesCase(t *testing.T) {

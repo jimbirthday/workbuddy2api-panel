@@ -68,6 +68,47 @@ func TestReportDesktopEventFingerprint(t *testing.T) {
 	}
 }
 
+// TestReportWebAndMPEventsCarryTenantHeaders 企业身份必须同时出现在事件 body 与
+// 出站头里：body 供上游业务归属，头供网关按租户鉴权。缺失头会在未来复用这些
+// 上报路径时串到个人空间。
+func TestReportWebAndMPEventsCarryTenantHeaders(t *testing.T) {
+	a := &auth.Auth{AccessToken: "at", UID: "u-ent", EnterpriseID: "ent-42"}
+	var webEnt, webTenant, mpEnt, mpTenant string
+	var hits []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits = append(hits, r.Header.Get("X-Client-Product"))
+		// X-Origin 在 Web 事件里等于 webBase，用它区分同路径的 Web/小程序请求。
+		isWeb := r.Header.Get("X-Client-Product") == ""
+		if r.Header.Get("X-Client-Product") == "workbuddy-mp" {
+			mpEnt, mpTenant = r.Header.Get("X-Enterprise-Id"), r.Header.Get("X-Tenant-Id")
+		}
+		if isWeb {
+			webEnt, webTenant = r.Header.Get("X-Enterprise-Id"), r.Header.Get("X-Tenant-Id")
+		}
+		w.Write([]byte(`{"code":0,"msg":"OK"}`))
+	}))
+	defer srv.Close()
+
+	// 两个 method 共用同一路径时，Web 请求没有 X-Client-Product，小程序有。
+	// 若两者都打到同一 srv，用顺序区分更脆弱；这里用 path 前缀区分。
+	c := &Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, WebBaseCN: srv.URL, BillingBaseCN: srv.URL, GlobalEnabled: false}
+	if err := c.ReportWebEvent(a, "library_doc_intro_click", srv.URL+"/library", "el", "文档"); err != nil {
+		t.Fatalf("web event: %v", err)
+	}
+	if err := c.ReportMPEvent(a, map[string]any{"eventCode": "chat_request_send"}); err != nil {
+		t.Fatalf("mp event: %v", err)
+	}
+	if len(hits) != 2 {
+		t.Fatalf("report hits=%v", hits)
+	}
+	if webEnt != "ent-42" || webTenant != "ent-42" {
+		t.Errorf("web headers enterprise=%q tenant=%q", webEnt, webTenant)
+	}
+	if mpEnt != "ent-42" || mpTenant != "ent-42" {
+		t.Errorf("mp headers enterprise=%q tenant=%q", mpEnt, mpTenant)
+	}
+}
+
 // TestDesktopChatSequenceShape 断言完整对话事件链的事件码顺序与关键字段。
 func TestDesktopChatSequenceShape(t *testing.T) {
 	events := DesktopChatSequence("conv-1", "req-1", "msg-1", "fast-model", "fast-model")

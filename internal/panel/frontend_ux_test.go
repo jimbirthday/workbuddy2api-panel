@@ -349,6 +349,7 @@ if (start < 0 || end < 0 || end < start) throw new Error('request metrics region
 const sinks = { reqSummary: { textContent: '', className: '' }, reqNote: { textContent: '', className: '' }, reqCount: { textContent: '', className: '' }, reqBody: { innerHTML: '' } };
 const ctx = {
   $: id => sinks[id] || { textContent: '', className: '', innerHTML: '' },
+  setText: (id, v) => { const el = sinks[id]; if (el) el.textContent = v; },
   fmtTok: v => String(v == null ? 0 : v), fmtMs: v => String(v == null ? 0 : v), fmtBytes: v => String(v),
   reqEntries: [], reqFilter: {}, esc: s => String(s == null ? '' : s),
   requestLogText: () => '', reqOutcomeTag: () => '', reqTokenCell: () => '—', reqCreditCell: () => '—',
@@ -383,8 +384,11 @@ func TestPanelIndexUXMarkup(t *testing.T) {
 		`id="actRange"`,
 		`<a href="#activity" data-view="activity">`,
 		`搜索仅影响列表，导出不含搜索词`,
-		`@media (max-width: 760px)`,
-		`grid-template-areas:`,
+		`@media (max-width: 700px)`,
+		`<header class="topbar"`,
+		// 日志行必须是 flex 列：后置的 display:block 会把时间/级别/频道/正文
+		// 压成一行纯文本，Hub 的终端式分列在本页完全失效。
+		`#logBox .ln { display: flex; align-items: flex-start; gap: 8px;`,
 	} {
 		if !bytes.Contains(b, []byte(needle)) {
 			t.Errorf("index.html missing %q", needle)
@@ -401,7 +405,7 @@ const start = src.indexOf('function perfPct');
 const end = src.indexOf('async function loadPerf');
 if (start < 0 || end < 0 || end < start) throw new Error('perf render region not found');
 const sinks = {};
-const mk = id => (sinks[id] = { innerHTML: '', textContent: '', title: '', hidden: false });
+const mk = id => (sinks[id] = { innerHTML: '', textContent: '', value: '', title: '', hidden: false });
 const ctx = {
   esc: s => String(s == null ? '' : s),
   fmtTok: v => String(v == null ? 0 : v),
@@ -695,6 +699,42 @@ vm.runInContext(src.slice(start, end) + '\nthis.loadCreditHistory=loadCreditHist
 	}
 }
 
+// TestAppJSCreditKindSwitchInvalidatesBoth 扣减/获取共用一张表，切页签时必须
+// 同时作废两类请求；否则迟到响应会在另一页签下覆盖表头与行。
+func TestAppJSCreditKindSwitchInvalidatesBoth(t *testing.T) {
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf("if ($('usCreditKindTabs'))");
+const end = src.indexOf("if ($('usSort'))", start);
+if (start < 0 || end < 0 || end < start) throw new Error('credit kind region not found');
+let spendAborted = false, grantAborted = false, grantLoads = 0, historyLoads = 0;
+const el = () => ({ hidden: false, innerHTML: '', textContent: '' });
+const ctx = {
+  usCreditKind: 'spend', creditHistSeq: 4, creditGrantSeq: 7,
+  creditCtrl: { abort() { spendAborted = true; } },
+  creditGrantCtrl: { abort() { grantAborted = true; } },
+  $: () => el(), document: { querySelectorAll: () => [] },
+  loadCreditGrants: () => { grantLoads++; }, loadCreditHistory: () => { historyLoads++; },
+  setHTML: () => {}, noteUsageDomMismatch: () => {}, setText: () => {},
+  creditSpendStatsHtml: '', creditSpendNote: '',
+};
+vm.createContext(ctx);
+const tabs = { addEventListener(_, fn) { ctx.__fn = fn; } };
+ctx.$ = id => id === 'usCreditKindTabs' ? tabs : el();
+vm.runInContext(src.slice(start, end), ctx);
+ctx.__fn({ target: { closest: () => ({ dataset: { kind: 'grant' } }) }, currentTarget: { querySelector: () => null } });
+process.stdout.write(JSON.stringify({
+  spendAborted, grantAborted, spendSeq: ctx.creditHistSeq, grantSeq: ctx.creditGrantSeq,
+  grantLoads, historyLoads,
+}));`
+	out := runNodeScript(t, "credit-kind-switch", script, appJSPath(t))
+	const want = `{"spendAborted":true,"grantAborted":true,"spendSeq":5,"grantSeq":8,"grantLoads":1,"historyLoads":0}`
+	if out != want {
+		t.Fatalf("credit kind switch=%s\nwant %s", out, want)
+	}
+}
+
 // 新的用量窗口一开始就作废旧分位/流水请求，避免 /usage 未返回时旧子区块先回写。
 func TestAppJSUsageInvalidatesChildRequests(t *testing.T) {
 	script := `const fs = require('fs');
@@ -712,8 +752,9 @@ const ctx = {
   usageSeq: 0, usageCtrl: null, perfSeq: 10, creditHistSeq: 20,
   perfCtrl: {abort() { perfAborted = true; }},
   creditCtrl: {abort() { creditAborted = true; }},
-  $: () => null, esc: s => String(s), fmtTok: v => String(v),
-  loadRemaining: () => {},
+  $: id => id === 'view-usage' ? { hidden: false } : null,
+  esc: s => String(s), fmtTok: v => String(v),
+  loadRemaining: () => {}, noteDOM: () => {}, noteUsageDomMismatch: () => {},
   trangeQuery: () => ({toString: () => 'range=usage'}),
   warmUsageModelRates: () => {},
   api: () => Promise.resolve({}),
@@ -747,9 +788,11 @@ func TestPanelCreditHistoryMarkup(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, needle := range []string{
-		`class="ngrp">监控`,
-		`class="ngrp">运营`,
-		`class="ngrp">系统`,
+		`<ul class="main-nav">`,
+		`id="themeDropdown"`,
+		`data-theme-opt="light"`,
+		`data-theme-opt="dark"`,
+		`data-theme-opt="auto"`,
 		`id="usCreditKindTabs"`,
 		`data-kind="grant" title="本地用量桶无法还原领取流水"`,
 		`data-kind="spend"`,
@@ -757,7 +800,7 @@ func TestPanelCreditHistoryMarkup(t *testing.T) {
 		`<th>粒度</th>`,
 		`每行是一个时间桶（小时或日）内的聚合扣减，不是逐请求账单`,
 		`<details class="us-fold" id="usCreditAgg">`,
-		`grid-template-areas:`,
+		`<ul class="main-nav">`,
 		`.us-credit-hist .acc td::before { content: attr(data-label);`,
 	} {
 		if !bytes.Contains(b, []byte(needle)) {
@@ -849,8 +892,9 @@ let perfCalls = 0, creditCalls = 0, rendered = 0;
 const ctx = {
   usageSeq: 0, usageCtrl: null, perfSeq: 10, creditHistSeq: 20,
   perfCtrl: null, creditCtrl: null,
-  $: () => null, esc: s => String(s), fmtTok: v => String(v),
-  loadRemaining: () => {},
+  $: id => id === 'view-usage' ? { hidden: false } : null,
+  esc: s => String(s), fmtTok: v => String(v),
+  loadRemaining: () => {}, noteDOM: () => {}, noteUsageDomMismatch: () => {},
   view: 'usage',
   trangeQuery: () => ({toString: () => 'range=usage'}),
   warmUsageModelRates: () => {},
@@ -986,6 +1030,36 @@ vm.runInContext(src.slice(start, end) + src.slice(groupStart, groupEnd) + src.sl
 	const want = `{"rendered":true,"button":true}`
 	if out != want {
 		t.Fatalf("first view reattach=%s want %s", out, want)
+	}
+}
+
+// TestAppJSNeverScannedKeepsInitialEmptyState 后端从未扫描时返回 accounts=null；
+// 这不能被渲染成“全部完成”，否则用户首次进入任务中心就误以为今日无待办。
+func TestAppJSNeverScannedKeepsInitialEmptyState(t *testing.T) {
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('function renderScanResult');
+const end = src.indexOf('// setScanProgress', start);
+if (start < 0 || end < 0 || end < start) throw new Error('scan render region not found');
+const empty = { style: {}, textContent: '', querySelector: () => ({ textContent: '' }) };
+let writes = 0;
+const list = { set innerHTML(v) { writes++; }, get innerHTML() { return ''; } };
+const ctx = {
+  $: id => id === 'tcEmpty' ? empty : id === 'qcList' ? list : null,
+  renderQueue: (groups, progress, title, desc) => {
+    if (title) throw new Error('never-scanned must not render a completion title: ' + title);
+  },
+  groupItems: () => { throw new Error('never-scanned must not group accounts'); },
+  setText: () => {}, toast: () => {}, GROWTH_TITLES: {}, Array, Number, String, Object,
+};
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, end) + '\nthis.renderScanResult=renderScanResult;', ctx);
+ctx.renderScanResult({running: false, seq: 0, accounts: null, pending_count: 0, error_count: 0});
+process.stdout.write(JSON.stringify({ok: true, writes}));`
+	out := runNodeScript(t, "scan-never-ran", script, appJSPath(t))
+	if out != `{"ok":true,"writes":0}` {
+		t.Fatalf("never scanned render=%s", out)
 	}
 }
 
@@ -1142,6 +1216,7 @@ const ctx = {
   logsReq: false, logSig: '', logPin: true, logCh: 'all',
   api: path => { if (String(path) === 'logs') calls++; return String(path) === 'logs' ? pending : Promise.resolve({archive: {enabled: false}, entries: []}); },
   $: id => id === 'logBox' ? box : sink(),
+  setText: () => {}, noteDOM: () => {},
   trangeQuery: () => ({set() {}, toString: () => ''}),
   renderRequestMetrics: () => {}, lastLogMetrics: null, lastLogRows: {entries: []}, lastLogErrors: {},
   esc: s => String(s), Promise, Array, Object, String,
@@ -1214,6 +1289,7 @@ const entry = e => { if (String(e) === 'logs') return Promise.resolve({entries: 
 const ctx = {
   logsReq: false, logSig: '', logPin: true, logCh: 'all',
   api: entry, $: id => id === 'logBox' ? box : sink(),
+  setText: () => {}, noteDOM: () => {},
   trangeQuery: () => ({set() {}, toString: () => ''}),
   renderRequestMetrics: () => {}, lastLogMetrics: null, lastLogRows: {entries: []}, lastLogErrors: {},
   esc: s => String(s), fmtLogTime: s => String(s), document: { getElementById: () => null }, Promise, Array, Object, String, Number,
@@ -1231,6 +1307,86 @@ vm.runInContext(src.slice(start, end) + '\nthis.loadLogs=loadLogs;', ctx);
 	const want = `{"first":1,"total":1,"scroll":10}`
 	if out != want {
 		t.Fatalf("logs identical render=%s want %s", out, want)
+	}
+}
+
+// TestAppJSLogsFilteredSummaryDoesNotThrow 日志页启用频道/级别/关键字筛选时，
+// 汇总行曾引用请求指标区块的局部变量 entries，触发 ReferenceError 并让整页
+// 日志停摆。筛选后必须只使用当前日志窗口内可见的计数。
+func TestAppJSLogsFilteredSummaryDoesNotThrow(t *testing.T) {
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('async function loadLogs');
+const end = src.indexOf('function renderRequestMetrics', start);
+if (start < 0 || end < 0) throw new Error('loadLogs not found');
+const box = {scrollTop: 0, clientHeight: 0, scrollHeight: 0, innerHTML: ''};
+let note = '';
+const sink = id => {
+  if (id === 'logNote') return {set textContent(v) { note = v; }, get textContent() { return note; }};
+  return {textContent: '', className: '', value: '100', hidden: false};
+};
+const entries = [
+  {ts: '2026-01-01T00:00:00Z', ch: 'task', text: 'one'},
+  {ts: '2026-01-01T00:00:01Z', ch: 'task', text: 'two'},
+  {ts: '2026-01-01T00:00:02Z', ch: 'sys', text: 'three'},
+];
+const api = path => {
+  const p = String(path);
+  if (p === 'logs') return Promise.resolve({entries});
+  if (p === 'request_metrics') return Promise.resolve({archive: {enabled: false}, recent: []});
+  return Promise.resolve({entries: []});
+};
+const ctx = {
+  logsReq: false, logSig: '', logPin: true, logCh: 'task', logLevel: '', logQ: '',
+  api, $: id => id === 'logBox' ? box : sink(id),
+  setText: (id, v) => { if (id === 'logNote') note = v; }, noteDOM: () => {},
+  trangeQuery: () => ({set() {}, toString: () => ''}),
+  renderRequestMetrics: () => {}, lastLogMetrics: null, lastLogRows: {entries: []}, lastLogErrors: {},
+  logRenderHTML: (all, ch) => ({html: '', count: all.filter(e => e.ch === ch).length}),
+  esc: s => String(s), fmtLogTime: s => String(s), Promise, Array, Object, String, Number,
+};
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, end) + '\nthis.loadLogs=loadLogs;', ctx);
+(async () => {
+  let err = '';
+  try { await ctx.loadLogs(); } catch (e) { err = String(e && e.message); }
+  process.stdout.write(JSON.stringify({err, note}));
+})();`
+	out := runNodeScript(t, "logs-filtered-summary", script, appJSPath(t))
+	const want = `{"err":"","note":"2 行 / 共 3 行"}`
+	if out != want {
+		t.Fatalf("logs filtered summary=%s want %s", out, want)
+	}
+}
+
+// TestAppJSBulkActionRestoresButtonOnError 批量启停失败后必须解除 disabled；
+// 否则一次网络错误会让工具栏按钮在整页生命周期内都无法再次点击。
+func TestAppJSBulkActionRestoresButtonOnError(t *testing.T) {
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('async function accSelectedAction');
+const end = src.indexOf("if ($('btnSelEnable'))", start);
+if (start < 0 || end < 0) throw new Error('accSelectedAction not found');
+const btn = {textContent: '禁用', disabled: false};
+const ctx = {
+  accSelected: new Set(['u1']), toast: () => {}, confirm: () => true,
+  api: () => Promise.reject(new Error('network down')),
+  $: id => id === 'btnSelDisable' ? btn : null,
+  invalidatePackagesCache: () => {}, loadOverview: () => {},
+  Promise, Array, Set, Object, String, Error,
+};
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, end) + '\nthis.run=accSelectedAction;', ctx);
+(async () => {
+  await ctx.run('disable');
+  process.stdout.write(JSON.stringify({disabled: btn.disabled, label: btn.textContent}));
+})();`
+	out := runNodeScript(t, "bulk-action-button-restore", script, appJSPath(t))
+	const want = `{"disabled":false,"label":"禁用"}`
+	if out != want {
+		t.Fatalf("bulk action button=%s want %s", out, want)
 	}
 }
 
@@ -1468,7 +1624,7 @@ ctx.renderConnect({
     placeholder: all.includes('$WB_API_KEY'),
     noSecret: !all.includes('admin-super-secret') && !all.includes('client-secret'),
     note: sinks.cxNote.textContent.includes('客户端需要 API Key'),
-    models: sinks.cxModels.innerHTML.includes('cn:glm-5.3') && sinks.cxModels.innerHTML.includes('global:kimi-k3'),
+    models: sinks.cxModels.value.includes('cn:glm-5.3') && sinks.cxModels.value.includes('global:kimi-k3'),
     messages: sinks.cxAnthropicMessages.textContent.includes('/v1/messages'),
   }));
 })();`
@@ -1476,6 +1632,54 @@ ctx.renderConnect({
 	const want = `{"copied":2,"placeholder":true,"noSecret":true,"note":true,"models":true,"messages":true}`
 	if out != want {
 		t.Fatalf("connect copy=%s\nwant %s", out, want)
+	}
+}
+
+// 升级后的旧 index.html 可能没有用量页节点：loadUsage 的入口与失败分支都必须
+// 静默退化，不能对 null 写 innerHTML（线上 app.js:2706 的未处理异常）。
+// 这里用最小 DOM 桩覆盖“api 拒绝”的最坏路径，断言不抛异常且只提示一次版本错配。
+func TestAppJSLoadUsageMissingDOMDoesNotThrow(t *testing.T) {
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('function domVersionTip()');
+const end = src.indexOf('/* ── 活动记录', start);
+if (start < 0 || end < 0) throw new Error('usage region not found');
+let tip = '', toasts = 0, aborts = 0;
+const ctx = {
+  $: id => null,
+  document: { querySelector: () => null, createElement: () => ({ setAttribute(){}, className:'' }) },
+  toast: () => { toasts++; },
+  api: async () => { throw new Error('boom'); },
+  usageSeq: 0, usageCtrl: null, perfSeq: 0, creditHistSeq: 0,
+  perfCtrl: null, creditCtrl: null, creditGrantSeq: 0, creditGrantCtrl: null,
+  view: 'usage', usRange: null, usDim: 'account', usSort: 'requests', usDimPage: 1,
+  usDimPageSize: 20, usCreditDim: 'account', usCreditKind: 'spend',
+  usQTimer: null, usageData: null, US_DIMS: { account: { key: 'by_account', span: 7 } },
+  setHTML(id, html) { tip += '|set:' + id; return false; },
+  setText() { return false; },
+  noteDOM(id) { tip += '|dom:' + id; },
+  noteUsageDomMismatch(id) { tip += '|usage:' + id; },
+  isAbortError: () => false,
+  trangeQuery: () => ({ toString: () => 'range=7d' }),
+  trangeLabel: () => '近 7 天',
+  esc: s => String(s == null ? '' : s), Array, String, Number, Math, Object, Promise,
+};
+vm.createContext(ctx);
+const exposed = '\nthis.loadUsage=loadUsage;this.noteDOM=noteDOM;this.noteUsageDomMismatch=noteUsageDomMismatch;this.renderUsage=renderUsage;';
+vm.runInContext(src.slice(start, end) + exposed, ctx);
+(async () => {
+  // 无 #view-usage/#usChart/#usError/#usNote：入口只需提示一次并返回，不发请求。
+  await ctx.loadUsage();
+  ctx.$ = () => null;
+  ctx.document.querySelector = () => null;
+  let threw = false;
+  try { ctx.renderUsage({ totals: { requests: 1 } }); } catch (e) { threw = true; }
+  process.stdout.write(JSON.stringify({ tip: ctx.noteDOM.shown === true, threw, toasts }));
+})().catch(e => { console.error(e && e.stack || e); process.exit(1); });`
+	out := runNodeScript(t, "usage-missing-dom", script, appJSPath(t))
+	if out != `{"tip":true,"threw":false,"toasts":0}` {
+		t.Fatalf("loadUsage missing dom=%s", out)
 	}
 }
 
@@ -1571,7 +1775,7 @@ func TestAppJSConfigFind(t *testing.T) {
 const vm = require('vm');
 const src = fs.readFileSync(process.argv[2], 'utf8');
 const start = src.indexOf('function cfgFindNode');
-const end = src.indexOf('$(\'btnEye\')', start);
+const end = src.indexOf('if ($(\'btnEye\'))', start);
 if (start < 0 || end < 0) throw new Error('config find region not found');
 const mk = text => ({
   textContent: text, classes: new Set(),
@@ -1610,6 +1814,7 @@ func TestPanelConnectAndRemainingMarkup(t *testing.T) {
 	}
 	html := string(b)
 	for _, needle := range []string{
+		`<aside class="page-sidebar" id="pageSidebar" hidden>`,
 		`<nav class="secnav" id="secNav" aria-label="页内区块导航" hidden></nav>`,
 		`<a href="#connect" data-view="connect">`,
 		`<section class="view" id="view-connect" hidden>`,
@@ -1618,8 +1823,8 @@ func TestPanelConnectAndRemainingMarkup(t *testing.T) {
 		`data-copy-el="cxV1"`, `data-copy-el="cxCurl"`, `data-copy-el="cxResponses"`,
 		`id="remBox"`, `id="remTabs"`, `id="remQ"`, `id="remSummary"`,
 		`id="remEmpty"`, `id="remTable"`, `id="remBody"`,
-		`.secnav { position: sticky;`,
-		`@media (max-width: 760px)`,
+		`.page-sidebar { position: fixed;`,
+		`@media (max-width: 860px)`,
 		`限额为 0 表示该维度未启用`,
 	} {
 		if !strings.Contains(html, needle) {
@@ -1634,6 +1839,8 @@ func TestPanelConnectAndRemainingMarkup(t *testing.T) {
 			t.Errorf("missing nav item %s", view)
 		}
 	}
+	// index.html 是 go:embed 源文件，版本查询串由 index.go 在服务端注入；
+	// 源文件必须保持无内联脚本的外链形态，否则 CSP 与 ETag 用例会失效。
 	if !strings.Contains(html, `<script src="app.js"></script>`) {
 		// CSP 实际在 index.go；这里只防止误把脚本改成内联。
 		t.Error("panel must load app.js as an external same-origin script")
@@ -1709,7 +1916,7 @@ let connectCalls = 0, usageCalls = 0, setup = [];
 const ctx = {
   TITLES: { accounts: '账号池', usage: '用量与积分', connect: '接入' },
   view: 'accounts',
-  $: id => id === 'ttl' ? { textContent: '' } : null,
+  $: id => id === 'navSub' || id === 'ttl' ? { textContent: '' } : null,
   document: {
     querySelectorAll: sel => sel === '.view' ? [] : sel === '.nav a' ? [] : [],
     getElementById: () => null,
@@ -1741,7 +1948,8 @@ const start = src.indexOf('async function loadOverview');
 const end = src.indexOf('/* checkAuthGate', start);
 if (start < 0 || end < 0) throw new Error('overview region not found');
 const els = {};
-const sink = id => (els[id] || (els[id] = { textContent: '', className: '', innerHTML: '' }));
+const sink = id => (els[id] || (els[id] = { textContent: '', className: '', innerHTML: '', title: '',
+  classList: { toggle() {} }, setAttribute(k, v) { this[k] = v; } }));
 let requests = [], renders = 0;
 const first = { total: 1, healthy: 1, cooling: 0, disabled: 0, paused: 0, accounts: [{ uid: 'u1' }], model_locks: [], sticky_sessions: 0, version: 't', redis_mode: 'noop', uptime_sec: 120 };
 const responses = [
@@ -1751,12 +1959,15 @@ const responses = [
 const ctx = {
   Date, Number, Math, String, JSON, Promise,
   $: id => sink(id),
+  setText: (id, v) => { sink(id).textContent = v; },
   authHeaders: () => ({ Authorization: 'Bearer k' }),
   openKey: () => { throw new Error('unexpected 401'); },
   toast: () => {},
   renderAccounts: rows => { renders++; ctx.rendered = rows.length; },
   renderModelLocks: () => {},
   renderExpirySnapshot: () => {},
+  renderUptime: () => {},
+  noteDOM: () => {},
   overviewData: null, overviewETag: '', overviewFetchedAt: 0, lastUptimeSec: 0,
   overviewInFlight: false, overviewPending: false, overviewSeq: 0,
   fetch: (url, opts) => {
@@ -1803,6 +2014,7 @@ const ctx = {
     return new Promise(resolve => { archiveRounds.push(resolve); });
   },
   $: id => id === 'logBox' ? box : sink(),
+  setText: () => {}, noteDOM: () => {},
   trangeQuery: () => ({set() {}, toString: () => 'limit=100'}),
   renderRequestMetrics: (m, entries, rowsChanged) => { if (rowsChanged !== undefined) calls.push(rowsChanged); },
   lastLogMetrics: null, get lastLogRows() { return ctx.lastRows || {entries: []}; }, set lastLogRows(v) { ctx.lastRows = v; }, lastLogErrors: {},
@@ -2021,11 +2233,483 @@ func TestIndexMobileNavBeforeMain(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	css := string(raw)
-	if !strings.Contains(css, `grid-template-areas: "nav" "main"`) {
-		t.Fatal("mobile layout must place nav before main")
+	html := string(raw)
+	headerAt := strings.Index(html, `<header class="topbar"`)
+	navAt := strings.Index(html, `<nav class="nav"`)
+	mainAt := strings.Index(html, `<div class="shell">`)
+	if headerAt < 0 || navAt < 0 || mainAt < 0 {
+		t.Fatalf("missing topbar/nav/main skeleton: header=%d nav=%d main=%d", headerAt, navAt, mainAt)
 	}
-	if strings.Contains(css, `grid-template-areas: "main" "nav"`) {
-		t.Fatal("mobile layout still places main before nav")
+	if !(headerAt < navAt && navAt < mainAt) {
+		t.Fatal("navigation must live in the topbar before the main shell")
+	}
+	if !strings.Contains(html, `.topbar > .nav { order:3;`) {
+		t.Fatal("mobile topbar must give the nav its own full-width row")
+	}
+}
+
+// TestIndexResponsiveHeaderContract 钉住 Hub 风格的响应式契约：中间宽度导航
+// 独占一行并可横向滑动，避免 9 个入口的 min-content 把页面撑出横向滚动；
+// 超窄屏把“添加账号”收成图标，积分卡保留完整值而不是省略号。
+func TestIndexResponsiveHeaderContract(t *testing.T) {
+	raw, err := os.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(raw)
+	for _, want := range []string{
+		`@media (max-width: 1180px)`,
+		`.topbar > .nav { order:3; flex:1 1 100%; width:100%; min-width:0; max-width:100%; margin:0; overflow:hidden; }`,
+		`@media (max-width: 700px)`,
+		`@media (max-width: 430px)`,
+		`#btnAdd::before`,
+		`.page-sidebar { position: relative; top: auto;`,
+		`display:flex; flex-direction:row; flex-wrap:nowrap; align-items:center; gap:6px;`,
+		`.box > header h3 { white-space: normal; min-width: 0; overflow-wrap: anywhere; }`,
+		`.box > header h3 .hint { white-space: normal; }`,
+		`.tbl-wrap { overflow-x: auto; max-width: 100%; min-width: 0; }`,
+		`#sCredits { white-space:normal;`,
+		`id="sCredits" title=`,
+	} {
+		if !strings.Contains(html, want) {
+			t.Errorf("responsive header contract missing %q", want)
+		}
+	}
+	// 431–700px 区间也要把“添加账号”收成图标，否则品牌行会被文字按钮挤满。
+	phoneAt := strings.Index(html, `@media (max-width: 700px)`)
+	addAt := strings.Index(html, `#btnAdd { width:34px; height:34px;`)
+	narrowAt := strings.Index(html, `@media (max-width: 430px)`)
+	if phoneAt < 0 || addAt < phoneAt || addAt > narrowAt || narrowAt < 0 {
+		t.Errorf("btnAdd must collapse during the 700px phone breakpoint, not only at 430px")
+	}
+}
+
+// TestAppJSOpenTasksMissingSkeleton 旧 index.html 没有任务弹窗时，点“任务”
+// 不能继续 loadTasks 后对空表格写 innerHTML；应只提示页面版本不一致。
+func TestAppJSOpenTasksMissingSkeleton(t *testing.T) {
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('let taskUID = null;');
+const end = src.indexOf('// 账号设置弹窗', start);
+if (start < 0 || end < start) throw new Error('openTasks region not found');
+let domTips = 0, loaded = 0;
+const ctx = {
+  $: () => null,
+  setText: () => false,
+  showModal: () => { throw new Error('must not open a missing modal'); },
+  hideModal: () => {},
+  noteDOM: id => { domTips++; ctx.missing = id; },
+  loadTasks: () => { loaded++; },
+  console,
+};
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, end) + '\nthis.openTasks = openTasks;', ctx);
+ctx.openTasks('u1', {enterprise: false});
+process.stdout.write(JSON.stringify({tips: domTips, loaded, missing: ctx.missing || ''}));`
+	out := runNodeScript(t, "open-tasks-missing", script, appJSPath(t))
+	if out != `{"tips":1,"loaded":0,"missing":"taskVeil"}` {
+		t.Fatalf("openTasks with missing skeleton=%s", out)
+	}
+}
+
+// TestAppJSUsageOptionalBlocksMissing 线上报错 "Cannot set properties of null
+// (setting 'innerHTML') at loadUsage" 的直接回归：升级后 index.html 已经不再
+// 渲染旧版用量页的部分区块（usStats / usDimHead / usCreditStats 等），但同版本
+// 的 app.js 仍按固定契约无条件写入。这里用「所有用量 DOM 都不存在」的最坏桩跑
+// 完整 loadUsage，要求它既不抛 TypeError，也能把失败状态落在仍存在的 #usChart。
+func TestAppJSUsageOptionalBlocksMissing(t *testing.T) {
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('function setHTML');
+const loadStart = src.indexOf('async function loadUsage');
+const end = src.indexOf('/* ── 活动记录', loadStart);
+if (start < 0 || loadStart < 0 || end < loadStart) throw new Error('usage region not found');
+const writes = {};
+const els = {};
+const mk = id => (els[id] || (els[id] = {innerHTML: '', textContent: '', hidden: false}));
+const $ = id => {
+  // Reproduce the upgraded page with a global error-returning /usage and no
+  // legacy usage blocks at all, except the chart the current page still has.
+  if (id === 'usChart') return mk(id);
+  return null;
+};
+const ctx = {
+  usageSeq: 0, usageCtrl: null, perfSeq: 0, creditHistSeq: 0,
+  perfCtrl: null, creditCtrl: null, creditGrantCtrl: null,
+  view: 'usage', usCreditKind: 'spend', usDim: 'account', usCreditDim: 'account',
+  $, esc: s => String(s == null ? '' : s),
+  trangeQuery: () => ({toString: () => 'range=usage'}),
+  api: () => Promise.reject(new Error('usage unavailable')),
+  renderUsage: () => { throw new Error('renderUsage must not run on failure'); },
+  loadRemaining: () => {}, loadPerf: () => {}, loadCreditHistory: () => {},
+  warmUsageModelRates: () => {}, AbortController: undefined,
+  US_DIM_TABS: [['account', '按账号']],
+  usTabsHtml: () => '',
+};
+vm.createContext(ctx);
+const abortStart = src.indexOf('function isAbortError');
+const abortEnd = src.indexOf('function toast', abortStart);
+if (abortStart < 0 || abortEnd < abortStart) throw new Error('isAbortError not found');
+vm.runInContext(src.slice(abortStart, abortEnd) + src.slice(start, src.indexOf('const US_DIM_TABS')) + src.slice(loadStart, end) +
+  '\nthis.loadUsage = loadUsage;', ctx);
+(async () => {
+  let threw = '';
+  try { await ctx.loadUsage(); } catch (e) { threw = String(e && e.message); }
+  process.stdout.write(JSON.stringify({threw, chart: els.usChart ? els.usChart.innerHTML : ''}));
+})();`
+	out := runNodeScript(t, "usage-missing-blocks", script, appJSPath(t))
+	const want = `{"threw":"","chart":"<div class=\"us-empty\">读取用量失败：usage unavailable</div>"}`
+	if out != want {
+		t.Fatalf("usage with missing blocks=%s\nwant %s", out, want)
+	}
+}
+
+// TestAppJSUsageButtonWithoutBlocks 线上更常见的错配不是“缺图表”，而是旧页面
+// 仍给了入口按钮、但用量区块已经被新版脚本改名/移除。此时 loadUsage 必须：
+//  1. 被调用时不抛 TypeError（按钮仍可点）；
+//  2. 不因缺少 usChart/usError 而静默丢失错误；
+//  3. 落一条“页面版本与脚本不一致”的可操作提示。
+func TestAppJSUsageButtonWithoutBlocks(t *testing.T) {
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('function setHTML');
+const loadStart = src.indexOf('async function loadUsage');
+const end = src.indexOf('/* ── 活动记录', loadStart);
+if (start < 0 || loadStart < 0 || end < loadStart) throw new Error('usage region not found');
+const writes = [];
+const tipHost = { parentNode: { insertBefore: (el) => writes.push({cls: el.className, text: el.textContent}) }, textContent: '' };
+const els = {viewusage: tipHost};
+const $ = id => {
+  if (id === 'view-usage') return tipHost;
+  return null;
+};
+const ctx = {
+  usageSeq: 0, usageCtrl: null, perfSeq: 0, creditHistSeq: 0,
+  perfCtrl: null, creditCtrl: null, creditGrantCtrl: null,
+  view: 'usage', usCreditKind: 'spend', usDim: 'account', usCreditDim: 'account',
+  $, esc: s => String(s == null ? '' : s),
+  trangeQuery: () => ({toString: () => 'range=usage'}),
+  api: () => Promise.reject(new Error('usage unavailable')),
+  renderUsage: () => { throw new Error('renderUsage must not run on failure'); },
+  loadRemaining: () => {}, loadPerf: () => {}, loadCreditHistory: () => {}, loadCreditGrants: () => {},
+  warmUsageModelRates: () => {}, AbortController: undefined,
+  document: {createElement: () => ({className: '', textContent: '', setAttribute(k,v){this[k]=v;}})},
+  US_DIM_TABS: [['account', '按账号']],
+  usTabsHtml: () => '',
+};
+vm.createContext(ctx);
+const abortStart = src.indexOf('function isAbortError');
+const abortEnd = src.indexOf('function toast', abortStart);
+if (abortStart < 0 || abortEnd < abortStart) throw new Error('isAbortError not found');
+vm.runInContext(src.slice(abortStart, abortEnd) + src.slice(start, src.indexOf('const US_DIM_TABS')) + src.slice(loadStart, end) +
+  '\nthis.loadUsage = loadUsage;', ctx);
+(async () => {
+  let threw = '';
+  try { await ctx.loadUsage(); } catch (e) { threw = String(e && e.message); }
+  process.stdout.write(JSON.stringify({threw, writes}));
+})();`
+	out := runNodeScript(t, "usage-button-missing-blocks", script, appJSPath(t))
+	if !strings.Contains(out, `"threw":""`) {
+		t.Fatalf("loadUsage must not throw when optional blocks are missing: %s", out)
+	}
+	if !strings.Contains(out, "页面版本与脚本不一致") {
+		t.Fatalf("missing DOM must surface a version-mismatch hint, got %s", out)
+	}
+}
+
+// TestAppJSMissingDOMNoticeSurvivesOptionalBlock 旧骨架常同时缺多个节点：
+// 入口（view-usage）先提示一次版本错配，随后可选块探测不能把这条可操作
+// 提示覆盖成第二条同义告警，也不能让它变成“只剩第一条可选块”。此前
+// noteDOM.shown 是全局一次标记，后到的关键缺块会被永久吞掉。
+func TestAppJSMissingDOMNoticeSurvivesOptionalBlock(t *testing.T) {
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('function domVersionTip()');
+const end = src.indexOf('const US_DIM_TABS', start);
+if (start < 0 || end < 0) throw new Error('dom guard region not found');
+const inserted = [];
+const setAttr = (el, k, v) => { el[k] = v; };
+const view = {
+  id: 'view-usage', hidden: false,
+  prepend(el) { inserted.push(String(el.textContent)); },
+};
+const ctx = {
+  $: id => id === 'view-usage' ? view : null,
+  toast: msg => inserted.push('toast:' + msg),
+  document: {
+    querySelector: sel => sel === '.view:not([hidden])' ? view : null,
+    createElement: () => ({ className: '', textContent: '', setAttribute(k, v) { setAttr(this, k, v); } }),
+  },
+};
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, end) + '\nthis.noteDOM=noteDOM;this.noteUsageDomMismatch=noteUsageDomMismatch;', ctx);
+// 真实入口先由 loadUsage 的 noteDOM 报版本错配；随后用量页可选块探测
+// 不能再把这条提示覆盖掉或吞掉。
+ctx.noteDOM('view-usage');
+ctx.noteUsageDomMismatch('usNote');
+ctx.noteDOM('accBody');
+process.stdout.write(JSON.stringify({inserted, shown: ctx.noteDOM.shown === true}));`
+	out := runNodeScript(t, "dom-notice-multiple", script, appJSPath(t))
+	var got struct {
+		Inserted []string `json:"inserted"`
+		Shown    bool     `json:"shown"`
+	}
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("bad output: %v\n%s", err, out)
+	}
+	if !got.Shown {
+		t.Fatalf("noteDOM.shown must be set: %s", out)
+	}
+	joined := strings.Join(got.Inserted, "\n")
+	if !strings.Contains(joined, "view-usage") || len(got.Inserted) != 1 {
+		t.Fatalf("entry notice must survive optional-block probe, got %s", out)
+	}
+}
+
+// TestAppJSUsageAbortDoesNotClearTables 快速切时间范围时旧请求会被取消；取消
+// 是“结果过期”，不是“读取失败”。若把 AbortError 当失败，loadUsage 会先清空
+// 刚渲染的新表，再写一条失败横幅——用户看到的就是“刷新把数据刷没了”。
+func TestAppJSUsageAbortDoesNotClearTables(t *testing.T) {
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('function setHTML');
+const loadStart = src.indexOf('async function loadUsage');
+const end = src.indexOf('/* ── 活动记录', loadStart);
+if (start < 0 || loadStart < 0 || end < loadStart) throw new Error('usage region not found');
+const writes = [];
+const els = {};
+const mk = id => (els[id] || (els[id] = {id, innerHTML: 'keep', textContent: 'keep', hidden: false,
+  set innerHTML(v) { this._html = v; writes.push([id, 'innerHTML', v]); }, get innerHTML() { return this._html || 'keep'; }}));
+['usError','usChart','usStats','usDimTabs','usDimHead','usDimBody','usCreditTabs','usCreditHead','usCreditBody','usCreditStats','usNote','usCreditNote','usDimNote','usChartNote'].forEach(mk);
+const ctx = {
+  usageSeq: 0, usageCtrl: null, perfSeq: 0, creditHistSeq: 0,
+  perfCtrl: null, creditCtrl: null, creditGrantCtrl: null,
+  view: 'usage', usCreditKind: 'spend', usDim: 'account', usCreditDim: 'account',
+  $: id => ['usError','usChart','usStats','usDimTabs','usDimHead','usDimBody','usCreditTabs','usCreditHead','usCreditBody','usCreditStats','usNote','usCreditNote','usDimNote','usChartNote'].includes(id) ? mk(id) : null,
+  esc: s => String(s == null ? '' : s),
+  trangeQuery: () => ({toString: () => 'range=usage'}),
+  api: () => Promise.reject(Object.assign(new Error('aborted'), {name: 'AbortError'})),
+  renderUsage: () => { throw new Error('renderUsage must not run on abort'); },
+  loadRemaining: () => {}, loadPerf: () => {}, loadCreditHistory: () => {},
+  warmUsageModelRates: () => {}, AbortController: undefined,
+  US_DIM_TABS: [['account', '按账号']],
+  usTabsHtml: () => '<button>tab</button>',
+  usageData: {totals: {requests: 1}},
+};
+vm.createContext(ctx);
+const abortStart = src.indexOf('function isAbortError');
+const abortEnd = src.indexOf('function toast', abortStart);
+if (abortStart < 0 || abortEnd < abortStart) throw new Error('isAbortError not found');
+vm.runInContext(src.slice(abortStart, abortEnd) + src.slice(start, src.indexOf('const US_DIM_TABS')) + src.slice(loadStart, end) +
+  '\nthis.loadUsage = loadUsage;', ctx);
+(async () => {
+  let threw = '';
+  try { await ctx.loadUsage(); } catch (e) { threw = String(e && e.message); }
+  process.stdout.write(JSON.stringify({threw, writes, kept: els.usDimBody.innerHTML}));
+})();`
+	out := runNodeScript(t, "usage-abort-no-clear", script, appJSPath(t))
+	if !strings.Contains(out, `"threw":""`) {
+		t.Fatalf("aborted usage request must not throw: %s", out)
+	}
+	if !strings.Contains(out, `"kept":"keep"`) || !strings.Contains(out, `"writes":[]`) {
+		t.Fatalf("aborted usage request must not clear rendered tables: %s", out)
+	}
+}
+
+// TestIndexHasHubCapsuleNav 导航可以换外观，但必须仍是 .nav a[data-view]；
+// 移动端导航顺序与「nav 在前」的红线也由同一条测试守住。
+func TestIndexHasHubCapsuleNav(t *testing.T) {
+	raw, err := os.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(raw)
+	for _, needle := range []string{
+		`<header class="topbar"`,
+		`class="header-left"`,
+		`class="header-right"`,
+		`<ul class="main-nav">`,
+		`.main-nav { display:inline-flex`,
+		`.main-nav a.on, .main-nav a[aria-current="page"] { background:var(--surface)`,
+	} {
+		if !strings.Contains(html, needle) {
+			t.Errorf("index.html missing Hub nav rule %q", needle)
+		}
+	}
+	for _, view := range []string{"accounts", "taskscenter", "models", "activity", "packages", "usage", "connect", "config", "logs"} {
+		if !strings.Contains(html, `data-view="`+view+`"`) {
+			t.Errorf("missing nav item %s", view)
+		}
+	}
+}
+
+// TestIndexHasHubViewHeads 每个主视图都应有 Hub 风格标题 + 说明；
+// 只换色板而正文直接进入表格，会让长页面失去定位。
+func TestIndexHasHubViewHeads(t *testing.T) {
+	raw, err := os.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(raw)
+	for _, view := range []string{"accounts", "taskscenter", "activity", "models", "packages", "usage", "connect", "config", "logs"} {
+		section := `<section class="view" id="view-` + view + `"`
+		i := strings.Index(html, section)
+		if i < 0 {
+			t.Errorf("missing view %s", view)
+			continue
+		}
+		next := strings.Index(html[i+len(section):], `<section class="view"`)
+		chunk := html[i:]
+		if next >= 0 {
+			chunk = html[i : i+len(section)+next]
+		}
+		if !strings.Contains(chunk, `class="view-head"`) || !strings.Contains(chunk, `<h2>`) {
+			t.Errorf("view %s missing Hub-style view-head h2", view)
+		}
+	}
+}
+
+// TestAppJSUsagePartialDomDoesNotThrow 升级时最常见的错配是“旧骨架还留着部分
+// 用量节点”：入口存在、图表/统计/明细/流水其中一块缺失。loadUsage 成功后
+// 会一路调用 renderUsage → renderUsageDim/renderCreditDim/renderUsageChart，
+// 再并发 loadPerf/loadCreditHistory/loadCreditGrants/loadRemaining；任何一处
+// 的 `$('id').innerHTML` 都不能把整条链炸成未处理 Promise 拒绝。
+//
+// 这里用最小 DOM 桩遍历四种缺块形态，断言：
+//  1. loadUsage 不抛；
+//  2. 缺失块只提示一次可操作版本信息；
+//  3. 其余仍存在的块照常渲染，不因一个可选块缺失而整页空白。
+func TestAppJSUsagePartialDomDoesNotThrow(t *testing.T) {
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('function perfPct');
+const end = src.indexOf('/* ── 活动记录', start);
+if (start < 0 || end < 0) throw new Error('usage render region not found');
+const cases = [
+  {name: 'all-missing', drop: ['view-usage','usChart','usError','usNote','usStats','usDimHead','usDimBody','usCreditHead','usCreditBody','usCreditStats','usCreditTabs']},
+  {name: 'chart-missing', drop: ['usChart'], keepView: true},
+  {name: 'dim-head-missing', drop: ['usDimHead'], keepView: true},
+  {name: 'dim-body-missing', drop: ['usDimBody'], keepView: true},
+  {name: 'credit-head-missing', drop: ['usCreditHead'], keepView: true},
+  {name: 'credit-body-missing', drop: ['usCreditBody'], keepView: true},
+  {name: 'credit-stats-missing', drop: ['usCreditStats'], keepView: true},
+  {name: 'failure-chart-missing', drop: ['usChart','usError'], keepView: true, fail: true},
+];
+function runCase(c) {
+  const drop = new Set(c.drop);
+  const els = {};
+  const mk = id => (els[id] || (els[id] = {id, innerHTML: '', textContent: '', title: '', hidden: false, disabled: false, value: id === 'usDimSize' ? '20' : '',
+    getAttribute(){ return null; }, attrs: {},
+    addEventListener(){}, setAttribute(k,v){this.attrs[k]=v;}, removeAttribute(k){delete this.attrs[k];}}));
+  const $ = id => drop.has(id) ? null : mk(id);
+  const tips = [];
+  const ctx = {
+    usageSeq: 0, usageCtrl: null, perfSeq: 0, creditHistSeq: 0,
+    perfCtrl: null, creditCtrl: null, creditGrantSeq: 0, creditGrantCtrl: null,
+    view: 'usage', usCreditKind: 'spend', usDim: 'account', usCreditDim: 'account',
+    usQTimer: null, usageData: null, US_DIMS: {account: {key:'by_account', title:'账号', withRealm:true, withPerf:true, span:10}},
+    usDimPage: 1, usDimPageSize: 20, usSort: 'total',
+    $,
+    document: {
+      querySelector: sel => sel === '#view-usage' && !drop.has('view-usage') ? mk('view-usage') : null,
+      querySelectorAll: () => [],
+      createElement: () => ({className:'', textContent:'', setAttribute(){}}),
+    },
+    esc: s => String(s == null ? '' : s),
+    fmtTok: v => String(v == null ? 0 : v),
+    fmtMs: v => String(v == null ? 0 : v),
+    fmtRate: v => String(v == null ? 0 : v),
+    fmtCredit: v => String(v == null ? 0 : v),
+    fmtCreditRatio: () => '—',
+    fmtModelRate: () => '—',
+    cacheRateCell: () => '—',
+    cacheRateText: () => '—',
+    usPct: () => '—',
+    usKpi: (v,k) => '<div>' + k + ':' + v + '</div>',
+    usMixBar: () => '',
+    usRow: () => '<tr><td>row</td></tr>',
+    usTabsHtml: () => '<button>tab</button>',
+    usDimHead: () => '<tr><th>head</th></tr>',
+    usCreditHead: () => '<tr><th>head</th></tr>',
+    noteUsageDomMismatch(id) { tips.push('usage:' + id); },
+    perfPct: () => ({p50:'—',p90:'—',p99:'—',max:'—'}),
+    trangeLabel: () => '近 7 天',
+    trangeQuery: () => ({toString: () => 'hours=72'}),
+    trangeBind: () => {},
+    perfQueryFromUsage: () => ({toString: () => 'hours=72'}),
+    setHTML(id, html) { const el = $(id); if (!el) { tips.push(id); return false; } el.innerHTML = html; return true; },
+    setText(id, text) { const el = $(id); if (!el) { tips.push(id); return false; } el.textContent = text; return true; },
+    noteDOM(id) { tips.push('dom:' + id); },
+    // 真实实现由 noteDOM.shown 收敛成一条提示；测试桩不能覆盖 stub 的
+    // setHTML 缺块探测，否则“只缺一块”会被误判为静默。
+    isAbortError: () => false,
+    api: async path => c.fail ? Promise.reject(new Error('usage unavailable')) :
+      (path.indexOf('usage?') === 0 ? {totals:{requests:2,total_tokens:10,prompt_tokens:6,completion_tokens:4}, series:[{t:'2026-10-19T10',scope:'hour',total_tokens:10,prompt_tokens:6,completion_tokens:4,requests:2}], by_account:[{key:'u1',realm:'cn',requests:2,total_tokens:10,prompt_tokens:6,completion_tokens:4,errors:0}], credit_by_account:[], credit_by_model:[]} : {}),
+    loadRemaining: async () => {}, loadPerf: async () => {}, loadCreditHistory: async () => {}, loadCreditGrants: async () => {},
+    warmUsageModelRates: () => {}, AbortController: undefined,
+    Array, String, Number, Math, Object, Promise,
+  };
+  vm.createContext(ctx);
+  vm.runInContext(src.slice(start, end) + '\nthis.loadUsage=loadUsage;', ctx);
+  // 编译切片的函数声明会覆盖 ctx 上同名占位，故在脚本求值后再挂观测钩子。
+  // 这里只验证“是否给出提示”，不复制真实 noteUsageDomMismatch 的去重逻辑。
+  const origNote = ctx.noteUsageDomMismatch;
+  ctx.noteUsageDomMismatch = id => { tips.push('usage:' + id); origNote(id); };
+  return ctx.loadUsage().then(() => ({
+    threw: false,
+    tips: tips.slice(0, 3),
+    allTips: tips.slice(),
+    view: !!els['view-usage'],
+    chart: els['usChart'] ? String(els['usChart'].innerHTML).length > 0 : false,
+    stats: els['usStats'] ? String(els['usStats'].innerHTML).length > 0 : false,
+  }), e => ({threw: String(e && e.message)}));
+}
+(async () => {
+  const out = [];
+  for (const c of cases) out.push(Object.assign({name:c.name}, await runCase(c)));
+  process.stdout.write(JSON.stringify(out));
+})().catch(e => { console.error(e && e.stack || e); process.exit(1); });`
+	out := runNodeScript(t, "usage-partial-dom", script, appJSPath(t))
+	var got []map[string]any
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("bad output: %v\n%s", err, out)
+	}
+	if len(got) != 8 {
+		t.Fatalf("cases=%d, want 8: %s", len(got), out)
+	}
+	for _, c := range got {
+		if c["threw"] != nil && c["threw"] != false {
+			t.Errorf("%s threw %v", c["name"], c["threw"])
+		}
+	}
+	if got[0]["tips"] == nil {
+		t.Errorf("全部缺块时必须给出可操作提示：%v", got[0])
+	}
+	if got[1]["chart"] != false {
+		t.Errorf("缺 #usChart 时不应伪造成已渲染：%v", got[1])
+	}
+	// 从第 2 个 case 起都是“只缺一块”：统计卡必须照常渲染，且必须留下
+	// 一次版本错配提示（不能静默吞掉）。
+	for _, c := range got[2:7] {
+		if c["stats"] != true {
+			t.Errorf("%s 应保留统计卡渲染：%v", c["name"], c)
+		}
+		tips, _ := c["allTips"].([]any)
+		if len(tips) == 0 {
+			t.Errorf("%s 缺少版本错配提示：%v", c["name"], c)
+		}
+	}
+	// 失败分支同样不能因缺 usChart/usError 写 null：应留下错误提示并正常结束。
+	if got[7]["threw"] != nil && got[7]["threw"] != false {
+		t.Errorf("failure-chart-missing threw %v", got[7]["threw"])
+	}
+	if tips, _ := got[7]["allTips"].([]any); len(tips) == 0 {
+		t.Errorf("失败分支缺块也必须提示：%v", got[7])
 	}
 }

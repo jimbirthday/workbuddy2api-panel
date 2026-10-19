@@ -909,6 +909,15 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	if convID == "" {
 		convID = sessKey
 	}
+	// 图片请求按「图片集合指纹」派生 prompt_cache_key 的会话源：同一张图重试
+	// 保持同一上游会话，换图/追加图自动进入新会话，避免上游 11135 把新图判成
+	// 旧会话的图片状态冲突。图片请求由 upstream.ChatStreamContext 把会话头与
+	// prompt_cache_key 一起切到派生值（上游按头绑定图片状态，只改缓存键不够）；
+	// 无图片时两源一致，存量行为零漂移。
+	// 图片指纹只算一次；具体派生会话必须在选号后按 acct.UID 生成（见下方
+	// ImageSessionFor）。不能在这里用首轮选的账号做隔离段，否则限流换号后
+	// 第二个账号仍会收到带第一个账号隔离段的会话头。
+	imgFP := session.ImageFingerprint(body)
 	chatMeta := upstream.ChatMeta{ConversationID: convID}
 	if v := r.Header.Get("X-Conversation-Request-ID"); v != "" {
 		chatMeta.ConversationRequestID = v
@@ -1008,9 +1017,16 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
+		// 图片会话按本轮实际出站账号派生：上游按 X-Conversation-ID 绑定图片
+		// 状态，同一会话换号重试时必须落到该账号自己的图片会话，不能把 A
+		// 账号的图片上下文发给 B。无图请求 ResolveImageSession 返回空串，
+		// chatMeta 保持原有透传语义（含上一轮从未带图的普通会话）。
+		attemptMeta := chatMeta
+		attemptMeta.PromptCacheConversationID = session.ResolveImageSession(convID, acct.UID, imgFP)
+
 		// 客户端 IP 按请求传递（PassthroughIP 开启时注入；消除共享字段竞态）。
 		attemptStarted := time.Now()
-		rc, status, respBody, terr := h.cfg.Upstream.ChatStreamContext(r.Context(), acct, body, clientIP, chatMeta)
+		rc, status, respBody, terr := h.cfg.Upstream.ChatStreamContext(r.Context(), acct, body, clientIP, attemptMeta)
 		// 分类信封一次成型：upstream 已在错误路径返回 *upstream.Error（Kind +
 		// Retry-After 头解析）。传输层错误（非 *Error）走抖动换号分支；防御分支
 		// （terr 为 nil 但 status>=400，如 ErrNone 兜底）回落本地 Classify，双保险。

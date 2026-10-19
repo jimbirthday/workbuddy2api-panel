@@ -16,6 +16,7 @@ package upstream
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -60,7 +61,13 @@ type Task struct {
 // 响应形如 data.tasks[]，元素字段随任务类型变化（progress 可能是 {current,target} 或平铺），
 // 这里做宽松解析：两种形状都尝试。
 func (c *Client) ListTasks(a *auth.Auth) ([]Task, error) {
-	data, err := c.growthJSON(a, http.MethodGet, tasksListPath, nil)
+	return c.ListTasksContext(context.Background(), a)
+}
+
+// ListTasksContext 同 ListTasks，但可由调用方取消/限时。任务中心整轮扫描
+// 给每账号一个总 deadline，避免单个上游 hang 把整轮拖到 HTTP 客户端 120s 上限。
+func (c *Client) ListTasksContext(ctx context.Context, a *auth.Auth) ([]Task, error) {
+	data, err := c.growthJSONContext(ctx, a, http.MethodGet, tasksListPath, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -74,7 +81,12 @@ func (c *Client) ListTasks(a *auth.Auth) ([]Task, error) {
 // （含 RichMeow/Model_chat 等常规任务 + wb_wechat_oa_subscribe_task 等 mp 专属），
 // 合并时调用方须按 task_code 去重。
 func (c *Client) ListTasksMP(a *auth.Auth) ([]Task, error) {
-	data, err := c.growthJSONMP(a, http.MethodGet, tasksListPath, nil)
+	return c.ListTasksMPContext(context.Background(), a)
+}
+
+// ListTasksMPContext 同 ListTasksMP，但支持调用方 deadline/cancel。
+func (c *Client) ListTasksMPContext(ctx context.Context, a *auth.Auth) ([]Task, error) {
+	data, err := c.growthJSONMPContext(ctx, a, http.MethodGet, tasksListPath, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -84,6 +96,11 @@ func (c *Client) ListTasksMP(a *auth.Auth) ([]Task, error) {
 // growthJSONMP 发 growth 域请求（小程序口径：叠加 X-Client-Platform: miniprogram）
 // 并解信封。语义同 growthJSON。
 func (c *Client) growthJSONMP(a *auth.Auth, method, path string, body any) (json.RawMessage, error) {
+	return c.growthJSONMPContext(context.Background(), a, method, path, body)
+}
+
+// growthJSONMPContext 同 growthJSONMP，context 透传到 HTTP 请求。
+func (c *Client) growthJSONMPContext(ctx context.Context, a *auth.Auth, method, path string, body any) (json.RawMessage, error) {
 	var rdr io.Reader
 	if body != nil {
 		raw, err := json.Marshal(body)
@@ -92,7 +109,10 @@ func (c *Client) growthJSONMP(a *auth.Auth, method, path string, body any) (json
 		}
 		rdr = bytes.NewReader(raw)
 	}
-	req, err := http.NewRequest(method, c.chatBase(a)+path, rdr)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	req, err := http.NewRequestWithContext(ctx, method, c.chatBase(a)+path, rdr)
 	if err != nil {
 		return nil, err
 	}
@@ -244,9 +264,9 @@ func (c *Client) ClaimReward(a *auth.Auth, taskCode string) (credit, energy int6
 	if a.UID != "" {
 		req.Header.Set("X-User-Id", a.UID)
 	}
-	if a.EnterpriseID != "" {
-		req.Header.Set("X-Enterprise-Id", a.EnterpriseID)
-		req.Header.Set("X-Tenant-Id", a.EnterpriseID)
+	if eid := a.EnterpriseIDValue(); eid != "" {
+		req.Header.Set("X-Enterprise-Id", eid)
+		req.Header.Set("X-Tenant-Id", eid)
 	}
 	if d := a.DomainValue(); d != "" {
 		req.Header.Set("X-Domain", d)

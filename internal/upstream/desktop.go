@@ -122,6 +122,10 @@ func (c *Client) ReportDesktopEvent(a *auth.Auth, events ...DesktopEvent) error 
 	if a.UID != "" {
 		req.Header.Set("X-User-Id", a.UID)
 	}
+	if eid := a.EnterpriseIDValue(); eid != "" {
+		req.Header.Set("X-Enterprise-Id", eid)
+		req.Header.Set("X-Tenant-Id", eid)
+	}
 	_, err = c.doJSON(req)
 	return err
 }
@@ -221,6 +225,10 @@ func (c *Client) SetAppearanceTheme(a *auth.Auth, resourceKey string) error {
 	if a.UID != "" {
 		req.Header.Set("X-User-Id", a.UID)
 	}
+	if eid := a.EnterpriseIDValue(); eid != "" {
+		req.Header.Set("X-Enterprise-Id", eid)
+		req.Header.Set("X-Tenant-Id", eid)
+	}
 	_, err = c.doJSON(req)
 	return err
 }
@@ -270,7 +278,7 @@ func (c *Client) ReportWebEvent(a *auth.Auth, eventCode, pageURL, elementID, ele
 		"pageURL": pageURL, "elementId": elementID, "elementName": elementName,
 		"os": "Win32", "arch": "", "osVersion": "10.0", "userAgent": ua,
 		"machineId": deriveID(a, "webmachine"), "userId": a.UID,
-		"userNickname": a.Nickname, "enterpriseId": a.EnterpriseID,
+		"userNickname": a.Nickname, "enterpriseId": a.EnterpriseIDValue(),
 	}
 	raw, err := json.Marshal([]map[string]any{ev})
 	if err != nil {
@@ -289,6 +297,10 @@ func (c *Client) ReportWebEvent(a *auth.Auth, eventCode, pageURL, elementID, ele
 	req.Header.Set("User-Agent", ua)
 	if a.UID != "" {
 		req.Header.Set("X-User-Id", a.UID)
+	}
+	if eid := a.EnterpriseIDValue(); eid != "" {
+		req.Header.Set("X-Enterprise-Id", eid)
+		req.Header.Set("X-Tenant-Id", eid)
 	}
 	_, err = c.doJSON(req)
 	return err

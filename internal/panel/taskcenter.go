@@ -10,6 +10,7 @@
 package panel
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -28,6 +29,11 @@ import (
 // ---------------------------------------------------------------------------
 // 扫描（只读）
 // ---------------------------------------------------------------------------
+
+// scanAccountTimeout 单账号成长任务扫描总时长。默认与 mp 两路并行共用该
+// deadline；超时只影响该账号，扫描继续下一号。取 35s：足以覆盖正常上游
+// （实测单列表 <5s），又明显短于 HTTP 客户端 120s，避免个别 hang 拖死整轮。
+var scanAccountTimeout = 35 * time.Second
 
 // scanAccountItem 单账号扫描结果。
 type scanAccountItem struct {
@@ -185,10 +191,12 @@ func (p *Panel) runScan(seq int) {
 	// （冷却、限流台账、成本账本、token 用量），而这些字段扫描一个都不用。
 	accounts := p.cfg.Pool.TaskAccounts(true)
 	// 先算分母再起 goroutine：否则 3 个并发槽位可能先完成，前端会短暂看到
-	// done > total（total 还没写），进度条出现回跳/负值。禁用账号不计入。
+	// done > total（total 还没写），进度条出现回跳/负值。禁用账号不计入；
+	// global / 企业版没有个人成长体系，扫描会门控跳过，也不能计入分母——
+	// 否则 470 号里混入几个企业号时进度永远停在「done < total」，像卡死。
 	run := 0
 	for _, acct := range accounts {
-		if !acct.Disabled {
+		if !acct.Disabled && acct.Auth != nil && !acct.Auth.IsGlobal() && !acct.Auth.IsEnterprise() {
 			run++
 		}
 	}
@@ -201,49 +209,61 @@ func (p *Panel) runScan(seq int) {
 	st.total = run
 	st.mu.Unlock()
 
-	// 保持原 List 形状（含禁用账号空槽位）：扫描结果 JSON 与既有前端/测试的
-	// 账号顺序、槽位语义不变，同时避免为禁用号发起上游请求。
-	items := make([]scanAccountItem, len(accounts))
-	// 覆盖集合直接来自本轮实际纳入的非禁用账号，且即使随后 AuthByUID
+	// items 按可扫描账号紧凑排列；被门控/禁用的账号不发请求、不产生空槽位，
+	// 这样 accounts 结果与 total 的分母一致，前端进度不会因空槽位看起来卡住。
+	items := make([]scanAccountItem, 0, run)
+	// 覆盖集合直接来自本轮实际纳入的可扫描账号，且即使随后 AuthByUID
 	// 返回 nil 也保留该 UID：复用队列必须知道「这个号本轮被考虑过」，
 	// 不能把空 UID 或「没有待办」误当成账号集合一致。
 	covered := make(map[string]bool, run)
-	idx := make([]int, 0, run)
-	for i, s := range accounts {
-		// 显式保留非禁用账号的 UID：复用队列必须知道「这个号本轮被考虑过」，
-		// 不能把没有待办的号误当成账号集合不一致。
-		if !s.Disabled {
-			items[i].UID = s.UID
-			covered[s.UID] = true
-			idx = append(idx, i)
+	type scanJob struct {
+		i int
+		a *auth.Auth
+	}
+	jobs := make([]scanJob, 0, run)
+	for _, s := range accounts {
+		// 显式保留非禁用且可扫描账号的 UID：复用队列必须知道「这个号本轮
+		// 被考虑过」，不能把没有待办的号误当成账号集合不一致。global / 企业版
+		// 被门控跳过，不计入 covered，也不进入 worker 下标。
+		if s.Disabled || s.Auth == nil || s.Auth.IsGlobal() || s.Auth.IsEnterprise() {
+			continue
 		}
+		items = append(items, scanAccountItem{UID: s.UID})
+		covered[s.UID] = true
+		// items 是压缩后的结果数组，而 accounts 含禁用/门控号，两者下标不再
+		// 对应。凭证必须与结果槽位一起入队，绝不能再用 items 下标回查 accounts，
+		// 否则夹有禁用号或企业号时会把请求发到另一个账号。
+		jobs = append(jobs, scanJob{i: len(items) - 1, a: s.Auth})
 	}
 	// 固定 3 个 worker：账号多时不再为每个账号先起一个 goroutine 再阻塞等
 	// 信号量（470 账号会瞬间多出 470 个等待者）。并发上限与原先完全一致。
-	if !p.runBackgroundBounded(3, len(idx), func(k int) {
-		i := idx[k]
+	if !p.runBackgroundBounded(3, len(jobs), func(k int) {
+		i := jobs[k].i
 		fixedUID := items[i].UID
 		p.scanCurrent(seq, fixedUID)
-		a := accounts[i].Auth
-		if a == nil {
-			p.scanTick(seq, 1)
-			return
-		}
+		a := jobs[k].a
 		it := &items[i]
 		it.Nickname = a.Nickname
-		// D4 门控：global 账号无 CN 成长任务体系，不发起任何上游调用。
-		if a.IsGlobal() {
-			p.scanTick(seq, 1)
-			return
-		}
-		// 企业版门控：同上——企业版无个人成长体系（GET /v2/activity/growth/tasks
-		// 上游 403「growth system is only available for personal users」）。
-		if a.IsEnterprise() {
-			p.scanTick(seq, 1)
-			return
-		}
-		if tasks, err := p.cfg.Upstream.ListTasks(a); err != nil {
-			it.GrowthErr = err.Error()
+		// 单账号总 deadline：默认与 mp 两路并行，且共享一个 35s 上限。
+		// 上游偶发 hang 时只把本账号标失败并继续下一号；不能因为一个坏请求
+		// 让整轮扫描停在 HTTP 客户端 120s 超时上（用户看到的就是“扫描卡住”）。
+		ctx, cancel := context.WithTimeout(context.Background(), scanAccountTimeout)
+		var tasks, mpTasks []upstream.Task
+		var tasksErr, mpErr error
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			tasks, tasksErr = p.cfg.Upstream.ListTasksContext(ctx, a)
+		}()
+		go func() {
+			defer wg.Done()
+			mpTasks, mpErr = p.cfg.Upstream.ListTasksMPContext(ctx, a)
+		}()
+		wg.Wait()
+		cancel()
+		if tasksErr != nil {
+			it.GrowthErr = tasksErr.Error()
 			it.hasErr = true
 		} else {
 			for _, t := range tasks {
@@ -254,8 +274,8 @@ func (p *Panel) runScan(seq int) {
 		}
 		// 小程序口径任务（school_season 校园日 / Sequential_Tasks_1 小程序首对话）
 		// 仅在 mp 头列表下发，与默认口径不重叠——合并进待办列表；mp 列表失败
-		// 静默（无 mp 任务的部署/活动结束时零影响）。
-		if mpTasks, err := p.cfg.Upstream.ListTasksMP(a); err == nil {
+		// 只计入该账号错误（无 mp 任务的部署/活动结束时零影响），不丢弃默认结果。
+		if mpErr == nil {
 			seen := map[string]bool{}
 			for _, t := range it.Growth {
 				seen[t.TaskCode] = true
@@ -266,9 +286,10 @@ func (p *Panel) runScan(seq int) {
 				}
 			}
 		} else {
-			// mp 列表失败此前静默；这里只标记该账号本次扫描有查询失败，
-			// 计入 error_count，不改变既有字段与前端可见的待办结构。
 			it.hasErr = true
+			if it.GrowthErr == "" {
+				it.GrowthErr = mpErr.Error()
+			}
 		}
 		p.scanTick(seq, 1)
 	}) {
@@ -440,10 +461,13 @@ func (p *Panel) reuseFreshScan(accounts []pool.TaskAccount) ([]queueAccount, []q
 	target := make(map[string]bool, len(accounts))
 	byUID := make(map[string]*auth.Auth, len(accounts))
 	for _, acct := range accounts {
-		if !acct.Disabled {
-			target[acct.UID] = true
-			byUID[acct.UID] = acct.Auth
+		// 与 runScan 的门控保持一致：禁用、global、企业版都不会进入扫描覆盖集。
+		// 只排除禁用位会让池里有一个企业号时 target 恒大于 covered，复用永远失败。
+		if acct.Disabled || acct.Auth == nil || acct.Auth.IsGlobal() || acct.Auth.IsEnterprise() {
+			continue
 		}
+		target[acct.UID] = true
+		byUID[acct.UID] = acct.Auth
 	}
 	p.scanMu.Lock()
 	fresh := !p.scanCacheAt.IsZero() && time.Since(p.scanCacheAt) <= scanReuseTTL
@@ -495,7 +519,7 @@ func (p *Panel) reuseFreshScan(accounts []pool.TaskAccount) ([]queueAccount, []q
 		if len(grow) == 0 {
 			continue
 		}
-		accts = append(accts, queueAccount{a: a, grow: grow})
+		accts = append(accts, queueAccount{a: a, uid: a.UID, grow: grow})
 		for _, t := range grow {
 			items = append(items, queueItem{
 				UID: a.UID, Nickname: a.Nickname, Kind: "growth", Code: t.TaskCode,
@@ -589,15 +613,15 @@ func (p *Panel) runGrowthQueueStart(concurrency int, growth bool) (started bool,
 	accounts := p.cfg.Pool.TaskAccounts(true)
 	covered := 0
 	for _, acct := range accounts {
-		if !acct.Disabled {
+		if !acct.Disabled && acct.Auth != nil && !acct.Auth.IsGlobal() && !acct.Auth.IsEnterprise() {
 			covered++
 		}
 	}
 	q.mu.Lock()
 	q.preTotal = covered
 	q.mu.Unlock()
-	// scanDone 由每个账号 goroutine 在结束时调用（包括门控跳过），让预扫阶段
-	// 的进度真实反映「已处理账号数」，而不是只统计有任务的账号。
+	// scanDone 由每个真正会查询上游的账号 goroutine 在结束时调用。被门控的
+	// global / 企业版账号不进入 jobs，也不占 preTotal，进度才能走满 100%。
 	scanDone := func() {
 		q.mu.Lock()
 		q.preDone++
@@ -669,10 +693,10 @@ func (p *Panel) runGrowthQueueStart(concurrency int, growth bool) (started bool,
 	}
 	jobs := make([]preJob, 0, len(accounts))
 	for _, acct := range accounts {
-		if acct.Disabled {
+		if acct.Disabled || acct.Auth == nil {
 			continue
 		}
-		if acct.Auth == nil {
+		if acct.Auth.IsGlobal() || acct.Auth.IsEnterprise() {
 			continue
 		}
 		jobs = append(jobs, preJob{a: acct.Auth})
@@ -680,18 +704,28 @@ func (p *Panel) runGrowthQueueStart(concurrency int, growth bool) (started bool,
 	if !p.runBackgroundBounded(3, len(jobs), func(k int) {
 		a := jobs[k].a
 		defer scanDone()
-		one := queueAccount{a: a}
-		// D4 门控：global 账号无 CN 成长任务体系，不发起任何上游调用。
-		if a.IsGlobal() {
-			return
-		}
-		// 企业版门控：同上（企业版无个人成长体系，任务端点上游一律 403）。
-		if a.IsEnterprise() {
-			return
-		}
+		one := queueAccount{a: a, uid: a.UID}
 		failed := 0
 		if growth {
-			if tasks, err := p.cfg.Upstream.ListTasks(a); err == nil {
+			// 与「扫描待办」同一单账号总 deadline：队列启动前的预扫同样会遍历
+			// 全池。这里若沿用 HTTP 客户端 120s，470 号里有几个 hang 的请求就会
+			// 让「执行全部待办」长期停在「启动中」；超时只记该号失败并继续。
+			ctx, cancel := context.WithTimeout(context.Background(), scanAccountTimeout)
+			var tasks, mpTasks []upstream.Task
+			var tasksErr, mpErr error
+			var wg sync.WaitGroup
+			wg.Add(2)
+			go func() {
+				defer wg.Done()
+				tasks, tasksErr = p.cfg.Upstream.ListTasksContext(ctx, a)
+			}()
+			go func() {
+				defer wg.Done()
+				mpTasks, mpErr = p.cfg.Upstream.ListTasksMPContext(ctx, a)
+			}()
+			wg.Wait()
+			cancel()
+			if tasksErr == nil {
 				for _, t := range tasks {
 					if growthPending(t) {
 						one.grow = append(one.grow, t)
@@ -700,7 +734,7 @@ func (p *Panel) runGrowthQueueStart(concurrency int, growth bool) (started bool,
 				// 合并小程序口径待办（与 tasksScanAll 同口径：mp 列表是默认口径
 				// 超集，按 code 去重；失败静默）。此前此处漏合并——扫描显示
 				// mp 待办而队列报"无可执行待办"。
-				if mpTasks, mpErr := p.cfg.Upstream.ListTasksMP(a); mpErr == nil {
+				if mpErr == nil {
 					seen := map[string]bool{}
 					for _, t := range one.grow {
 						seen[t.TaskCode] = true
@@ -850,25 +884,44 @@ func (p *Panel) runQueueItems(accts []queueAccount, items []queueItem, concurren
 	// 再阻塞等信号量。panic 在本任务内兜住，标记失败后继续执行其他账号。
 	runBounded(concurrency, len(accts), func(k int) {
 		one := accts[k]
+		uid := one.uid
+		if uid == "" && one.a != nil {
+			uid = one.a.UID
+		}
 		func() {
 			defer func() {
 				if v := recover(); v != nil {
-					log.Printf("panel: 队列账号 worker panic uid=%s: %v", logfmt.UID8(one.a.UID), v)
-					p.queueSet(q, one.a.UID, func(it *queueItem) {
+					log.Printf("panel: 队列账号 worker panic uid=%s: %v", logfmt.UID8(uid), v)
+					p.queueSet(q, uid, func(it *queueItem) {
 						if it.Status == "pending" || it.Status == "running" {
 							it.Status, it.Message = "error", fmt.Sprintf("执行异常：%v", v)
 						}
 					})
 				}
 			}()
+			// 防御性门控：企业号没有个人成长体系。扫描/预扫已经过滤，但队列
+			// 状态可能被旧快照、外部脚本或手工请求复用；执行入口必须再挡一次，
+			// 不能让企业号进入 accept/growth/claim 的上游链路。
+			if one.a == nil {
+				p.queueSet(q, uid, func(it *queueItem) {
+					it.Status, it.Message = "skipped", "账号已不在账号池中，跳过"
+				})
+				return
+			}
+			if one.a.IsEnterprise() {
+				p.queueSet(q, uid, func(it *queueItem) {
+					it.Status, it.Message = "skipped", "企业账号无个人成长任务体系，跳过"
+				})
+				return
+			}
 			// per-account 互斥：与单任务/一键完成共用一把锁。
-			if !p.tryLockAccount(one.a.UID) {
-				p.queueSet(q, one.a.UID, func(it *queueItem) {
+			if !p.tryLockAccount(uid) {
+				p.queueSet(q, uid, func(it *queueItem) {
 					it.Status, it.Message = "skipped", "该账号有其它任务动作在执行，跳过"
 				})
 				return
 			}
-			defer p.unlockAccount(one.a.UID)
+			defer p.unlockAccount(uid)
 			// 前置：批量接受尚未接受的任务。上游对 not_accepted 的任务不计数——
 			// 面板「一键完成」一直有这步，队列路径此前漏了（表现为上报 200 但进度
 			// 一直 not_accepted、无法领奖）。失败不阻塞（行为事件才是进度判据）。
@@ -878,7 +931,7 @@ func (p *Panel) runQueueItems(accts []queueAccount, items []queueItem, concurren
 			// 只遍历本账号的条目：队列启动后条目固定，q.byUID 是启动时建好的
 			// 索引；旧实现每个账号都遍历全部条目，账号/待办多时是 O(n×m)。
 			q.mu.Lock()
-			indexes := append([]int(nil), q.byUID[one.a.UID]...)
+			indexes := append([]int(nil), q.byUID[uid]...)
 			q.mu.Unlock()
 			for _, i := range indexes {
 				kind, code := q.snapshotAt(i)
@@ -903,6 +956,7 @@ func (p *Panel) runQueueItems(accts []queueAccount, items []queueItem, concurren
 // queueAccount 队列执行的账号单元（runQueueItems 参数）。
 type queueAccount struct {
 	a    *auth.Auth
+	uid  string
 	grow []upstream.Task
 }
 
@@ -932,6 +986,11 @@ func (p *Panel) queueSet(q *queueState, uid string, fn func(*queueItem)) {
 
 // acceptPendingTasks 批量接受该账号未接受的任务，返回接受的个数（失败返回 0 不阻塞）。
 func (p *Panel) acceptPendingTasks(a *auth.Auth) int {
+	// 防御性入口门控：所有当前调用方都已先挡企业号，但该函数是对上游的写
+	// 操作，未来新增调用方不应依赖调用顺序才能保证租户红线。
+	if a == nil || a.IsEnterprise() {
+		return 0
+	}
 	tasks, err := p.cfg.Upstream.ListTasks(a)
 	if err != nil {
 		return 0
@@ -956,6 +1015,12 @@ func (p *Panel) acceptPendingTasks(a *auth.Auth) int {
 // runGrowthQueued 执行单个成长任务（动作 + 回读 + 自动领奖；与
 // accountTaskAuto 同语义，结果以文字返回）。
 func (p *Panel) runGrowthQueued(a *auth.Auth, code string) (string, error) {
+	if a == nil {
+		return "", fmt.Errorf("账号为空")
+	}
+	if a.IsEnterprise() {
+		return "", fmt.Errorf("企业账号无个人成长任务体系")
+	}
 	act := autoActionFor(code)
 	if act == nil {
 		return "", fmt.Errorf("任务 %s 无自动动作", code)
@@ -1058,6 +1123,8 @@ func (p *Panel) schoolVouchers(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case a.IsGlobal():
 			it.Err = "global realm（无开学季活动）"
+		case a.IsEnterprise():
+			it.Err = "企业账号无个人成长体系（无开学季活动）"
 		default:
 			vs, err := p.cfg.Upstream.SchoolVouchers(a)
 			if err != nil {

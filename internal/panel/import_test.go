@@ -2,6 +2,7 @@ package panel
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"mime/multipart"
@@ -237,6 +238,49 @@ func TestCockpitImportConcurrentJobsAreRaceFree(t *testing.T) {
 	}
 	if len(res.Errors) != 0 {
 		t.Fatalf("unexpected errors: %v", res.Errors)
+	}
+}
+
+// TestCockpitImportPreservesEnterpriseID 企业号导出可能把 enterpriseId 放在
+// 扁平行，也可能用 enterprise_id；两种都必须落盘并让池内账号继续走企业门控。
+func TestCockpitImportPreservesEnterpriseID(t *testing.T) {
+	dir := t.TempDir()
+	pl := pool.New("")
+	p := New(Config{Version: "test", APIKey: "k", Pool: pl, AuthDir: dir})
+	accounts := []cockpitAccount{
+		{UID: "uid-ent-camel", AccessToken: "at", RefreshToken: "rt", EnterpriseID: "ent-camel"},
+		{UID: "uid-ent-snake", AccessToken: "at", RefreshToken: "rt", EnterpriseIDSnake: "ent-snake"},
+	}
+	res := p.importCockpitAccounts(accounts, false, false)
+	if res.Added != 2 || res.Skipped != 0 || res.Invalid != 0 {
+		t.Fatalf("enterprise import result = %+v", res)
+	}
+	for uid, want := range map[string]string{
+		"uid-ent-camel": "ent-camel",
+		"uid-ent-snake": "ent-snake",
+	} {
+		a := pl.AuthByUID(uid)
+		if a == nil || a.EnterpriseIDValue() != want || !a.IsEnterprise() {
+			t.Fatalf("%s enterprise id not preserved: %+v", uid, a)
+		}
+	}
+}
+
+// TestCockpitImportEnterpriseIDFromJWT 导出文件没有 enterprise 字段时，仍应
+// 从 access token 的 JWT claim 识别企业号，避免导入后误签到/走个人额度。
+func TestCockpitImportEnterpriseIDFromJWT(t *testing.T) {
+	dir := t.TempDir()
+	pl := pool.New("")
+	p := New(Config{Version: "test", APIKey: "k", Pool: pl, AuthDir: dir})
+	payload := base64.RawURLEncoding.EncodeToString([]byte(`{"enterprise_id":"ent-jwt"}`))
+	at := "header." + payload + ".sig"
+	res := p.importCockpitAccounts([]cockpitAccount{{UID: "uid-ent-jwt", AccessToken: at, RefreshToken: "rt"}}, false, false)
+	if res.Added != 1 {
+		t.Fatalf("jwt enterprise import result = %+v", res)
+	}
+	a := pl.AuthByUID("uid-ent-jwt")
+	if a == nil || a.EnterpriseIDValue() != "ent-jwt" || !a.IsEnterprise() {
+		t.Fatalf("jwt enterprise id not recognized: %+v", a)
 	}
 }
 

@@ -1,6 +1,9 @@
 package panel
 
 import (
+	"bytes"
+	"compress/gzip"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -70,12 +73,42 @@ func TestIndexReferencesExternalScript(t *testing.T) {
 	p.ServeHTTP(rec, httptest.NewRequest("GET", "/panel/", nil))
 	body := rec.Body.String()
 
-	if !strings.Contains(body, `<script src="app.js"></script>`) {
-		t.Error("index.html must load app.js externally (inline script is blocked by CSP)")
+	if !strings.Contains(body, `<script src="app.js?v=`) || !strings.Contains(body, `"></script>`) {
+		t.Error("index.html must load versioned app.js externally (inline script is blocked by CSP)")
 	}
 	// 反例保护：出现内联 <script>...</script> 内容块即为回归
 	if strings.Contains(body, "<script>\n") || strings.Contains(body, "<script> ") {
 		t.Error("index.html still contains an inline <script> block; CSP would block it")
+	}
+}
+
+// 静态脚本 URL 必须带内容指纹，且 gzip/plain 两个表示拿到同一版本号：
+// 前者防止反代缓存旧 app.js，后者防止只替换了未压缩页面而漏掉 gzip 页面。
+func TestIndexScriptVersionMatchesAppETag(t *testing.T) {
+	p := newTestPanel()
+	plain := httptest.NewRecorder()
+	p.ServeHTTP(plain, httptest.NewRequest("GET", "/panel/", nil))
+	gz := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/panel/", nil)
+	req.Header.Set("Accept-Encoding", "gzip")
+	p.ServeHTTP(gz, req)
+	if gz.Code != http.StatusOK || gz.Header().Get("Content-Encoding") != "gzip" {
+		t.Fatalf("gzip page code=%d enc=%q", gz.Code, gz.Header().Get("Content-Encoding"))
+	}
+	want := "app.js?v=" + strings.Trim(appETag, `"`)
+	if !strings.Contains(plain.Body.String(), want) {
+		t.Fatalf("plain index missing %q", want)
+	}
+	zr, err := gzip.NewReader(bytes.NewReader(gz.Body.Bytes()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := io.ReadAll(zr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), want) {
+		t.Fatalf("gzip index missing %q", want)
 	}
 }
 
@@ -97,7 +130,39 @@ func TestAppScriptServed(t *testing.T) {
 		t.Error("app.js must carry a content ETag")
 	}
 	if got := rec.Header().Get("Cache-Control"); got != "no-cache" {
-		t.Errorf("Cache-Control=%q want no-cache", got)
+		t.Errorf("unversioned app.js Cache-Control=%q want no-cache", got)
+	}
+}
+
+// 页面引用的 app.js 自带内容指纹：该 URL 的内容永不变，反向代理与浏览器可以
+// 长期缓存；无版本号或版本号与当前二进制不一致时仍必须回源校验。否则反代可能
+// 把旧脚本配到新 DOM 上，重新触发 loadUsage 的 null.innerHTML 崩溃。
+func TestVersionedAppScriptIsImmutable(t *testing.T) {
+	p := newTestPanel()
+	version := strings.Trim(appETag, `"`)
+	cases := []struct {
+		query string
+		want  string
+	}{
+		{"?v=" + version, "public, max-age=31536000, immutable"},
+		{"?v=stale-version", "no-cache"},
+		{"", "no-cache"},
+	}
+	for _, c := range cases {
+		rec := httptest.NewRecorder()
+		p.ServeHTTP(rec, httptest.NewRequest("GET", "/panel/app.js"+c.query, nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%q: code=%d", c.query, rec.Code)
+		}
+		if got := rec.Header().Get("Cache-Control"); got != c.want {
+			t.Errorf("%q: Cache-Control=%q want %q", c.query, got, c.want)
+		}
+	}
+	// 页面本身绝不能长期缓存：升级后必须拿到新的 app.js 版本号。
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, httptest.NewRequest("GET", "/panel/", nil))
+	if got := rec.Header().Get("Cache-Control"); got != "no-cache" {
+		t.Errorf("index Cache-Control=%q want no-cache", got)
 	}
 }
 

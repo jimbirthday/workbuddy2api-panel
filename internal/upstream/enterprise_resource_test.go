@@ -130,3 +130,34 @@ func TestPersonalResourceStaysOnPackageEndpoint(t *testing.T) {
 		t.Fatal("应至少请求一次资源包端点")
 	}
 }
+
+// TestGlobalEnterpriseResourceFallsBackToV2 global 计费域历史端点不带 /v2。
+// 企业额度此前硬编码 /v2，global 企业号会恒 404；由于调度器逐号 continue，
+// 面板只会长期显示「企业额度未知」。这里断言先无前缀、404 后回落到 /v2。
+func TestGlobalEnterpriseResourceFallsBackToV2(t *testing.T) {
+	var paths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		if strings.HasPrefix(r.URL.Path, "/v2/billing/meter/get-enterprise-user-usage") {
+			w.Write([]byte(`{"code":0,"data":{"credit":100,"limitNum":500}}`))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+		w.Write([]byte(`{"code":404,"msg":"not found"}`))
+	}))
+	defer srv.Close()
+
+	c := &Client{HTTP: srv.Client(), BillingBaseCN: srv.URL, BillingBaseGlobal: srv.URL, GlobalEnabled: true}
+	a := &auth.Auth{UID: "u-global-ent", AccessToken: "at", EnterpriseID: "ent-global", Domain: "www.workbuddy.ai"}
+	remain, total, _, _, _, err := c.UserResourceDetailedWithExpiry(a, 0)
+	if err != nil {
+		t.Fatalf("global enterprise resource: %v (paths=%v)", err, paths)
+	}
+	if remain != 400 || total != 500 {
+		t.Fatalf("remain=%d total=%d want 400/500", remain, total)
+	}
+	if len(paths) != 2 || paths[0] != "/billing/meter/get-enterprise-user-usage" ||
+		paths[1] != "/v2/billing/meter/get-enterprise-user-usage" {
+		t.Fatalf("fallback paths=%v want no-v2 then v2", paths)
+	}
+}

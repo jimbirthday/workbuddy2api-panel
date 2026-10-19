@@ -16,6 +16,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -26,11 +27,11 @@ import (
 	"time"
 )
 
-const billingBaseCN = "https://www.codebuddy.cn"
+var billingBaseCN = "https://www.codebuddy.cn"
 
 // billingBaseGlobal 国际版计费域。global 账号打 CN 域会得到 401：
 // www.codebuddy.cn 不认 workbuddy.ai 的 token（实测 401，workbuddy.ai 同 token 为 code=0）。
-const billingBaseGlobal = "https://www.workbuddy.ai"
+var billingBaseGlobal = "https://www.workbuddy.ai"
 
 // billingBaseFor 按账号 realm 选择计费域。
 //
@@ -38,27 +39,93 @@ const billingBaseGlobal = "https://www.workbuddy.ai"
 // workbuddy.ai 家族，都按国际版处理。cmd/credit 早先对所有账号硬编码 CN 域，
 // 导致 global 账号余额查询恒返回 401（面板显示的是池内缓存值，不是实时的）。
 func billingBaseFor(af *authFile) string {
-	if strings.EqualFold(strings.TrimSpace(af.Auth.Realm), "global") {
-		return billingBaseGlobal
-	}
-	d := strings.ToLower(strings.TrimSpace(af.Auth.Domain))
-	if d == "workbuddy.ai" || strings.HasSuffix(d, ".workbuddy.ai") {
+	if isGlobalAuth(af) {
 		return billingBaseGlobal
 	}
 	return billingBaseCN
 }
 
+// isGlobalAuth 按 realm/domain 判 global。路径前缀必须与返回的 base 绑定同一
+// 判定，不能再用 `base == billingBaseGlobal` 比较 URL：测试或私有部署把两个
+// base 配成同一地址时会误判为 global，企业端点会丢掉 /v2 前缀。
+func isGlobalAuth(af *authFile) bool {
+	if strings.EqualFold(strings.TrimSpace(af.Auth.Realm), "global") {
+		return true
+	}
+	d := strings.ToLower(strings.TrimSpace(af.Auth.Domain))
+	return d == "workbuddy.ai" || strings.HasSuffix(d, ".workbuddy.ai")
+}
+
 type authFile struct {
 	Auth struct {
-		AccessToken string `json:"accessToken"`
-		Domain      string `json:"domain"`
-		Realm       string `json:"realm"`
+		AccessToken      string `json:"accessToken"`
+		AccessTokenSnake string `json:"access_token"`
+		Domain           string `json:"domain"`
+		Realm            string `json:"realm"`
 	} `json:"auth"`
 	Account struct {
-		UID          string `json:"uid"`
-		EnterpriseID string `json:"enterpriseId"`
-		Nickname     string `json:"nickname"`
+		UID               string `json:"uid"`
+		EnterpriseID      string `json:"enterpriseId"`
+		EnterpriseIDSnake string `json:"enterprise_id"`
+		Nickname          string `json:"nickname"`
 	} `json:"account"`
+}
+
+// accessToken 兼容插件嵌套形（accessToken）与 cockpit/扁平导入（access_token）。
+// 两种命名在 internal/auth 与面板导入里都已支持；脚本若只看驼峰，会把可用的
+// snake_case 凭据误报成 no accessToken，并漏掉企业额度分流。
+func (af *authFile) accessToken() string {
+	if af == nil {
+		return ""
+	}
+	return firstNonBlank(af.Auth.AccessToken, af.Auth.AccessTokenSnake)
+}
+
+// firstNonBlank 返回第一个去空白后非空的字符串。
+func firstNonBlank(values ...string) string {
+	for _, v := range values {
+		if s := strings.TrimSpace(v); s != "" {
+			return s
+		}
+	}
+	return ""
+}
+
+// jwtEnterpriseID 从 accessToken 的 JWT payload 读取企业 ID。cmd/credit 历史上
+// 只读文件里的 account.enterpriseId；旧版凭据文件该字段常为空，导致企业号被
+// 当成个人号去打 get-user-resource。只解码不验签：这里只用于选对额度端点，
+// 鉴权仍由上游校验签名。
+func jwtEnterpriseID(token string) string {
+	parts := strings.Split(strings.TrimSpace(token), ".")
+	if len(parts) < 2 || parts[1] == "" {
+		return ""
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		if payload, err = base64.URLEncoding.DecodeString(parts[1]); err != nil {
+			return ""
+		}
+	}
+	var claims struct {
+		EnterpriseID      string `json:"enterprise_id"`
+		EnterpriseIDCamel string `json:"enterpriseId"`
+	}
+	if json.Unmarshal(payload, &claims) != nil {
+		return ""
+	}
+	if id := strings.TrimSpace(claims.EnterpriseID); id != "" {
+		return id
+	}
+	return strings.TrimSpace(claims.EnterpriseIDCamel)
+}
+
+// enterpriseIDFor 返回该凭据当前的企业身份：JWT 有 claim 时以 claim 为准（文件里
+// 的显式值可能是旧租户），无 claim 时回退显式字段（旧版导出只带 enterpriseId）。
+func enterpriseIDFor(af *authFile) string {
+	if claim := jwtEnterpriseID(af.accessToken()); claim != "" {
+		return claim
+	}
+	return firstNonBlank(af.Account.EnterpriseID, af.Account.EnterpriseIDSnake)
 }
 
 type accountResult struct {
@@ -111,6 +178,11 @@ func packageRemainUsed(a resourcePackage) (remain, used, size int64) {
 }
 
 func fetchUserResource(af *authFile) (remain, used, size int64, packs int, err error) {
+	// 企业版额度不在个人资源包体系内：get-user-resource 对企业号恒返回空 Accounts，
+	// 会把「有额度」显示成 0。与企业网关同口径分流到 get-enterprise-user-usage。
+	if enterpriseIDFor(af) != "" {
+		return fetchEnterpriseResource(af)
+	}
 	now := time.Now()
 	body, _ := json.Marshal(map[string]any{
 		"PageNumber":               1,
@@ -123,22 +195,24 @@ func fetchUserResource(af *authFile) (remain, used, size int64, packs int, err e
 	base := billingBaseFor(af)
 	// global 域无 /v2 前缀（与 internal/upstream 的 billingMeterPaths 同口径）。
 	path := "/v2/billing/meter/get-user-resource"
-	if base == billingBaseGlobal {
+	if isGlobalAuth(af) {
 		path = "/billing/meter/get-user-resource"
 	}
 	req, err := http.NewRequest(http.MethodPost, base+path, bytes.NewReader(body))
 	if err != nil {
 		return 0, 0, 0, 0, err
 	}
-	req.Header.Set("Authorization", "Bearer "+af.Auth.AccessToken)
+	req.Header.Set("Authorization", "Bearer "+af.accessToken())
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "application/json")
 	if af.Account.UID != "" {
 		req.Header.Set("X-User-Id", af.Account.UID)
 	}
-	if af.Account.EnterpriseID != "" {
-		req.Header.Set("X-Enterprise-Id", af.Account.EnterpriseID)
-		req.Header.Set("X-Tenant-Id", af.Account.EnterpriseID)
+	// 个人端点也不能使用文件里过期的租户值：JWT 已判为个人时应无企业头，
+	// 企业号则早已在上方分流到 fetchEnterpriseResource。
+	if eid := enterpriseIDFor(af); eid != "" {
+		req.Header.Set("X-Enterprise-Id", eid)
+		req.Header.Set("X-Tenant-Id", eid)
 	}
 	if af.Auth.Domain != "" {
 		req.Header.Set("X-Domain", af.Auth.Domain)
@@ -191,6 +265,84 @@ func fetchUserResource(af *authFile) (remain, used, size int64, packs int, err e
 	return remain, used, size, packs, nil
 }
 
+// fetchEnterpriseResource 查询企业账号的分配额度。上游口径与
+// internal/upstream.enterpriseResource 一致：credit = 本周期已用，limitNum =
+// 分配给本账号的额度；因此 remain = limitNum - credit（四舍五入）。
+func fetchEnterpriseResource(af *authFile) (remain, used, size int64, packs int, err error) {
+	base := billingBaseFor(af)
+	path := "/v2/billing/meter/get-enterprise-user-usage"
+	if isGlobalAuth(af) {
+		path = "/billing/meter/get-enterprise-user-usage"
+	}
+	body, _ := json.Marshal(map[string]any{})
+	req, err := http.NewRequest(http.MethodPost, base+path, bytes.NewReader(body))
+	if err != nil {
+		return 0, 0, 0, 0, err
+	}
+	req.Header.Set("Authorization", "Bearer "+af.accessToken())
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Content-Type", "application/json")
+	if af.Account.UID != "" {
+		req.Header.Set("X-User-Id", af.Account.UID)
+	}
+	if eid := enterpriseIDFor(af); eid != "" {
+		req.Header.Set("X-Enterprise-Id", eid)
+		req.Header.Set("X-Tenant-Id", eid)
+	}
+	if af.Auth.Domain != "" {
+		req.Header.Set("X-Domain", af.Auth.Domain)
+	}
+	client := &http.Client{Timeout: 20 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, 0, 0, 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return 0, 0, 0, 0, fmt.Errorf("http %d", resp.StatusCode)
+	}
+	var env struct {
+		Code int    `json:"code"`
+		Msg  string `json:"msg"`
+		Data struct {
+			Credit   *float64 `json:"credit"`
+			UsedNum  *float64 `json:"used_num"`
+			LimitNum *int64   `json:"limitNum"`
+			LimitSn  *int64   `json:"limit_num"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&env); err != nil {
+		return 0, 0, 0, 0, err
+	}
+	if env.Code != 0 {
+		return 0, 0, 0, 0, fmt.Errorf("code=%d %s", env.Code, env.Msg)
+	}
+	limit, consumed := env.Data.LimitNum, env.Data.Credit
+	if limit == nil {
+		limit = env.Data.LimitSn
+	}
+	if consumed == nil {
+		consumed = env.Data.UsedNum
+	}
+	if limit == nil || consumed == nil {
+		return 0, 0, 0, 0, fmt.Errorf("enterprise usage fields missing")
+	}
+	if *limit < 0 {
+		// 不限量：与 internal/upstream 同口径，用大剩余量表示，total=-1。
+		return 1 << 40, 0, -1, 1, nil
+	}
+	used = int64(*consumed + 0.5)
+	size = *limit
+	remain = size - used
+	if remain < 0 {
+		remain = 0
+	}
+	if remain > size {
+		remain = size
+	}
+	return remain, used, size, 1, nil
+}
+
 func main() {
 	pretty := len(os.Args) > 1 && os.Args[1] == "-pretty"
 	authDir := "./auths"
@@ -212,7 +364,7 @@ func main() {
 			continue
 		}
 		res := accountResult{UID: af.Account.UID, Nickname: af.Account.Nickname}
-		if af.Auth.AccessToken == "" {
+		if af.accessToken() == "" {
 			res.Error = "no accessToken"
 			accounts = append(accounts, res)
 			continue

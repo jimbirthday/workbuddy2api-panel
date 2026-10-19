@@ -501,9 +501,11 @@ func TestReuseFreshScanCoverageIncludesGated(t *testing.T) {
 	st.items = []scanAccountItem{}
 	st.covered = map[string]bool{}
 	for _, s := range states {
-		if !s.Disabled {
-			st.covered[s.UID] = true
+		// 与 runScan 一致：global / 企业版不进入覆盖集合。
+		if s.Disabled || s.Auth == nil || s.Auth.IsGlobal() || s.Auth.IsEnterprise() {
+			continue
 		}
+		st.covered[s.UID] = true
 	}
 	st.seq = 1
 	st.running = false
@@ -755,5 +757,134 @@ func TestQueuePreScanPartialFailureWarns(t *testing.T) {
 	warn, _ := snap["pre_warn"].(string)
 	if !strings.Contains(warn, "查询失败") || !strings.Contains(warn, "漏扫") {
 		t.Fatalf("pre_warn=%q snap=%v", warn, snap)
+	}
+}
+
+// TestRunScanBindsJobToAuthWhenGatedAccountsInterleave 扫描结果数组已压缩，
+// 但凭证必须与每个结果槽位一起绑定。池中插入禁用号/企业号后，若仍用压缩后的
+// items 下标回查 accounts，会把 A 的 UID 配上 B 的 Bearer——轻则串号查询，
+// 重则污染另一个账号的任务状态。这里从上游侧按 Bearer 统计，逐一校验。
+func TestRunScanBindsJobToAuthWhenGatedAccountsInterleave(t *testing.T) {
+	var mu sync.Mutex
+	got := map[string]int{}
+	p, _ := scanFixture(t, 2, func(w http.ResponseWriter, r *http.Request) {
+		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		mu.Lock()
+		got[token]++
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(listJSON()))
+	})
+	// 池按 UID 排序：插入更小的禁用号与企业号，使压缩下标与原 accounts 下标错位。
+	off, err := auth.Parse([]byte(`{"uid":"000-off","accessToken":"off-at","realm":"cn"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.cfg.Pool.Add(off)
+	p.cfg.Pool.Disable("000-off", "test")
+	ent, err := auth.Parse([]byte(`{"uid":"001-ent","accessToken":"ent-at","realm":"cn","enterpriseId":"ent-1"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.cfg.Pool.Add(ent)
+	// 给两个真实账号不同 token，便于从上游侧确认请求绑定。
+	if a := p.cfg.Pool.AuthByUID("uid-x"); a != nil {
+		a.AccessToken = "token-x"
+	}
+	if a := p.cfg.Pool.AuthByUID("uid-xx"); a != nil {
+		a.AccessToken = "token-xx"
+	}
+	req := httptest.NewRequest("POST", "/panel/api/tasks/scan_all", nil)
+	req.Header.Set("Authorization", "Bearer k")
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("scan_all code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	waitScanDone(t, p)
+
+	st := p.scan()
+	st.mu.Lock()
+	items := append([]scanAccountItem(nil), st.items...)
+	total := st.total
+	st.mu.Unlock()
+	if len(items) != 2 || total != 2 {
+		t.Fatalf("gated/disabled accounts must not occupy slots: total=%d items=%v", total, items)
+	}
+	want := map[string]string{"token-x": "uid-x", "token-xx": "uid-xx"}
+	seen := map[string]bool{}
+	for _, it := range items {
+		if it.GrowthErr != "" {
+			t.Fatalf("uid=%s query failed: %s", it.UID, it.GrowthErr)
+		}
+		for token, uid := range want {
+			if uid == it.UID {
+				seen[token] = true
+			}
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	for token, uid := range want {
+		if !seen[token] || got[token] == 0 {
+			t.Fatalf("uid %s was not queried with its own token; hits=%v", uid, got)
+		}
+	}
+	if got["off-at"] != 0 || got["ent-at"] != 0 {
+		t.Fatalf("disabled/enterprise accounts must not be queried: hits=%v", got)
+	}
+}
+
+// TestScanAccountTimeoutDoesNotHangRound 扫描单账号上游 hang 时，35s deadline
+// 必须让该账号失败退出并继续整轮；否则 470 号里一个坏请求就能把「扫描」永久
+// 卡在 HTTP 客户端 120s 上限上。测试把 deadline 缩短到百毫秒级，断言整轮仍能结束。
+func TestScanAccountTimeoutDoesNotHangRound(t *testing.T) {
+	oldTimeout := scanAccountTimeout
+	scanAccountTimeout = 120 * time.Millisecond
+	t.Cleanup(func() { scanAccountTimeout = oldTimeout })
+
+	p, hits := scanFixture(t, 2, func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-User-Id") == "uid-x" {
+			// 模拟上游 hang：只有 context 被 deadline 取消后才返回，验证请求确实
+			// 带上了调用方 ctx（而不是只等 http.Client.Timeout）。
+			<-r.Context().Done()
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(listJSON()))
+	})
+
+	req := httptest.NewRequest("POST", "/panel/api/tasks/scan_all", nil)
+	req.Header.Set("Authorization", "Bearer k")
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("scan_all code=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	var snap map[string]any
+	for time.Now().Before(deadline) {
+		snap = scanStatusForTest(t, p)
+		if snap["running"] == false {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if snap == nil || snap["running"] != false {
+		t.Fatalf("上游 hang 时扫描未在 deadline 内结束：%v", snap)
+	}
+	if got := snap["error_count"].(float64); got != 1 {
+		t.Fatalf("error_count=%v want 1（仅 hang 账号失败）", got)
+	}
+	if got := snap["pending_count"].(float64); got != 1 {
+		t.Fatalf("pending_count=%v want 1（正常账号仍被扫描）", got)
+	}
+	if done, total := snap["done"].(float64), snap["total"].(float64); done != total || total != 2 {
+		t.Fatalf("done/total=%v/%v want 2/2", done, total)
+	}
+	if hits.Load() < 3 {
+		// 两个账号各两路列表（默认 + mp）；hang 账号的两路也应已发出。
+		t.Fatalf("上游请求数=%d，预期至少 3", hits.Load())
 	}
 }

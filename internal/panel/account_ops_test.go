@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
@@ -20,6 +21,7 @@ func accountOpsFixture(t *testing.T, handler http.HandlerFunc) (*Panel, *pool.Po
 	up := upstream.New()
 	up.ChatBaseCN = srv.URL
 	up.WebBaseCN = srv.URL
+	up.BillingBaseCN = srv.URL
 	up.HTTP.Transport = srv.Client().Transport
 	up.ChatHTTP = srv.Client()
 
@@ -70,6 +72,34 @@ func TestAccountTestEmptyReplyIsFailure(t *testing.T) {
 	}
 	if st, _ := pl.Status("u1"); st.Cooling {
 		t.Fatalf("empty reply must not cool account: %+v", st)
+	}
+}
+
+// TestAccountBalanceReenablesHardCreditCooling 单号「余额」必须与签到/全量刷新
+// 同一恢复语义：余额耗尽进入 CoolHard 的账号，手动刷新拿回正余额即证明恢复，
+// 应立即解冻；只写 credits 会让按钮看起来成功、账号却继续显示冷却中。
+func TestAccountBalanceReenablesHardCreditCooling(t *testing.T) {
+	p, pl, _ := accountOpsFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/v2/billing/meter/get-user-resource") {
+			t.Errorf("unexpected path %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"code":0,"data":{"Response":{"Data":{"Accounts":[{"CapacityRemain":321,"CapacitySize":1000}]}}}}`))
+	})
+	pl.Cooldown("u1", pool.CoolHard, time.Hour, "credits exhausted")
+	if st, _ := pl.Status("u1"); !st.Cooling {
+		t.Fatalf("fixture account should start cooled: %+v", st)
+	}
+	rec := accountOpsPost(t, p, "/panel/api/accounts/u1/balance", `{}`)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"ok":true`) {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	st, _ := pl.Status("u1")
+	if st.Cooling {
+		t.Fatalf("balance refresh must clear CoolHard cooling: %+v", st)
+	}
+	if st.Credits != 321 {
+		t.Fatalf("credits=%d want 321", st.Credits)
 	}
 }
 

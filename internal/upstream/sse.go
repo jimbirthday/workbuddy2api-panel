@@ -126,9 +126,12 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 		// 出现内容时才作为有效收尾（避免只发 role + stop 也合成 200 空回答）。
 		gotAnswer   bool
 		validEvents int
-		sawDone     bool // 上游显式发过 data: [DONE]（正常收尾）
-		toolCalls   = map[int]map[string]any{}
-		toolOrder   []int
+		// sawChoice 标记是否真的见过非空 choices。Aggregate 会自行合成 choices，
+		// 若只有正文却从未出现可解析 choice，说明帧结构不可交付，不能 200 放行。
+		sawChoice bool
+		sawDone   bool // 上游显式发过 data: [DONE]（正常收尾）
+		toolCalls = map[int]map[string]any{}
+		toolOrder []int
 		// legacyFunctionCall 累积遗留 function_call（非 tool_calls 数组形态）。
 		// 上游真实流里 name 在首片、arguments 在后续分片；必须合并而不是丢弃，
 		// 否则合法的 function_call-only 回答会被最终闸门误判为空流。
@@ -285,6 +288,9 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 						usage = u
 					}
 					if ch, ok := chunk["choices"].([]any); ok {
+						if len(ch) > 0 {
+							sawChoice = true
+						}
 						for _, ci := range ch {
 							c, _ := ci.(map[string]any)
 							if c == nil {
@@ -394,6 +400,9 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 	// 的空消息——正是非流式假成功。必须把「非空正文/思考/带名称或参数的
 	// tool_calls 或遗留 function_call」作为最后一道闸。
 	if !aggregateHasDeliverableAnswer(content.String(), reasoning.String(), message) {
+		return nil, errEmptyStream
+	}
+	if !sawChoice {
 		return nil, errEmptyStream
 	}
 	resp := map[string]any{

@@ -154,6 +154,64 @@ func TestChatLargeBodyNoGatewayLimit(t *testing.T) {
 	}
 }
 
+// TestChatImageFollowUpKeepsDerivedSession 端到端钉住 11135 的多轮修复：
+//   - 第 1 轮带图 -> 出站 X-Conversation-ID / prompt_cache_key 进入按账号隔离的图片会话；
+//   - 第 2 轮同一 conversation_id 只发文字 -> 两轮必须沿用同一个派生会话；
+//   - 换图 -> 派生会话必须变化。
+//
+// 断言的是实际写到上游 HTTP 请求上的值，而不是 session 包内部返回值。
+func TestChatImageFollowUpKeepsDerivedSession(t *testing.T) {
+	type seen struct {
+		conv string
+		key  string
+	}
+	var got []seen
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			body, _ := io.ReadAll(r.Body)
+			var obj map[string]any
+			_ = json.Unmarshal(body, &obj)
+			key, _ := obj["prompt_cache_key"].(string)
+			got = append(got, seen{conv: r.Header.Get("X-Conversation-ID"), key: key})
+			return &http.Response{
+				StatusCode: 200,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader(sseOK)),
+			}, nil
+		})},
+		ChatBaseCN:    "https://fake.example",
+		BillingBaseCN: "https://fake.example",
+	}
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up})
+
+	send := func(body string) {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+		}
+	}
+	image := `{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}`
+	send(`{"model":"glm-5.2","stream":true,"conversation_id":"conv-1","messages":[{"role":"user","content":[` + image + `]}]}`)
+	send(`{"model":"glm-5.2","stream":true,"conversation_id":"conv-1","messages":[{"role":"user","content":"这次图里是什么？"}]}`)
+	send(`{"model":"glm-5.2","stream":true,"conversation_id":"conv-1","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,BBBB"}}]}]}`)
+
+	if len(got) != 3 {
+		t.Fatalf("upstream calls=%d want 3", len(got))
+	}
+	if got[0].conv == "" || got[0].conv == "conv-1" || !strings.Contains(got[0].conv, ":img") {
+		t.Fatalf("first image turn did not use derived session: %+v", got[0])
+	}
+	if got[1].conv != got[0].conv || got[1].key == "" || got[1].key != got[0].key {
+		t.Fatalf("text follow-up must reuse image session: first=%+v follow-up=%+v", got[0], got[1])
+	}
+	if got[2].conv == got[0].conv {
+		t.Fatalf("replacing image must switch session: first=%+v replaced=%+v", got[0], got[2])
+	}
+}
+
 // TestChatBadParamsFailsFastWithoutPenalty 上游 400 + Unmarshal chat params failed（11101）
 // → 请求级错误：不罚账号（无冷却/无禁用/无熔断计数/无 errTotal），**且不轮转**——
 // 同一 body 换号必然同样失败。端到端断言只打一次上游、直接回 400、账号完好。

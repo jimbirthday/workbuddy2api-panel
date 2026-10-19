@@ -4,6 +4,7 @@ package upstream
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -44,6 +45,13 @@ type TravelState struct {
 // growthJSON 发 growth 域请求并解信封；body 为 nil 时不带请求体。
 // 错误语义与 doJSON 一致：HTTP 非 2xx / 业务 code != 0 → *Error。
 func (c *Client) growthJSON(a *auth.Auth, method, path string, body any) (json.RawMessage, error) {
+	return c.growthJSONContext(context.Background(), a, method, path, body)
+}
+
+// growthJSONContext 同 growthJSON，但把调用方 context 透传到 HTTP 请求。
+// 任务中心扫描用它给单账号设置总超时：上游 hang 时请求会被取消，扫描继续
+// 处理下一个账号，而不是整轮卡在 120 秒 HTTP 超时上。
+func (c *Client) growthJSONContext(ctx context.Context, a *auth.Auth, method, path string, body any) (json.RawMessage, error) {
 	var rdr io.Reader
 	if body != nil {
 		raw, err := json.Marshal(body)
@@ -52,7 +60,10 @@ func (c *Client) growthJSON(a *auth.Auth, method, path string, body any) (json.R
 		}
 		rdr = bytes.NewReader(raw)
 	}
-	req, err := http.NewRequest(method, c.chatBase(a)+path, rdr)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	req, err := http.NewRequestWithContext(ctx, method, c.chatBase(a)+path, rdr)
 	if err != nil {
 		return nil, err
 	}

@@ -651,3 +651,189 @@ func TestClampGPTMinMaxTokens(t *testing.T) {
 		})
 	}
 }
+
+// TestNormalizeStop 钉住 OpenAI `stop: string | string[]` 的出站形态。上游把
+// 字段定死为 []string，字符串会 400/11101；空值与空数组删除字段，非法类型
+// 原样交给上游报错，避免把调用方错误静默改写成另一种语义。
+func TestNormalizeStop(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want any // nil 表示输出不应有 stop 字段
+	}{
+		{"string wraps", `{"model":"m","stop":"END"}`, []any{"END"}},
+		{"blank separator string survives", `{"model":"m","stop":"\n\n"}`, []any{"\n\n"}},
+		{"array stays ordered", `{"model":"m","stop":["END","STOP"]}`, []any{"END", "STOP"}},
+		{"array filters empties", `{"model":"m","stop":["END","","STOP"]}`, []any{"END", "STOP"}},
+		// 数组里混入非字符串时不能只转发合法前缀，否则调用方的 `["END",7]`
+		// 会被静默改写成 `["END"]`。整体保留原值，交给上游明确 400。
+		{"array with non-strings preserved", `{"model":"m","stop":["END",7,null]}`, []any{"END", float64(7), nil}},
+		{"empty string removed", `{"model":"m","stop":""}`, nil},
+		{"empty array removed", `{"model":"m","stop":[]}`, nil},
+		{"null removed", `{"model":"m","stop":null}`, nil},
+		{"number preserved", `{"model":"m","stop":7}`, float64(7)},
+		{"object preserved", `{"model":"m","stop":{"a":1}}`, map[string]any{"a": float64(1)}},
+		{"absent stays absent", `{"model":"m"}`, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out := PrepareBodyOptWithEfforts([]byte(tc.body), false, nil)
+			var obj map[string]any
+			if err := json.Unmarshal(out, &obj); err != nil {
+				t.Fatalf("unmarshal: %v (out=%s)", err, out)
+			}
+			got, present := obj["stop"]
+			if tc.want == nil {
+				if present {
+					t.Fatalf("stop should be removed, got %#v", got)
+				}
+				return
+			}
+			if !present {
+				t.Fatalf("stop missing, want %#v", tc.want)
+			}
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("stop=%#v want %#v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestNormalizeStopOutboundJSON 全链路断言不是单测内部 map 自嗨：序列化后的
+// JSON 必须是数组，否则上游仍然会在 unmarshal 阶段报 11101。
+func TestNormalizeStopOutboundJSON(t *testing.T) {
+	out := PrepareBodyOpt([]byte(`{"model":"m","stop":"\n\n","messages":[]}`), true)
+	var probe struct {
+		Stop []string `json:"stop"`
+	}
+	if err := json.Unmarshal(out, &probe); err != nil {
+		t.Fatalf("outbound stop is not []string: %v (out=%s)", err, out)
+	}
+	if !reflect.DeepEqual(probe.Stop, []string{"\n\n"}) {
+		t.Fatalf("outbound stop=%#v want [\\n\\n]", probe.Stop)
+	}
+}
+
+// TestPrepareBodyStopStringThroughClient 端到端：客户端组件发出的 stop 字符串
+// 在真正写到上游请求体之前必须已是数组。走 prepareBody（含 cache key / effort
+// 管线）而不是只测 normalizeBodyObject，避免将来调换阶段顺序时回归。
+func TestPrepareBodyStopStringThroughClient(t *testing.T) {
+	c := New()
+	out := c.prepareBody([]byte(`{"model":"glm-5.2","stop":"END","messages":[{"role":"user","content":"hi"}]}`), "cn", "uid-1", "conv-1", false)
+	var obj map[string]any
+	if err := json.Unmarshal(out, &obj); err != nil {
+		t.Fatalf("unmarshal: %v (%s)", err, out)
+	}
+	got, ok := obj["stop"].([]any)
+	if !ok || len(got) != 1 || got[0] != "END" {
+		t.Fatalf("prepareBody stop=%#v want [END] (body=%s)", obj["stop"], out)
+	}
+}
+
+// TestPrepareBodyImageSessionCacheKey 图片请求的会话源必须覆盖 body 里的旧
+// conversation_id：否则客户端在同一会话换图后，X-Conversation-ID 虽被隔离，
+// prompt_cache_key 仍哈希回旧会话，前缀缓存与上游图片状态继续串用（11135）。
+// 无图请求不改变既有优先级（body conversation_id 仍优先）。
+func TestPrepareBodyImageSessionCacheKey(t *testing.T) {
+	c := New()
+	for _, body := range [][]byte{
+		[]byte(`{"model":"glm-5.2","conversation_id":"client-conv","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}]}]}`),
+		// 客户端显式固定 prompt_cache_key 时也必须被图片指纹派生值覆盖，
+		// 否则换图后仍命中旧缓存会话，11135 继续复现。
+		[]byte(`{"model":"glm-5.2","conversation_id":"client-conv","prompt_cache_key":"client-fixed","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}]}]}`),
+	} {
+		out := c.prepareBodyForceCacheConv(body, "cn", "uid-1", "client-conv:img:abcd", false, true)
+		var obj map[string]any
+		if err := json.Unmarshal(out, &obj); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		got, _ := obj["prompt_cache_key"].(string)
+		want := buildCacheKey("uid-1", "client-conv:img:abcd")
+		if got != want {
+			t.Fatalf("body=%s prompt_cache_key=%q want image-session derived %q", body, got, want)
+		}
+	}
+}
+
+// TestChatStreamImageSessionCacheKey 走真实 ChatStreamContext 入口，确认
+// PromptCacheConversationID 不仅存在于单测 helper，而是实际支配出站缓存键。
+func TestChatStreamImageSessionCacheKey(t *testing.T) {
+	var wire map[string]any
+	var wireConvID string
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		body, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(body, &wire); err != nil {
+			t.Fatalf("wire body: %v", err)
+		}
+		wireConvID = r.Header.Get("X-Conversation-ID")
+		return &http.Response{
+			StatusCode: 200,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       io.NopCloser(strings.NewReader("data: [DONE]\n\n")),
+		}, nil
+	})
+	a := &auth.Auth{AccessToken: "at", UID: "u1"}
+	body := []byte(`{"model":"glm-5.2","conversation_id":"client-conv","messages":[]}`)
+	rc, status, respBody, err := c.ChatStream(a, body, "", ChatMeta{
+		ConversationID: "client-conv", PromptCacheConversationID: "client-conv:img:abcd",
+	})
+	if err != nil || status != 200 {
+		t.Fatalf("chat: status=%d body=%s err=%v", status, respBody, err)
+	}
+	rc.Close()
+	got, _ := wire["prompt_cache_key"].(string)
+	want := buildCacheKey("u1", "client-conv:img:abcd")
+	if got != want {
+		t.Fatalf("wire prompt_cache_key=%q want %q", got, want)
+	}
+	// 11135 隔离必须同时作用于 X-Conversation-ID：上游按该头绑定图片状态，
+	// 只改缓存键仍会复用旧会话。图片请求用派生会话，普通请求保持原值透传。
+	if wireConvID != "client-conv:img:abcd" {
+		t.Fatalf("wire X-Conversation-ID=%q want image-derived session", wireConvID)
+	}
+}
+
+// TestChatStreamEnterpriseImageSessionCarriesTenant 企业号的图片隔离会话必须
+// 与租户头同时成立：换图后 X-Conversation-ID / body 会话切到派生值，但
+// X-Enterprise-Id / X-Tenant-Id 仍指向该企业。若只覆盖个人号，回归时很容易
+// 修好 11135 却把企业聊天落回默认租户（企业图片请求表现为“图片存在但上下文
+// 丢失”或跨租户 11135）。
+func TestChatStreamEnterpriseImageSessionCarriesTenant(t *testing.T) {
+	var wire map[string]any
+	var gotConv, gotEnt, gotTenant string
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		body, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(body, &wire); err != nil {
+			t.Fatalf("wire body: %v", err)
+		}
+		gotConv = r.Header.Get("X-Conversation-ID")
+		gotEnt = r.Header.Get("X-Enterprise-Id")
+		gotTenant = r.Header.Get("X-Tenant-Id")
+		return &http.Response{
+			StatusCode: 200,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       io.NopCloser(strings.NewReader("data: [DONE]\n\n")),
+		}, nil
+	})
+	a := &auth.Auth{AccessToken: "at", UID: "u-ent", EnterpriseID: "ent-img"}
+	body := []byte(`{"model":"glm-5.2","conversation_id":"client-conv","messages":[]}`)
+	rc, status, respBody, err := c.ChatStream(a, body, "", ChatMeta{
+		ConversationID: "client-conv", PromptCacheConversationID: "client-conv:img:abcd",
+	})
+	if err != nil || status != 200 {
+		t.Fatalf("chat: status=%d body=%s err=%v", status, respBody, err)
+	}
+	rc.Close()
+	if gotConv != "client-conv:img:abcd" {
+		t.Fatalf("enterprise image X-Conversation-ID=%q want derived session", gotConv)
+	}
+	if gotEnt != "ent-img" || gotTenant != "ent-img" {
+		t.Fatalf("enterprise image tenant headers=%q/%q want ent-img/ent-img", gotEnt, gotTenant)
+	}
+	if got, _ := wire["conversation_id"].(string); got != "client-conv:img:abcd" {
+		t.Fatalf("enterprise image body conversation_id=%q want derived session", got)
+	}
+	if got, _ := wire["prompt_cache_key"].(string); got != buildCacheKey("u-ent", "client-conv:img:abcd") {
+		t.Fatalf("enterprise image prompt_cache_key=%q", got)
+	}
+}

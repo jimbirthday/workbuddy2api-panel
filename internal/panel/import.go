@@ -18,23 +18,27 @@ import (
 
 // cockpitAccount 映射 cockpit tools 导出格式的单个账号。
 type cockpitAccount struct {
-	ID             string `json:"id"`
-	Email          string `json:"email"`
-	UID            string `json:"uid"`
-	Nickname       string `json:"nickname"`
-	AccessToken    string `json:"access_token"`
-	RefreshToken   string `json:"refresh_token"`
-	TokenType      string `json:"token_type"`
-	ExpiresAt      int64  `json:"expires_at"`
-	Domain         string `json:"domain"`
-	DosageNotify   string `json:"dosage_notify_code"`
-	PaymentType    string `json:"payment_type"`
-	Status         string `json:"status"`
-	UsageUpdatedAt int64  `json:"usage_updated_at"`
-	LastCheckin    int64  `json:"last_checkin_time"`
-	CheckinStreak  int    `json:"checkin_streak"`
-	CreatedAt      int64  `json:"created_at"`
-	LastUsed       int64  `json:"last_used"`
+	ID       string `json:"id"`
+	Email    string `json:"email"`
+	UID      string `json:"uid"`
+	Nickname string `json:"nickname"`
+	// cockpit 导出可能在 account/扁平行任一位置携带企业标识；两种命名都接受，
+	// 否则企业号导入后会退化成个人号（签到、成长任务、个人额度端点都会走错）。
+	EnterpriseID      string `json:"enterpriseId"`
+	EnterpriseIDSnake string `json:"enterprise_id"`
+	AccessToken       string `json:"access_token"`
+	RefreshToken      string `json:"refresh_token"`
+	TokenType         string `json:"token_type"`
+	ExpiresAt         int64  `json:"expires_at"`
+	Domain            string `json:"domain"`
+	DosageNotify      string `json:"dosage_notify_code"`
+	PaymentType       string `json:"payment_type"`
+	Status            string `json:"status"`
+	UsageUpdatedAt    int64  `json:"usage_updated_at"`
+	LastCheckin       int64  `json:"last_checkin_time"`
+	CheckinStreak     int    `json:"checkin_streak"`
+	CreatedAt         int64  `json:"created_at"`
+	LastUsed          int64  `json:"last_used"`
 }
 
 // importCockpit 接收 cockpit tools 导出的 JSON 文件，批量导入账号到池中。
@@ -165,9 +169,13 @@ func (p *Panel) importCockpitAccounts(accounts []cockpitAccount, dryRun, overwri
 			ExpiresAt:    expiresAt,
 			Domain:       acc.Domain,
 			UID:          uid,
+			EnterpriseID: firstNonBlank(acc.EnterpriseID, acc.EnterpriseIDSnake),
 			Nickname:     nickname,
 			FilePath:     filePath,
 		}
+		// 导入可能带来显式 enterpriseId 与 token 不一致的旧导出：claim 有企业身份
+		// 时以 token 为准，避免新 token 被旧租户字段压住。
+		a.InitEnterpriseIdentity()
 
 		exists := p.importTargetExists(uid, filePath)
 		if exists && !overwrite {
@@ -267,11 +275,19 @@ func saveAndActivateImportedAccount(p *Panel, a *auth.Auth, realm string, overwr
 			} else if claimed {
 				log.Printf("panel: import global trial uid=%s 已领", logfmt.UID8(a.UID))
 			}
-		} else if err := p.cfg.Upstream.DailyCheckin(a); err != nil {
-			log.Printf("panel: import checkin uid=%s: %v", logfmt.UID8(a.UID), err)
+		} else if !a.IsEnterprise() {
+			// 企业账号没有个人签到体系（上游 400 code 10001）。导入时跳过，
+			// 但下方额度查询照常走企业端点，不能把「签到失败」误报成导入异常。
+			if err := p.cfg.Upstream.DailyCheckin(a); err != nil {
+				log.Printf("panel: import checkin uid=%s: %v", logfmt.UID8(a.UID), err)
+			}
 		}
-		if rm, tt, err := p.cfg.Upstream.UserResource(a); err == nil {
+		// 企业额度与个人积分走不同端点；UserResource 已按 IsEnterprise 分流。
+		// 必须写回完整快照（总额/到期），否则导入后的账号要等下一次后台刷新
+		// 才有正确额度，面板会短暂显示 0 或被误判为余额不足。
+		if rm, tt, expiring, at, er, err := p.cfg.Upstream.UserResourceDetailedWithExpiry(a, p.expiringSoonWindow()); err == nil {
 			p.cfg.Pool.ReenableIfCredits(a.UID, rm, tt)
+			p.cfg.Pool.SetCreditsDetailed(a.UID, rm, tt, expiring, at, er)
 		}
 	}
 	return nil
@@ -298,6 +314,17 @@ func parseImportBool(values ...string) bool {
 		}
 	}
 	return false
+}
+
+// firstNonBlank 返回第一个去空白后非空的字符串，用于兼容同一语义的两种
+// 字段命名（如 enterpriseId / enterprise_id）。
+func firstNonBlank(values ...string) string {
+	for _, v := range values {
+		if s := strings.TrimSpace(v); s != "" {
+			return s
+		}
+	}
+	return ""
 }
 
 // safeImportID 只输出导入行自带的短 id，并剔除控制字符；缺失时用 "-"。

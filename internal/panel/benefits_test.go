@@ -266,9 +266,20 @@ func TestBenefitsFocusReusesGrowthSnapshot(t *testing.T) {
 			t.Fatalf("focus selected %q want %q", a.UID, statusUID8(second.UID))
 		}
 	}
-	// 第二次快照只重跑同一份成长快照；focus 不应再额外打任务列表端点。
+	// 切换 focus 只复用同一份成长快照；不应再额外打任务列表端点。
 	// 首次 12 次 = 2 个国内个人号 ×（streak/lottery/energy/travel/task/mp-task）。
-	if delta := calls - firstCalls; delta != firstCalls {
+	if delta := calls - firstCalls; delta != 0 {
 		t.Fatalf("focus caused extra upstream calls: delta=%d first=%d", delta, firstCalls)
+	}
+	// ?refresh=1 必须绕过缓存并重新拉取同一组账号。
+	req = httptest.NewRequest(http.MethodGet, "/panel/api/benefits?refresh=1&focus="+benefitRefFor(second.UID), nil)
+	req.Header.Set("Authorization", "Bearer k")
+	rr = httptest.NewRecorder()
+	p.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("refresh code=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if delta := calls - firstCalls; delta != firstCalls {
+		t.Fatalf("refresh did not re-query upstream: delta=%d want=%d", delta, firstCalls)
 	}
 }

@@ -51,10 +51,32 @@ func (s *Scheduler) runDailyChat(trigger activity.Trigger) {
 	}
 }
 
-func (s *Scheduler) dailyChatOne(a *auth.Auth, trigger activity.Trigger) {
+// RunDailyChatFor 对单个国际版个人号执行一次完整每日活跃：桌面通道 + 网页通道。
+// 面板单号动作必须与定时任务同口径；只跑网页通道会让界面显示成功，但桌面腿
+// 的兼容路径从未被验证，和 Hub /accounts/daily-chat 的语义也不一致。
+// 返回值与活动记录同源：ok=false 时 message 是失败原因，供面板原样展示。
+func (s *Scheduler) RunDailyChatFor(a *auth.Auth, trigger activity.Trigger) (bool, string, error) {
+	if a == nil {
+		return false, "", fmt.Errorf("account not found")
+	}
+	if a.AccessTokenValue() == "" {
+		return false, "", fmt.Errorf("account has no access token")
+	}
+	if !a.IsGlobal() || a.IsEnterprise() {
+		return false, "", fmt.Errorf("daily chat is only for international personal accounts")
+	}
 	if s.cfg.Upstream == nil {
-		s.recordActivity(a, activity.TaskDailyChat, trigger, false, "upstream client unavailable")
-		return
+		return false, "", fmt.Errorf("upstream client unavailable")
+	}
+	ok, msg := s.dailyChatOne(a, trigger)
+	return ok, msg, nil
+}
+
+func (s *Scheduler) dailyChatOne(a *auth.Auth, trigger activity.Trigger) (bool, string) {
+	if s.cfg.Upstream == nil {
+		msg := "upstream client unavailable"
+		s.recordActivity(a, activity.TaskDailyChat, trigger, false, msg)
+		return false, msg
 	}
 	// 网页腿是官方每日活跃的计数依据；先跑它，失败时仍保留桌面腿尝试的
 	// 可观测信息，但最终结果必须是失败。
@@ -78,8 +100,9 @@ func (s *Scheduler) dailyChatOne(a *auth.Auth, trigger activity.Trigger) {
 			msg = strings.TrimSpace(string(respBody))
 		}
 		log.Printf("daily-chat %s: desktop leg failed: %v", logfmt.Label(a.UID, a.Nickname), err)
-		s.recordActivity(a, activity.TaskDailyChat, trigger, false, "桌面通道失败："+msg+webNote)
-		return
+		msg = "桌面通道失败：" + msg + webNote
+		s.recordActivity(a, activity.TaskDailyChat, trigger, false, msg)
+		return false, msg
 	}
 	if rc != nil {
 		// 只读空流，避免大响应占内存；关闭后交给连接池回收。
@@ -92,14 +115,18 @@ func (s *Scheduler) dailyChatOne(a *auth.Auth, trigger activity.Trigger) {
 			msg = fmt.Sprintf("upstream HTTP %d", status)
 		}
 		log.Printf("daily-chat %s: desktop leg HTTP %d", logfmt.Label(a.UID, a.Nickname), status)
-		s.recordActivity(a, activity.TaskDailyChat, trigger, false, "桌面通道失败："+msg+webNote)
-		return
+		msg = "桌面通道失败：" + msg + webNote
+		s.recordActivity(a, activity.TaskDailyChat, trigger, false, msg)
+		return false, msg
 	}
 	if !web.OK {
 		log.Printf("daily-chat %s: web leg failed: %s", logfmt.Label(a.UID, a.Nickname), web.Error)
-		s.recordActivity(a, activity.TaskDailyChat, trigger, false, "每日活跃未完成"+webNote)
-		return
+		msg := "每日活跃未完成" + webNote
+		s.recordActivity(a, activity.TaskDailyChat, trigger, false, msg)
+		return false, msg
 	}
 	log.Printf("daily-chat %s: ok (desktop+web)", logfmt.Label(a.UID, a.Nickname))
-	s.recordActivity(a, activity.TaskDailyChat, trigger, true, "每日活跃完成"+webNote)
+	msg := "每日活跃完成" + webNote
+	s.recordActivity(a, activity.TaskDailyChat, trigger, true, msg)
+	return true, msg
 }

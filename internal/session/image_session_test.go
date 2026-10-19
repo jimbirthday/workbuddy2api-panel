@@ -137,3 +137,28 @@ func TestResolveImageSessionLineageIsAccountScoped(t *testing.T) {
 		t.Fatalf("u1 follow-up=%q want %q", got, first)
 	}
 }
+
+// TestImageSummary 日志摘要只暴露 MIME/字节数/短哈希，不泄露 base64 原文；
+// 坏 base64、远程 URL 与同一图片的稳定哈希都要可区分。
+func TestImageSummary(t *testing.T) {
+	png := "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+	body := []byte(`{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,` + png + `"}}]}]}`)
+	got := ImageSummary(body)
+	if !strings.Contains(got, "images=1") || !strings.Contains(got, "image/png") || !strings.Contains(got, "B/") {
+		t.Fatalf("summary=%q", got)
+	}
+	if strings.Contains(got, png) || strings.Contains(got, "base64,") {
+		t.Fatalf("summary leaked payload: %q", got)
+	}
+	if again := ImageSummary(body); again != got {
+		t.Fatalf("summary unstable: %q vs %q", got, again)
+	}
+	bad := ImageSummary([]byte(`{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,%%%"}}]}]}`))
+	if !strings.Contains(bad, "bad-base64") {
+		t.Fatalf("bad base64 summary=%q", bad)
+	}
+	remote := ImageSummary([]byte(`{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.com/a.png?token=secret"}}]}]}`))
+	if !strings.Contains(remote, "url/") || strings.Contains(remote, "secret") {
+		t.Fatalf("remote summary=%q", remote)
+	}
+}

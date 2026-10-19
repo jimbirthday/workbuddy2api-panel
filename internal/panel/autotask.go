@@ -752,6 +752,7 @@ func (p *Panel) accountTaskAuto(w http.ResponseWriter, r *http.Request) {
 			}
 			return
 		}
+		p.invalidateBenefitsGrowth()
 		writeJSON(w, http.StatusOK, res.resp)
 	case <-ctx.Done():
 		// HTTP 侧超时返回，但后台流水线仍在跑——锁在流水线 goroutine 内释放，
@@ -1312,6 +1313,7 @@ func (p *Panel) accountTaskAutoAll(w http.ResponseWriter, r *http.Request) {
 	select {
 	case results := <-done:
 		log.Printf("panel: 一键完成可自动任务 uid=%s 共 %d 项", logfmt.UID8(uid), len(results))
+		p.invalidateBenefitsGrowth()
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "results": results})
 	case <-ctx.Done():
 		// HTTP 侧超时返回，但后台流水线仍在跑——锁在流水线 goroutine 内释放，

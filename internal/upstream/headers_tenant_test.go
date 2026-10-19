@@ -42,6 +42,21 @@ func TestChatHeadersCarryTenantForEnterprise(t *testing.T) {
 	}
 }
 
+// TestChatHeadersDoNotFabricateConversationID 客户端没给会话 ID 时不得发送
+// X-Conversation-ID。上游按此头绑定对话/图片状态，伪造一个账号级固定值会把
+// 所有无会话键的客户端并进同一个上游对话。
+func TestChatHeadersDoNotFabricateConversationID(t *testing.T) {
+	c := &Client{}
+	req := httptest.NewRequest(http.MethodPost, "http://upstream/v2/chat/completions", nil)
+	c.ChatHeaders(req, &auth.Auth{UID: "u1", AccessToken: "at"}, "", ChatMeta{})
+	if got := req.Header.Get("X-Conversation-ID"); got != "" {
+		t.Fatalf("X-Conversation-ID=%q want absent", got)
+	}
+	if got := req.Header.Get("X-Conversation-Request-ID"); got == "" {
+		t.Fatal("X-Conversation-Request-ID must still be generated")
+	}
+}
+
 // TestEnterpriseModelCatalogCarriesTenant 企业模型目录（/v3/config 与企业端点家族）
 // 必须与聊天同一租户。缺 X-Enterprise-Id / X-Tenant-Id 时，上游会返回默认租户
 // 目录，企业私有模型缺失，前端表现为「企业号没有模型」。

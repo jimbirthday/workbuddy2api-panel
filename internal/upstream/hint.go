@@ -40,13 +40,13 @@ func GatewayHint(kind ErrKind, msg string, ctx HintContext) string {
 	}
 	// 11135 invalid_image_data 家族（图片数据无效，Discussion #77 实测形态）。
 	if isInvalidImageData(msg) {
-		return "image data rejected by upstream; use a real/valid image, may need a new conversation"
+		return "image rejected for this conversation; retry with a new conversation_id or replace the image"
 	}
 	switch kind {
 	case ErrPromptTooLong:
 		return "request context exceeds the model's limit; reduce history/message size"
 	case ErrImageInvalid:
-		return "image request was rejected by upstream; check image_url format and image data"
+		return "image rejected for this conversation; retry with a new conversation_id or replace the image"
 	case ErrWafBlock:
 		// 账号级 WAF 403 与 IP 级 fail-fast 同 hint：两者对客户端的动作一致
 		// （等待窗口过去再试，换号/立刻重试无意义）。

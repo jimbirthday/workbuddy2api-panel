@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -209,7 +210,10 @@ func (p *Panel) benefitsOverview(w http.ResponseWriter, r *http.Request) {
 
 	// 成长福利详情对所有国内个人号并发查询（固定 4 worker），避免顺序查询
 	// 把一页首屏拖成 N×4 次上游 RTT。失败只影响该行详情，不影响汇总。
-	growthByUID := p.benefitsGrowthSnapshot(statuses)
+	// ?refresh=1 是显式“刷新快照”：跳过缓存；普通打开/切换聚焦账号复用
+	// 30 秒内同一账号集合的结果，避免每次 focus 变化都重打 2N 次任务端点。
+	forceGrowth := r.URL.Query().Get("refresh") == "1"
+	growthByUID := p.benefitsGrowthSnapshot(statuses, forceGrowth)
 	for _, g := range growthByUID {
 		summary.StreakDays += g.StreakDays
 		summary.MakeupCards += g.MakeupCards
@@ -484,6 +488,7 @@ func (p *Panel) startBenefitBatch(kind string, fn func()) bool {
 	p.batchRuns[kind] = &batchRun{Kind: kind, StartedAt: started, Running: true}
 	p.batchMu.Unlock()
 	go p.finishBenefitBatch(kind, started, done)
+	p.invalidateBenefitsGrowth()
 	return true
 }
 
@@ -530,6 +535,7 @@ func (p *Panel) finishBenefitBatch(kind string, started time.Time, done <-chan s
 	p.batchMu.Lock()
 	p.batchRuns[kind] = &rec
 	p.batchMu.Unlock()
+	p.invalidateBenefitsGrowth()
 }
 
 // benefitsBatches returns the latest manual batch state for the welfare page.
@@ -555,6 +561,45 @@ func (p *Panel) benefitsBatches(w http.ResponseWriter, r *http.Request) {
 	p.batchMu.Unlock()
 	sort.SliceStable(out, func(i, j int) bool { return out[i].StartedAt.After(out[j].StartedAt) })
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "runs": out})
+}
+
+// benefitsLog returns the most recent welfare/task activity rows for the task
+// page. It is a read-only projection over the durable activity store, matching
+// Hub's visible execution log without inventing in-memory results. Full UIDs are
+// never exposed; the frontend only needs time, nickname, task and outcome.
+func (p *Panel) benefitsLog(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.Activity == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "rows": []any{}})
+		return
+	}
+	limit := 40
+	if v := strings.TrimSpace(r.URL.Query().Get("limit")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 200 {
+			limit = n
+		}
+	}
+	res, err := p.cfg.Activity.Query(activity.Filter{Limit: limit})
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "read activity log failed")
+		return
+	}
+	type row struct {
+		TS       time.Time        `json:"ts"`
+		Nickname string           `json:"nickname,omitempty"`
+		Realm    string           `json:"realm,omitempty"`
+		Task     activity.Task    `json:"task"`
+		Trigger  activity.Trigger `json:"trigger"`
+		OK       bool             `json:"ok"`
+		Message  string           `json:"message,omitempty"`
+	}
+	rows := make([]row, 0, len(res.Records))
+	for _, rec := range res.Records {
+		rows = append(rows, row{
+			TS: rec.Time, Nickname: rec.Nickname, Realm: rec.Realm,
+			Task: rec.Task, Trigger: rec.Trigger, OK: rec.OK, Message: rec.Message,
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "rows": rows})
 }
 
 // benefitGrowth 单账号成长福利快照（Hub fetch_growth_summary 同口径）。
@@ -648,7 +693,9 @@ func (p *Panel) growthResult(ctx context.Context, a *auth.Auth) benefitGrowth {
 // benefitsGrowthSnapshot 并发拉取国内个人号的成长福利详情。只读上游；
 // 企业号、国际号不参与（Hub 同一门控）。错误按账号记录，不写活动历史——
 // 这是展示查询，不是一次福利动作。
-func (p *Panel) benefitsGrowthSnapshot(statuses []pool.Status) map[string]benefitGrowth {
+const benefitsGrowthCacheTTL = 30 * time.Second
+
+func (p *Panel) benefitsGrowthSnapshot(statuses []pool.Status, force bool) map[string]benefitGrowth {
 	type job struct {
 		uid string
 		a   *auth.Auth
@@ -666,6 +713,29 @@ func (p *Panel) benefitsGrowthSnapshot(statuses []pool.Status) map[string]benefi
 	if len(jobs) == 0 {
 		return out
 	}
+	// Key includes the exact account set so adding/removing/disabling an
+	// account never serves another pool's task rows. Actions call
+	// invalidateBenefitsGrowth, and ?refresh=1 bypasses the TTL explicitly.
+	keys := make([]string, 0, len(jobs))
+	for _, j := range jobs {
+		keys = append(keys, j.uid)
+	}
+	sort.Strings(keys)
+	key := strings.Join(keys, "\x00")
+	now := time.Now()
+	if !force {
+		p.benefitsGrowthMu.Lock()
+		if p.benefitsGrowthSnap != nil && p.benefitsGrowthKey == key &&
+			now.Sub(p.benefitsGrowthAt) < benefitsGrowthCacheTTL {
+			cached := make(map[string]benefitGrowth, len(p.benefitsGrowthSnap))
+			for k, v := range p.benefitsGrowthSnap {
+				cached[k] = v
+			}
+			p.benefitsGrowthMu.Unlock()
+			return cached
+		}
+		p.benefitsGrowthMu.Unlock()
+	}
 	var mu sync.Mutex
 	p.runBackgroundBounded(4, len(jobs), func(i int) {
 		j := jobs[i]
@@ -676,7 +746,22 @@ func (p *Panel) benefitsGrowthSnapshot(statuses []pool.Status) map[string]benefi
 		out[j.uid] = g
 		mu.Unlock()
 	})
+	p.benefitsGrowthMu.Lock()
+	p.benefitsGrowthKey = key
+	p.benefitsGrowthAt = time.Now()
+	p.benefitsGrowthSnap = out
+	p.benefitsGrowthMu.Unlock()
 	return out
+}
+
+// invalidateBenefitsGrowth drops the cached growth/task snapshot after a
+// welfare or task action changes upstream state.
+func (p *Panel) invalidateBenefitsGrowth() {
+	p.benefitsGrowthMu.Lock()
+	p.benefitsGrowthSnap = nil
+	p.benefitsGrowthAt = time.Time{}
+	p.benefitsGrowthKey = ""
+	p.benefitsGrowthMu.Unlock()
 }
 
 // loadBenefitGrowth 拉取一个账号的成长福利；各接口相互独立，任一失败不阻塞

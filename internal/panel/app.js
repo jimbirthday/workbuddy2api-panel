@@ -5149,7 +5149,7 @@ if ($('usRange')) trangeBind('usRange', loadUsage);
 /* ── 活动记录 ─────────────────────────────────────────────────────── */
 /* 只读活动历史：签到/活跃/旅行/保活每次真实尝试。筛选全部由服务端按同一口径
    执行（task/result/uid/from	o），前端不缓存旧页结果，避免“看起来筛选了”。 */
-const ACT_TASK_LABEL = { checkin: '签到', activity: '活跃上报', travel: '猫猫旅行', keepalive: 'Token 保活' };
+const ACT_TASK_LABEL = { checkin: '签到', activity: '活跃上报', travel: '猫猫旅行', keepalive: 'Token 保活', daily_chat: '国际版每日活跃' };
 const ACT_TRIGGER_LABEL = { schedule: '定时', manual: '手动', unknown: '未知' };
 function actRowKey(r) {
   r = r || {};
@@ -5645,16 +5645,54 @@ async function loadBenefitBatches() {
         loadBenefitBatches();
       }, 3000);
     } else if (runs.length && !benefitsBatchDoneSig) {
-      // 批量刚结束：活动记录与账号状态已变化，自动刷新一次福利快照。
+      // 批量刚结束：活动记录与账号状态已变化，自动刷新一次福利快照和流水。
       benefitsBatchDoneSig = runs.map(r => r.kind + ':' + r.started_at + ':' + (r.failed || 0)).join('|');
       loadBenefits(true);
+      loadBenefitLog();
     } else if (runs.length) {
       const sig = runs.map(r => r.kind + ':' + r.started_at + ':' + (r.failed || 0)).join('|');
-      if (sig !== benefitsBatchDoneSig) { benefitsBatchDoneSig = sig; loadBenefits(true); }
+      if (sig !== benefitsBatchDoneSig) { benefitsBatchDoneSig = sig; loadBenefits(true); loadBenefitLog(); }
     }
   } catch (e) {
     const box = $('bfBatchList');
     if (box && view === 'taskscenter') box.innerHTML = '<div class="empty">读取执行结果失败：' + esc(e.message) + '</div>';
+  }
+}
+
+function renderBenefitLog(rows) {
+  const box = $('bfLogList');
+  if (!box) return;
+  rows = Array.isArray(rows) ? rows : [];
+  const note = $('bfLogNote');
+  if (note) note.textContent = rows.length ? '最近 ' + rows.length + ' 条' : '—';
+  if (!rows.length) {
+    box.innerHTML = '<div class="empty">暂无执行记录；手动执行签到/任务/旅行后会出现在这里</div>';
+    return;
+  }
+  box.innerHTML = rows.map(r => {
+    const task = benefitTaskLabel(r.task);
+    const when = benefitsTime(r.ts);
+    const who = r.nickname || (r.realm === 'global' ? '国际账号' : '国内账号');
+    const msg = r.message || (r.ok ? '完成' : '失败');
+    const tone = r.ok ? 'ok' : 'bad';
+    const trigger = r.trigger === 'manual' ? '手动' : (r.trigger === 'scheduler' || r.trigger === 'schedule' ? '排程' : '');
+    return '<div class="bf-log-row">' +
+      '<span class="t">' + esc(when) + '</span>' +
+      '<span class="n" title="' + esc(who) + '">' + esc(who) + '</span>' +
+      '<span class="m"><span class="tag ' + tone + '">' + (r.ok ? '成功' : '失败') + '</span> ' +
+      esc(task) + (trigger ? ' · ' + esc(trigger) : '') + ' · ' + esc(msg) + '</span>' +
+      '</div>';
+  }).join('');
+}
+
+async function loadBenefitLog() {
+  try {
+    const d = await api('benefits/log?limit=40');
+    if (view !== 'taskscenter') return;
+    renderBenefitLog(d && d.rows);
+  } catch (e) {
+    const box = $('bfLogList');
+    if (box && view === 'taskscenter') box.innerHTML = '<div class="empty">读取执行流水失败：' + esc(e.message) + '</div>';
   }
 }
 
@@ -5679,16 +5717,20 @@ function renderBenefits(d) {
   renderBenefitFocus(d || {});
   renderBenefitsAccounts(d && d.accounts);
   loadBenefitBatches();
+  loadBenefitLog();
 }
 
-async function loadBenefits(force) {
+async function loadBenefits(force, refresh) {
   if (benefitsReq && !force) return benefitsReq;
   if (force) benefitsReq = null;
   const my = ++benefitsSeq;
   const req = { promise: null, path: '' };
   req.promise = (async () => {
     try {
-      const q = benefitsFocusRef ? ('?focus=' + encodeURIComponent(benefitsFocusRef)) : '';
+      const qs = [];
+      if (benefitsFocusRef) qs.push('focus=' + encodeURIComponent(benefitsFocusRef));
+      if (refresh) qs.push('refresh=1');
+      const q = qs.length ? ('?' + qs.join('&')) : '';
       req.path = 'benefits' + q;
       const d = await api(req.path);
       if (my !== benefitsSeq || view !== 'taskscenter') return;
@@ -5841,7 +5883,8 @@ if ($('bfAccountsBody')) $('bfAccountsBody').addEventListener('click', ev => {
   runBenefitAction(btn.dataset.bfRef, btn.dataset.bfAct, btn.textContent || '动作');
 });
 
-if ($('btnBenefitsRefresh')) $('btnBenefitsRefresh').onclick = () => { loadBenefits(); loadOverview(true); toast('福利概览已刷新', 'ok'); };
+if ($('btnBenefitsRefresh')) $('btnBenefitsRefresh').onclick = () => { loadBenefits(true, true); loadOverview(true); toast('福利概览已刷新', 'ok'); };
+if ($('bfBtnLogRefresh')) $('bfBtnLogRefresh').onclick = () => { loadBenefitLog(); loadBenefitBatches(); };
 if ($('bfBtnRefreshGrants')) $('bfBtnRefreshGrants').onclick = async () => {
   const b = $('bfBtnRefreshGrants');
   const label = b.textContent;

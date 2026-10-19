@@ -98,3 +98,57 @@ func TestDailyChatWebFailureIsNotReportedAsSuccess(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 }
+
+// TestRunDailyChatForUsesDesktopAndWeb 单号入口必须与 Hub /accounts/daily-chat
+// 同口径：网页腿 + 桌面腿都执行。只跑网页腿会让面板的「每日活跃」按钮与
+// 定时任务产生两套行为，回归时也很难从活动记录里发现桌面调用消失。
+func TestRunDailyChatForUsesDesktopAndWeb(t *testing.T) {
+	origWeb := dailyChatWeb
+	var webCalls atomic.Int32
+	dailyChatWeb = func(s *Scheduler, a *auth.Auth) upstream.WebDailyResult {
+		webCalls.Add(1)
+		return upstream.WebDailyResult{OK: true, Conversation: "web-ok", Status: "completed", Chunks: 1}
+	}
+	t.Cleanup(func() { dailyChatWeb = origWeb })
+
+	r := &recorderUpstream{}
+	srv := r.server()
+	t.Cleanup(srv.Close)
+
+	a := &auth.Auth{UID: "global-one", AccessToken: "at", Domain: "www.workbuddy.ai"}
+	pl := pool.New("")
+	pl.Add(a)
+	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, ChatBaseGlobal: srv.URL}
+	store := activity.New(activity.Config{Path: filepath.Join(t.TempDir(), activity.FileName())})
+	s := New(Config{Pool: pl, Upstream: up, Activity: store})
+
+	ok, msg, err := s.RunDailyChatFor(a, activity.TriggerManual)
+	if err != nil || !ok || !strings.Contains(msg, "网页通道") {
+		t.Fatalf("daily chat for: ok=%v msg=%q err=%v", ok, msg, err)
+	}
+	if webCalls.Load() != 1 {
+		t.Fatalf("web leg calls=%d want 1", webCalls.Load())
+	}
+	var desktop int
+	for _, p := range r.snapshot() {
+		if p == "/v2/chat/completions" || p == "/chat/completions" {
+			desktop++
+		}
+	}
+	if desktop != 1 {
+		t.Fatalf("desktop leg calls=%d paths=%v want 1", desktop, r.snapshot())
+	}
+}
+
+// TestRunDailyChatForRejectsNonGlobal 单号入口不把国内/企业号送进网页通道。
+func TestRunDailyChatForRejectsNonGlobal(t *testing.T) {
+	s := New(Config{Upstream: &upstream.Client{}})
+	for _, a := range []*auth.Auth{
+		{UID: "cn", AccessToken: "at"},
+		{UID: "ent", AccessToken: "at", Domain: "www.workbuddy.ai", EnterpriseID: "ent"},
+	} {
+		if _, _, err := s.RunDailyChatFor(a, activity.TriggerManual); err == nil {
+			t.Fatalf("account %s should be rejected", a.UID)
+		}
+	}
+}

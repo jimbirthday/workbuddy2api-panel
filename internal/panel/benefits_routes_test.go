@@ -5,10 +5,12 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/linguo2625469/workbuddy2api-panel/internal/activity"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/scheduler"
@@ -130,5 +132,57 @@ func TestBenefitsBatchResultEndpoint(t *testing.T) {
 			t.Fatalf("streak batch did not finish: %s", rr.Body.String())
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestBenefitsLogExposesRecentActivity 任务页执行日志必须来自持久化活动记录，
+// 限制条数、最新在前，且不回显任何 UID。空 Store 时返回空数组而不是错误。
+func TestBenefitsLogExposesRecentActivity(t *testing.T) {
+	dir := t.TempDir()
+	store := activity.New(activity.Config{Path: filepath.Join(dir, activity.FileName()), MaxBytes: 1 << 20})
+	base := time.Date(2026, 10, 19, 9, 0, 0, 0, time.UTC)
+	for i, rec := range []activity.Record{
+		{Time: base, UID: "13800138000", Nickname: "甲", Realm: "cn", Task: activity.TaskCheckin, Trigger: activity.TriggerManual, OK: true, Message: "签到成功"},
+		{Time: base.Add(time.Minute), UID: "13900139000", Nickname: "乙", Realm: "cn", Task: activity.TaskTravel, Trigger: activity.TriggerManual, OK: false, Message: "旅行失败"},
+	} {
+		_ = i
+		if err := store.Append(rec); err != nil {
+			t.Fatal(err)
+		}
+	}
+	p := New(Config{Version: "test", APIKey: "k", Pool: pool.New(""), Activity: store})
+	req := httptest.NewRequest(http.MethodGet, "/panel/api/benefits/log?limit=1", nil)
+	req.Header.Set("Authorization", "Bearer k")
+	rr := httptest.NewRecorder()
+	p.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rr.Code, rr.Body.String())
+	}
+	var out struct {
+		Rows []struct {
+			Nickname string `json:"nickname"`
+			Task     string `json:"task"`
+			OK       bool   `json:"ok"`
+			Message  string `json:"message"`
+		} `json:"rows"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Rows) != 1 || out.Rows[0].Nickname != "乙" || out.Rows[0].Task != "travel" || out.Rows[0].OK {
+		t.Fatalf("rows=%+v", out.Rows)
+	}
+	body := rr.Body.String()
+	if strings.Contains(body, "13800138000") || strings.Contains(body, "13900139000") {
+		t.Fatalf("activity log leaked full UID: %s", body)
+	}
+
+	empty := New(Config{Version: "test", APIKey: "k", Pool: pool.New("")})
+	req = httptest.NewRequest(http.MethodGet, "/panel/api/benefits/log", nil)
+	req.Header.Set("Authorization", "Bearer k")
+	rr = httptest.NewRecorder()
+	empty.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK || !strings.Contains(rr.Body.String(), `"rows":[]`) {
+		t.Fatalf("nil store code=%d body=%s", rr.Code, rr.Body.String())
 	}
 }

@@ -2,8 +2,10 @@ package session
 
 import (
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -181,6 +183,97 @@ func ImageFingerprint(body []byte) string {
 		h.Write([]byte(url))
 	}
 	return hex.EncodeToString(h.Sum(nil)[:8])
+}
+
+// ImageSummary 返回请求里图片 part 的脱敏摘要，供日志定位 11135。仅统计
+// data: URL：MIME、解码后字节数、短哈希；远程 URL 只记 scheme+host，绝不打印
+// 查询串或原始 base64。返回空串表示没有可识别的图片。
+func ImageSummary(body []byte) string {
+	if len(body) == 0 {
+		return ""
+	}
+	var root struct {
+		Messages []struct {
+			Role    json.RawMessage `json:"role"`
+			Content json.RawMessage `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(body, &root); err != nil {
+		return ""
+	}
+	var parts []map[string]any
+	for _, m := range root.Messages {
+		var role string
+		_ = json.Unmarshal(m.Role, &role)
+		if !strings.EqualFold(strings.TrimSpace(role), "user") {
+			continue
+		}
+		raw := strings.TrimSpace(string(m.Content))
+		if len(raw) == 0 || raw[0] != '[' {
+			parts = nil
+			continue
+		}
+		if err := json.Unmarshal(m.Content, &parts); err != nil {
+			parts = nil
+		}
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	type item struct {
+		mime string
+		size int
+		hash string
+		kind string
+	}
+	var out []item
+	for _, part := range parts {
+		if !strings.EqualFold(imageString(part["type"]), "image_url") {
+			continue
+		}
+		u := imageURLFromPart(part)
+		if u == "" {
+			continue
+		}
+		if !strings.HasPrefix(strings.ToLower(u), "data:") {
+			out = append(out, item{kind: "url", hash: shortHash(u)})
+			continue
+		}
+		meta, payload, ok := strings.Cut(u, ",")
+		if !ok || !strings.HasPrefix(strings.ToLower(meta), "data:image/") {
+			out = append(out, item{kind: "malformed", hash: shortHash(u)})
+			continue
+		}
+		mime := strings.ToLower(strings.TrimSpace(strings.Split(strings.TrimPrefix(strings.ToLower(meta), "data:"), ";")[0]))
+		raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(payload))
+		if err != nil {
+			out = append(out, item{kind: "bad-base64", mime: mime, hash: shortHash(u)})
+			continue
+		}
+		out = append(out, item{kind: "data", mime: mime, size: len(raw), hash: shortHash(string(raw))})
+	}
+	if len(out) == 0 {
+		return ""
+	}
+	bits := make([]string, 0, len(out))
+	for _, it := range out {
+		switch it.kind {
+		case "data":
+			bits = append(bits, it.mime+"/"+strconv.Itoa(it.size)+"B/"+it.hash)
+		case "bad-base64":
+			bits = append(bits, it.mime+"/bad-base64/"+it.hash)
+		case "malformed":
+			bits = append(bits, "malformed/"+it.hash)
+		default:
+			bits = append(bits, "url/"+it.hash)
+		}
+	}
+	return "images=" + strconv.Itoa(len(out)) + " " + strings.Join(bits, ",")
+}
+
+func shortHash(s string) string {
+	sum := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(sum[:4])
 }
 
 // imageURLFromPart 取 image_url part 的 url。兼容 OpenAI 对象形态与字符串形态

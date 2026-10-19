@@ -212,6 +212,39 @@ func TestChatImageFollowUpKeepsDerivedSession(t *testing.T) {
 	}
 }
 
+// TestChatIgnoresInboundConversationHeader X-Conversation-ID 的来源是请求体
+// conversation_id / sessKey，不是入站同名头。若直接复制客户端头，调用方可以
+// 随意覆盖图片隔离派生的会话，11135 换图隔离会被绕过；没有会话键时也不应
+// 把客户端头当会话来源。
+func TestChatIgnoresInboundConversationHeader(t *testing.T) {
+	var gotConv string
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			gotConv = r.Header.Get("X-Conversation-ID")
+			return &http.Response{
+				StatusCode: 200,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader(sseOK)),
+			}, nil
+		})},
+		ChatBaseCN:    "https://fake.example",
+		BillingBaseCN: "https://fake.example",
+	}
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	body := `{"model":"glm-5.2","stream":true,"conversation_id":"body-conv","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("X-Conversation-ID", "header-must-not-win")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	if gotConv != "body-conv" {
+		t.Fatalf("outbound X-Conversation-ID=%q want body conversation_id", gotConv)
+	}
+}
+
 // TestChatBadParamsFailsFastWithoutPenalty 上游 400 + Unmarshal chat params failed（11101）
 // → 请求级错误：不罚账号（无冷却/无禁用/无熔断计数/无 errTotal），**且不轮转**——
 // 同一 body 换号必然同样失败。端到端断言只打一次上游、直接回 400、账号完好。

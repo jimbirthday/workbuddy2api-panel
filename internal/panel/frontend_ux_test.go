@@ -2829,6 +2829,56 @@ process.stdout.write(JSON.stringify({
 	}
 }
 
+// TestAppJSBenefitLogContract 任务页的最近执行流水必须来自 benefits/log，
+// 按时间/账号/任务/结果展示；完整 UID 不应出现在 DOM。
+func TestAppJSBenefitLogContract(t *testing.T) {
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('function benefitTaskLabel');
+const end = src.indexOf('async function loadBenefitLog', start);
+if (start < 0 || end < 0 || end < start) throw new Error('benefit log region not found');
+const nodes = {};
+const mk = id => (nodes[id] = { id, innerHTML: '', textContent: '', value: '', disabled: false, hidden: false, addEventListener() {}, querySelector() { return null; } });
+const $ = id => nodes[id] || mk(id);
+const ctx = {
+  $, esc: s => String(s == null ? '' : s),
+  benefitsTime: v => String(v || '').slice(0, 16),
+};
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, end) + '\nthis.renderBenefitLog=renderBenefitLog;', ctx);
+ctx.renderBenefitLog([
+  {ts: '2026-10-19T09:12:00Z', nickname: '甲', realm: 'cn', task: 'checkin', trigger: 'manual', ok: true, message: '签到成功'},
+  {ts: '2026-10-19T09:11:00Z', nickname: '乙', realm: 'cn', task: 'travel', trigger: 'scheduler', ok: false, message: '旅行失败'}
+]);
+const html = $('bfLogList').innerHTML;
+process.stdout.write(JSON.stringify({
+  rows: (html.match(/class="bf-log-row"/g) || []).length,
+  success: html.includes('签到成功'),
+  failure: html.includes('旅行失败'),
+  manual: html.includes('手动'),
+  schedule: html.includes('排程'),
+  note: $('bfLogNote').textContent,
+  leaked: html.includes('13800138000')
+}));`
+	out := runNodeScript(t, "benefit-log", script, appJSPath(t))
+	var got struct {
+		Rows     int    `json:"rows"`
+		Success  bool   `json:"success"`
+		Failure  bool   `json:"failure"`
+		Manual   bool   `json:"manual"`
+		Schedule bool   `json:"schedule"`
+		Note     string `json:"note"`
+		Leaked   bool   `json:"leaked"`
+	}
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("decode benefit log: %v (%s)", err, out)
+	}
+	if got.Rows != 2 || !got.Success || !got.Failure || !got.Manual || !got.Schedule || got.Note != "最近 2 条" || got.Leaked {
+		t.Fatalf("benefit log=%+v", got)
+	}
+}
+
 // TestAppJSBenefitsWelfareSummary 福利总积分/发放记录必须用 summary 的可用标记
 // 区分“尚未刷新快照”和“确实为 0”，并把最近记录按时间展示。
 func TestAppJSBenefitsWelfareSummary(t *testing.T) {
@@ -2872,6 +2922,58 @@ process.stdout.write(JSON.stringify({
 	const want = `{"total":"+80","sub":"2 笔福利发放","rows":2,"signin":true,"growth":true}`
 	if out != want {
 		t.Fatalf("benefits summary=%s\nwant %s", out, want)
+	}
+}
+
+// TestAppJSBenefitsRefreshForcesUpstream 刷新概览必须显式带 refresh=1；
+// 仅清前端请求去重仍会命中服务端 30 秒快照，按钮看起来“刷新了”但数字没变。
+func TestAppJSBenefitsRefreshForcesUpstream(t *testing.T) {
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('async function loadBenefits');
+const end = src.indexOf('\n}\n', start) + 3;
+if (start < 0 || end <= start) throw new Error('loadBenefits not found');
+const calls = [];
+const ctx = {
+  benefitsReq: null, benefitsSeq: 0, benefitsFocusRef: 'ref-1',
+  view: 'taskscenter', renderBenefits() {},
+  api: path => { calls.push(path); return Promise.resolve({}); },
+};
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, end) + '\nthis.loadBenefits=loadBenefits;', ctx);
+ctx.loadBenefits(false, false)
+  .then(() => ctx.loadBenefits(true, true))
+  .then(() => process.stdout.write(JSON.stringify(calls)));
+`
+	out := runNodeScript(t, "benefits-refresh", script, appJSPath(t))
+	if out != `["benefits?focus=ref-1","benefits?focus=ref-1&refresh=1"]` {
+		t.Fatalf("benefits requests=%s", out)
+	}
+}
+
+// TestTasksCenterParityDom 任务页必须同时具备 Hub 的账号选择、批量动作、
+// 执行结果与最近流水；账号表视口必须是固定高度虚拟窗口，不能随行数撑满整页。
+func TestTasksCenterParityDom(t *testing.T) {
+	raw, err := os.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(raw)
+	for _, id := range []string{
+		"bfGrowthAcct", "bfBtnFocusCheckin", "bfBtnFocusRun", "bfBtnFocusTravel", "bfBtnFocusStreak",
+		"bfTaskViewport", "bfTaskBody", "bfBatchList", "bfLogList", "bfBtnLogRefresh",
+		"accViewport", "accBody",
+	} {
+		if !strings.Contains(html, `id="`+id+`"`) {
+			t.Errorf("missing #%s in task/account UI", id)
+		}
+	}
+	if !strings.Contains(html, ".acc-viewport { position: relative; height:") {
+		t.Errorf("account viewport must use a bounded fixed height")
+	}
+	if !strings.Contains(html, ".benefits-tasks { height:") {
+		t.Errorf("task detail must use a bounded viewport too")
 	}
 }
 

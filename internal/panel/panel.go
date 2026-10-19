@@ -167,6 +167,15 @@ type Panel struct {
 	grantActionKey   string
 	grantActionAt    time.Time
 	grantActionCache map[string][]grantActionEntry
+
+	// benefitsGrowthMu caches the per-account growth/task snapshot for the
+	// welfare page. Hub does the same with a TTL: opening the page or switching
+	// the focused account must not hammer every account's task endpoints again.
+	// The cache is keyed by the exact account set and invalidated after actions.
+	benefitsGrowthMu   sync.Mutex
+	benefitsGrowthKey  string
+	benefitsGrowthAt   time.Time
+	benefitsGrowthSnap map[string]benefitGrowth
 }
 
 // tryLockAccount 尝试锁定账号的任务执行；已在执行返回 false。
@@ -292,6 +301,7 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/activity/history", p.withAuth(p.activityHistory))
 	p.mux.HandleFunc("GET /panel/api/benefits", p.withAuth(p.benefitsOverview))
 	p.mux.HandleFunc("GET /panel/api/benefits/batches", p.withAuth(p.benefitsBatches))
+	p.mux.HandleFunc("GET /panel/api/benefits/log", p.withAuth(p.benefitsLog))
 	p.mux.HandleFunc("GET /panel/api/school/vouchers", p.withAuth(p.schoolVouchers))
 	p.mux.HandleFunc("POST /panel/api/checkin_all", p.withAuth(p.checkinAll))
 	p.mux.HandleFunc("POST /panel/api/travel_all", p.withAuth(p.travelAll))
@@ -1152,9 +1162,11 @@ func (p *Panel) benefitsAccount(ref string, wantGlobal bool) (*auth.Auth, string
 }
 
 // benefitsDailyChat 单号国际版每日活跃（同步返回结果，便于页面立刻刷新）。
+// 与 Hub /accounts/daily-chat 同口径：桌面通道 + 网页通道。网页-only 的补打
+// 入口是 benefitsDailyChatWeb，两者不能互相替代。
 func (p *Panel) benefitsDailyChat(w http.ResponseWriter, r *http.Request) {
-	if p.cfg.Upstream == nil {
-		writeErr(w, http.StatusNotImplemented, "upstream client unavailable")
+	if p.cfg.Scheduler == nil || p.cfg.Upstream == nil {
+		writeErr(w, http.StatusNotImplemented, "scheduler not available")
 		return
 	}
 	a, msg := p.benefitsAccount(r.PathValue("ref"), true)
@@ -1168,18 +1180,14 @@ func (p *Panel) benefitsDailyChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer p.unlockAccount(uid)
-	res := p.cfg.Upstream.DailyChatWeb(a, "deepseek-v4.1-flash")
-	_ = p.cfg.Activity.Append(activity.Record{
-		UID: uid, Nickname: a.Nickname, Realm: a.Realm(), Task: activity.TaskDailyChat,
-		Trigger: activity.TriggerManual, OK: res.OK,
-		Message: dailyChatResultMessage(res),
-	})
+	ok, message, err := p.cfg.Scheduler.RunDailyChatFor(a, activity.TriggerManual)
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	p.invalidateBenefitsGrowth()
 	p.invalidateOverview()
-	writeJSON(w, http.StatusOK, map[string]any{
-		"ok": true, "success": res.OK, "conversation": res.Conversation,
-		"status": res.Status, "chunks": res.Chunks, "elapsed_ms": res.ElapsedMS,
-		"error": res.Error, "message": dailyChatResultMessage(res),
-	})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "success": ok, "message": message})
 }
 
 // benefitsDailyChatWeb 单号网页通道打卡。与 Hub 的 daily-chat-web 对齐：
@@ -1201,6 +1209,7 @@ func (p *Panel) benefitsDailyChatWeb(w http.ResponseWriter, r *http.Request) {
 	}
 	defer p.unlockAccount(uid)
 	res := p.cfg.Upstream.DailyChatWeb(a, "deepseek-v4.1-flash")
+	p.invalidateBenefitsGrowth()
 	_ = p.cfg.Activity.Append(activity.Record{
 		UID: uid, Nickname: a.Nickname, Realm: a.Realm(), Task: activity.TaskDailyChat,
 		Trigger: activity.TriggerManual, OK: res.OK,
@@ -1245,6 +1254,7 @@ func (p *Panel) benefitsStreak(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadGateway, err.Error())
 		return
 	}
+	p.invalidateBenefitsGrowth()
 	p.invalidateOverview()
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": "连登兑换与抽奖检查完成"})
 }
@@ -1268,6 +1278,7 @@ func (p *Panel) benefitsTravel(w http.ResponseWriter, r *http.Request) {
 	if !p.GoBackground(func() {
 		defer p.unlockAccount(a.UID)
 		_ = p.cfg.Scheduler.RunTravelFor(a)
+		p.invalidateBenefitsGrowth()
 		p.invalidateOverview()
 	}) {
 		p.unlockAccount(a.UID)
@@ -1327,6 +1338,7 @@ func (p *Panel) benefitsCheckin(w http.ResponseWriter, r *http.Request) {
 	next := r.Clone(r.Context())
 	next.SetPathValue("uid", a.UID)
 	p.accountCheckin(w, next)
+	p.invalidateBenefitsGrowth()
 }
 
 // balanceAll 手动全量刷新余额：并发查上游、写回池内 credits（含解冻语义），

@@ -96,6 +96,7 @@ func (p *Panel) accountTaskAccept(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadGateway, "accept: "+err.Error())
 		return
 	}
+	p.invalidateBenefitsGrowth()
 	log.Printf("panel: 接受任务 uid=%s codes=%v", logfmt.UID8(uid), body.TaskCodes)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
@@ -179,6 +180,7 @@ func (p *Panel) taskAcceptAll(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	log.Printf("panel: 全部接受 uid=%s 接受=%d 失败=%d", logfmt.UID8(uid), accepted, len(failed))
+	p.invalidateBenefitsGrowth()
 	resp := map[string]any{"ok": true, "accepted": accepted, "failed": failed}
 	if len(failed) > 0 {
 		resp["message"] = "部分任务接受失败（上游拒绝），可重试"
@@ -224,6 +226,7 @@ func (p *Panel) accountTaskClaim(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadGateway, "claim: "+err.Error())
 		return
 	}
+	p.invalidateBenefitsGrowth()
 	if credit == 0 && energy == 0 {
 		log.Printf("panel: 领取任务奖励 uid=%s code=%s（已领取过，无新增）", logfmt.UID8(uid), body.TaskCode)
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "already_claimed": true, "message": "该奖励此前已领取"})

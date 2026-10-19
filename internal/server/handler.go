@@ -1139,6 +1139,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			if kind == upstream.ErrImageInvalid {
 				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
 				fail(acct.UID)
+				if summary := session.ImageSummary(body); summary != "" {
+					log.Printf("WARN: [server] image rejected acct=%s model=%s conv=%q %s upstream=%s",
+						logfmt.Label(acct.UID, acct.Nickname), bareModel, logfmt.Truncate(convID, 48),
+						summary, logfmt.Truncate(string(respBody), 200))
+				}
 				msg := string(respBody)
 				if strings.TrimSpace(msg) == "" {
 					msg = "image request was rejected by upstream"

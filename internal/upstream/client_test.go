@@ -754,3 +754,21 @@ func TestFetchModelsOverlaysV3ConfigCapabilities(t *testing.T) {
 		t.Errorf("Efforts=%v want low,high,max", mi.Efforts)
 	}
 }
+
+// TestGatewayHintImageConversation 11135 的 gateway_hint 必须给出可执行动作：
+// 换会话或换图，而不是只重复“图片无效”。上游把图片状态绑定到会话，
+// 同一会话复用旧图/追加新图时即使图片本身合法也会被拒。
+func TestGatewayHintImageConversation(t *testing.T) {
+	for _, msg := range []string{
+		`{"code":11135,"msg":"Please start a new conversation, replace the image, and try again."}`,
+		`{"code":11135,"msg":"invalid_image_data"}`,
+	} {
+		got := GatewayHint(ErrImageInvalid, msg, HintContext{HasImage: true})
+		if !strings.Contains(got, "new conversation_id") || !strings.Contains(got, "replace the image") {
+			t.Fatalf("hint=%q want actionable conversation/image guidance", got)
+		}
+	}
+	if got := GatewayHint(ErrImageInvalid, "image request was rejected", HintContext{}); !strings.Contains(got, "new conversation_id") {
+		t.Fatalf("generic image hint=%q", got)
+	}
+}

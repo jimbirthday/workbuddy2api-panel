@@ -102,6 +102,12 @@ type Panel struct {
 	benefitRefMu sync.Mutex
 	benefitRefs  map[string]string
 
+	// batchMu/batchRuns holds the latest manual task/welfare batch per kind.
+	// The scheduler owns the real single-flight gate; this state only explains
+	// the outcome in the panel (started, running, success/failure counts).
+	batchMu   sync.Mutex
+	batchRuns map[string]*batchRun
+
 	// bgWG 跟踪面板后台异步任务（扫描、队列、导入等）。StopWaiting 先关
 	// bgStop 再等待，保证 Wait 期间不会再有 Add（WaitGroup 不允许 Add 与
 	// Wait 并发；关闭时的调度回调可能仍尝试启动成长队列）。没有登记的任务
@@ -238,6 +244,7 @@ func New(cfg Config) *Panel {
 		logs:        NewRing(500),
 		logins:      map[string]loginSession{},
 		benefitRefs: map[string]string{},
+		batchRuns:   map[string]*batchRun{},
 	}
 	p.routes()
 	return p
@@ -284,6 +291,7 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/tasks/queue", p.withAuth(p.tasksQueueStatus))
 	p.mux.HandleFunc("GET /panel/api/activity/history", p.withAuth(p.activityHistory))
 	p.mux.HandleFunc("GET /panel/api/benefits", p.withAuth(p.benefitsOverview))
+	p.mux.HandleFunc("GET /panel/api/benefits/batches", p.withAuth(p.benefitsBatches))
 	p.mux.HandleFunc("GET /panel/api/school/vouchers", p.withAuth(p.schoolVouchers))
 	p.mux.HandleFunc("POST /panel/api/checkin_all", p.withAuth(p.checkinAll))
 	p.mux.HandleFunc("POST /panel/api/travel_all", p.withAuth(p.travelAll))
@@ -997,7 +1005,7 @@ func (p *Panel) checkinAll(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotImplemented, "scheduler not available")
 		return
 	}
-	if !p.cfg.Scheduler.TryRunBatch("checkin", p.cfg.Scheduler.RunCheckinNow) {
+	if !p.startBenefitBatch("checkin", p.cfg.Scheduler.RunCheckinNow) {
 		writeErr(w, http.StatusConflict, "already_running")
 		return
 	}
@@ -1011,7 +1019,7 @@ func (p *Panel) travelAll(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotImplemented, "scheduler not available")
 		return
 	}
-	if !p.cfg.Scheduler.TryRunBatch("travel", p.cfg.Scheduler.RunTravelNow) {
+	if !p.startBenefitBatch("travel", p.cfg.Scheduler.RunTravelNow) {
 		writeErr(w, http.StatusConflict, "already_running")
 		return
 	}
@@ -1025,7 +1033,7 @@ func (p *Panel) activityAll(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotImplemented, "scheduler not available")
 		return
 	}
-	if !p.cfg.Scheduler.TryRunBatch("activity", p.cfg.Scheduler.RunActivityNow) {
+	if !p.startBenefitBatch("activity", p.cfg.Scheduler.RunActivityNow) {
 		writeErr(w, http.StatusConflict, "already_running")
 		return
 	}
@@ -1039,7 +1047,7 @@ func (p *Panel) keepaliveAll(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotImplemented, "scheduler not available")
 		return
 	}
-	if !p.cfg.Scheduler.TryRunBatch("keepalive", p.cfg.Scheduler.RunKeepaliveNow) {
+	if !p.startBenefitBatch("keepalive", p.cfg.Scheduler.RunKeepaliveNow) {
 		writeErr(w, http.StatusConflict, "already_running")
 		return
 	}
@@ -1053,7 +1061,7 @@ func (p *Panel) dailyChatAll(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotImplemented, "scheduler not available")
 		return
 	}
-	if !p.cfg.Scheduler.TryRunBatch("daily_chat", p.cfg.Scheduler.RunDailyChatNow) {
+	if !p.startBenefitBatch("daily_chat", p.cfg.Scheduler.RunDailyChatNow) {
 		writeErr(w, http.StatusConflict, "already_running")
 		return
 	}
@@ -1067,7 +1075,7 @@ func (p *Panel) streakAll(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotImplemented, "scheduler not available")
 		return
 	}
-	if !p.cfg.Scheduler.TryRunBatch("streak", p.cfg.Scheduler.RunStreakBonusNow) {
+	if !p.startBenefitBatch("streak", p.cfg.Scheduler.RunStreakBonusNow) {
 		writeErr(w, http.StatusConflict, "already_running")
 		return
 	}

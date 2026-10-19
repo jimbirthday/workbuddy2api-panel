@@ -453,16 +453,29 @@ func (s *Scheduler) runBatch(ctx context.Context, kinds []taskKind) {
 // 后台 goroutine 执行 fn，结束清位。闸门在 Scheduler 侧统一持有，确保手动与
 // 定时两路不会并发遍历同一批账号。
 func (s *Scheduler) TryRunBatch(kind string, fn func()) bool {
+	_, ok := s.TryRunBatchDone(kind, fn)
+	return ok
+}
+
+// TryRunBatchDone 与 TryRunBatch 相同，但额外返回一个在 fn 返回后关闭的
+// done 通道。调用方（面板批量结果）据此只等待自己启动的这一轮，而不是
+// 全局 WaitBatches——后者会在并发 Add/Wait 时产生竞态，也会被后启动的
+// 其它 kind 拖住。
+func (s *Scheduler) TryRunBatchDone(kind string, fn func()) (<-chan struct{}, bool) {
 	if !s.beginBatchKind(kind) {
-		return false
+		return nil, false
 	}
 	s.batchWG.Add(1)
+	done := make(chan struct{})
 	go func() {
+		// LIFO：先清 kind 标记、再减 WaitGroup、最后关闭 done。done 关闭时
+		// 本轮闸门已经释放，面板可以立即轮询批次状态。
+		defer close(done)
 		defer s.batchWG.Done()
 		defer s.endBatchKind(kind)
 		fn()
 	}()
-	return true
+	return done, true
 }
 
 // WaitBatches 等待所有通过 TryRunBatch 启动的后台批量任务结束（含签到/旅行/

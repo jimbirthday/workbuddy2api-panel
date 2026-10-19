@@ -382,6 +382,17 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 .benefits-table { max-height: clamp(300px, 48vh, 580px); overflow: auto; }
 .benefits-table .acc { min-width: 1080px; }
 .benefits-table th { position: sticky; top: 0; z-index: 2; }
+.benefits-table .virtual-pad td { padding: 0; border: 0; height: 0; }
+.benefits-table .virtual-pad i { display: block; }
+.bf-batch-list { max-height: 220px; overflow: auto; padding: 10px 16px 14px; font-size: 12px; }
+.bf-batch-row { display: grid; grid-template-columns: minmax(120px, 1fr) auto; gap: 4px 12px;
+  padding: 8px 0; border-bottom: 1px solid var(--line-soft); }
+.bf-batch-row:last-child { border-bottom: none; }
+.bf-batch-k { font-weight: 650; }
+.bf-batch-meta { color: var(--ink-3); font-size: 11.5px; }
+.bf-batch-stat { text-align: right; white-space: nowrap; }
+.benefits-grants-wrap { max-height: 300px; overflow: auto; }
+.benefits-grants-wrap th { position: sticky; top: 0; z-index: 2; background: var(--surface-2); }
 .bf-acts { white-space: nowrap; }
 .bf-acts button { margin: 2px 4px 2px 0; }
 .view-acts { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
@@ -1236,6 +1247,29 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <div class="stat card"><div class="k">国际版活跃</div><div class="v" id="bfDailyChatDone">-</div><div class="bf-sub" id="bfDailyChatSub">今日待活跃 —</div></div>
         <div class="stat card warn"><div class="k">成长待办</div><div class="v" id="bfGrowthPending">-</div><div class="bf-sub" id="bfGrowthSub">扫描后更新</div></div>
         <div class="stat card accent"><div class="k">今日失败</div><div class="v" id="bfTodayFailed">-</div><div class="bf-sub" id="bfLastActivity">最近活动 —</div></div>
+        <div class="stat card"><div class="k">福利总积分</div><div class="v" id="bfWelfareCredits">-</div><div class="bf-sub" id="bfWelfareSub">签到 / 成长 / 活动所得</div></div>
+      </div>
+      <div class="box benefits-batches">
+        <header>
+          <h3>福利动作执行结果 <span class="hint">手动批量动作的最近一轮结果</span></h3>
+          <span class="grow"></span>
+          <span class="note" id="bfBatchNote">—</span>
+        </header>
+        <div class="bf-batch-list" id="bfBatchList"><div class="empty">尚未执行批量动作</div></div>
+      </div>
+      <div class="box benefits-grants">
+        <header>
+          <h3>积分发放记录 <span class="hint">来自最近一次刷新积分的快照，不是逐笔账本</span></h3>
+          <span class="grow"></span>
+          <span class="note" id="bfGrantNote"></span>
+          <button class="xs" id="bfBtnRefreshGrants" title="逐账号实时查询积分包，用于更新总积分与发放记录">刷新积分</button>
+        </header>
+        <div class="tbl-wrap benefits-grants-wrap">
+          <table class="acc">
+            <thead><tr><th>发放时间</th><th>账号</th><th>包 / 来源</th><th>面额</th><th>剩余</th><th>到期</th><th>状态</th></tr></thead>
+            <tbody id="bfGrantsBody"><tr><td colspan="7"><div class="empty">读取中…</div></td></tr></tbody>
+          </table>
+        </div>
       </div>
       <div class="box benefits-actions">
         <header>
@@ -1279,7 +1313,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <span class="grow"></span>
           <span class="note" id="bfAcctNote"></span>
         </header>
-        <div class="tbl-wrap benefits-table">
+        <div class="tbl-wrap benefits-table acc-viewport" id="bfViewport" tabindex="0" aria-label="账号福利虚拟表格，可用上下方向键浏览">
           <table class="acc">
             <thead><tr><th>账号</th><th>区域</th><th>今日签到</th><th>每日活跃</th><th>成长待办</th><th>连登 / 补签 / 抽奖 / 能量</th><th>猫猫状态</th><th>最近活动</th><th>结果</th><th>操作</th></tr></thead>
             <tbody id="bfAccountsBody"></tbody>

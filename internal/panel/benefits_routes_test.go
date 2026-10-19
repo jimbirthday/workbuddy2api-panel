@@ -1,11 +1,13 @@
 package panel
 
 import (
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
@@ -75,5 +77,58 @@ func TestBenefitsAccountActionRef(t *testing.T) {
 		if rr.Code != tc.want {
 			t.Fatalf("%s code=%d want %d body=%s", tc.path, rr.Code, tc.want, rr.Body.String())
 		}
+	}
+}
+
+// TestBenefitsBatchResultEndpoint 批量动作启动后必须在福利页返回可轮询的
+// 最近一轮状态；空池时动作很快结束，状态应为 done 且不报错误。
+func TestBenefitsBatchResultEndpoint(t *testing.T) {
+	pl := pool.New("")
+	up := upstream.New()
+	s := scheduler.New(scheduler.Config{Pool: pl, Upstream: up})
+	p := New(Config{Version: "test", APIKey: "k", Pool: pl, Upstream: up, Scheduler: s})
+
+	rr := httptest.NewRecorder()
+	p.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/panel/api/benefits/batches", nil))
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("batches unauth code=%d want 401", rr.Code)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/panel/api/streak_all", strings.NewReader("{}"))
+	req.Header.Set("Authorization", "Bearer k")
+	rr = httptest.NewRecorder()
+	p.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("start batch code=%d body=%s", rr.Code, rr.Body.String())
+	}
+	// The batch records completion asynchronously after its own scheduler done
+	// signal, so poll the panel endpoint rather than reaching into the scheduler.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		req = httptest.NewRequest(http.MethodGet, "/panel/api/benefits/batches", nil)
+		req.Header.Set("Authorization", "Bearer k")
+		rr = httptest.NewRecorder()
+		p.ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("batch result code=%d body=%s", rr.Code, rr.Body.String())
+		}
+		var out struct {
+			Runs []struct {
+				Kind string `json:"kind"`
+				Done bool   `json:"done"`
+			} `json:"runs"`
+		}
+		if err := json.Unmarshal(rr.Body.Bytes(), &out); err != nil {
+			t.Fatalf("decode batch result: %v", err)
+		}
+		for _, run := range out.Runs {
+			if run.Kind == "streak" && run.Done {
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("streak batch did not finish: %s", rr.Body.String())
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }

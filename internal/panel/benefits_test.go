@@ -12,6 +12,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/activity"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
 // TestBenefitsOverviewAggregates 福利概览必须把账号、签到分母、成长待办与
@@ -100,5 +101,76 @@ func TestBenefitsOverviewAggregates(t *testing.T) {
 				t.Fatalf("last activity/checkin mismatch: %+v", a)
 			}
 		}
+	}
+}
+
+// TestBenefitsWelfareGrantsFromSnapshot 福利页的总积分与最近发放必须来自
+// 同一份积分快照：只统计签到/成长/活动等福利包，排除免费套餐，并且只暴露
+// uid8。没有快照时必须显式 available=false，不能把“尚未刷新”伪装成 0 元福利。
+func TestBenefitsWelfareGrantsFromSnapshot(t *testing.T) {
+	pl := pool.New("")
+	const uid = "13800138000"
+	const entUID = "enterprise-138001"
+	pl.Add(&auth.Auth{UID: uid, Nickname: "秋叶"})
+	pl.Add(&auth.Auth{UID: entUID, Nickname: "企业", EnterpriseID: "ent-1"})
+	p := New(Config{Version: "test", APIKey: "k", Pool: pl})
+	now := time.Now()
+	p.rememberCreditSnapshot(uid, "秋叶", "cn", []upstream.CreditPackage{
+		{Name: "Buddy 加油站签到奖励", Size: 30, Remain: 30, CreatedAt: now.Add(-time.Minute).Format(time.RFC3339)},
+		{Name: "成长计划奖励", Size: 50, Remain: 20, CreatedAt: now.Add(-2 * time.Hour).Format(time.RFC3339)},
+		{Name: "免费套餐", Size: 1500, Remain: 1500, CreatedAt: now.Add(-3 * time.Hour).Format(time.RFC3339)},
+		{Name: "普通体验包", Size: 300, Remain: 300, CreatedAt: now.Add(-4 * time.Hour).Format(time.RFC3339)},
+	})
+	p.rememberCreditSnapshot(entUID, "企业", "cn", []upstream.CreditPackage{
+		{Name: "企业签到奖励", Size: 999, Remain: 999, CreatedAt: now.Format(time.RFC3339)},
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/panel/api/benefits", nil)
+	req.Header.Set("Authorization", "Bearer k")
+	rr := httptest.NewRecorder()
+	p.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if strings.Contains(rr.Body.String(), uid) {
+		t.Fatalf("benefits grants leaked full UID: %s", rr.Body.String())
+	}
+	var out struct {
+		Summary struct {
+			WelfareCreditsTotal    int64  `json:"welfare_credits_total"`
+			WelfareGrantCount      int    `json:"welfare_grant_count"`
+			WelfareGrantsAvailable bool   `json:"welfare_grants_available"`
+			WelfareSnapshotAt      string `json:"welfare_snapshot_at"`
+			Enterprise             int    `json:"enterprise"`
+		} `json:"summary"`
+		Recent []struct {
+			UID       string `json:"uid"`
+			Name      string `json:"name"`
+			Size      int64  `json:"size"`
+			CreatedAt string `json:"created_at"`
+		} `json:"recent_grants"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if !out.Summary.WelfareGrantsAvailable || out.Summary.WelfareCreditsTotal != 80 || out.Summary.WelfareGrantCount != 2 || out.Summary.Enterprise != 1 {
+		t.Fatalf("welfare summary=%+v", out.Summary)
+	}
+	if len(out.Recent) != 2 || out.Recent[0].Name != "Buddy 加油站签到奖励" || out.Recent[0].Size != 30 {
+		t.Fatalf("recent grants not sorted/filtered: %+v", out.Recent)
+	}
+	for _, r := range out.Recent {
+		if r.UID == uid || len(r.UID) > 8 {
+			t.Fatalf("grant uid not masked: %+v", r)
+		}
+	}
+
+	empty := New(Config{Version: "test", APIKey: "k", Pool: pool.New("")})
+	req = httptest.NewRequest(http.MethodGet, "/panel/api/benefits", nil)
+	req.Header.Set("Authorization", "Bearer k")
+	rr = httptest.NewRecorder()
+	empty.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK || !strings.Contains(rr.Body.String(), `"welfare_grants_available":false`) {
+		t.Fatalf("empty snapshot must be explicit: %d %s", rr.Code, rr.Body.String())
 	}
 }

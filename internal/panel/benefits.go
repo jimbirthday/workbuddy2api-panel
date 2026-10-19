@@ -11,6 +11,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/activity"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
 // benefitsGrowthTimeout 单账号福利详情的上游查询上限。福利页是只读快照：
@@ -120,6 +121,14 @@ func (p *Panel) benefitsOverview(w http.ResponseWriter, r *http.Request) {
 		MakeupCards      int       `json:"makeup_cards"`
 		LotteryChances   int       `json:"lottery_chances"`
 		Energy           int64     `json:"energy"`
+		// Welfare credits come from the latest credit-package snapshot (the same
+		// source and filter as the Hub task/welfare page). Free plans and trial
+		// packages are not welfare; when no snapshot exists, available=false so the
+		// UI can ask for a refresh instead of presenting a fake zero.
+		WelfareCreditsTotal    int64  `json:"welfare_credits_total"`
+		WelfareGrantCount      int    `json:"welfare_grant_count"`
+		WelfareGrantsAvailable bool   `json:"welfare_grants_available"`
+		WelfareSnapshotAt      string `json:"welfare_snapshot_at,omitempty"`
 	}{}
 	dailyChatByUID := map[string]activity.Record{}
 	if p.cfg.Activity != nil {
@@ -265,11 +274,241 @@ func (p *Panel) benefitsOverview(w http.ResponseWriter, r *http.Request) {
 	summary.LastActivityTask = lastTask
 	summary.TodayFailed = todayFailed
 
+	welfareGrants := p.welfareGrantRows()
+	for _, row := range welfareGrants.rows {
+		summary.WelfareCreditsTotal += row.Size
+	}
+	summary.WelfareGrantCount = len(welfareGrants.rows)
+	summary.WelfareGrantsAvailable = welfareGrants.available
+	if !welfareGrants.fetchedAt.IsZero() {
+		summary.WelfareSnapshotAt = welfareGrants.fetchedAt.Format(time.RFC3339)
+	}
+
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":       true,
-		"summary":  summary,
-		"accounts": out,
+		"ok":            true,
+		"summary":       summary,
+		"accounts":      out,
+		"recent_grants": welfareGrants.recent,
 	})
+}
+
+// benefitGrantRow is the compact welfare grant record consumed by the panel.
+// Full UIDs never leave the server; the row only carries display fields.
+type benefitGrantRow struct {
+	UID         string `json:"uid"`
+	Nickname    string `json:"nickname"`
+	Realm       string `json:"realm"`
+	Name        string `json:"name"`
+	GrantReason string `json:"grant_reason,omitempty"`
+	Size        int64  `json:"size"`
+	Remain      int64  `json:"remain"`
+	CreatedAt   string `json:"created_at,omitempty"`
+	ExpireAt    string `json:"expire_at,omitempty"`
+	NoExpiry    bool   `json:"no_expiry"`
+	Status      string `json:"status"`
+}
+
+type welfareGrantSnapshot struct {
+	rows      []benefitGrantRow
+	recent    []benefitGrantRow
+	fetchedAt time.Time
+	available bool
+}
+
+const benefitGrantRecentLimit = 30
+
+// welfareGrantRows filters the existing credit snapshot using the Hub's
+// welfare keywords. It never calls upstream and never infers welfare from a
+// package amount alone, so plan/trial grants are not counted as welfare.
+func (p *Panel) welfareGrantRows() welfareGrantSnapshot {
+	snaps := p.creditSnapshots()
+	if len(snaps) == 0 {
+		return welfareGrantSnapshot{rows: []benefitGrantRow{}, recent: []benefitGrantRow{}}
+	}
+	out := welfareGrantSnapshot{rows: make([]benefitGrantRow, 0, 16), available: true}
+	accounts := make(map[string]*auth.Auth)
+	if p.cfg.Pool != nil {
+		for _, st := range p.cfg.Pool.List() {
+			accounts[st.UID] = p.cfg.Pool.AuthByUID(st.UID)
+		}
+	}
+	for _, snap := range snaps {
+		if snap.FetchedAt.After(out.fetchedAt) {
+			out.fetchedAt = snap.FetchedAt
+		}
+		// Hub 的「已获取福利总积分」只看国内版个人号：企业号没有个人成长
+		// 福利体系，国际版走 Bonus Pack 另一套口径。快照本身不带企业标记，
+		// 这里按当前池的实际账号过滤，避免企业签到包抬高国内福利总数。
+		acct := accounts[snap.UID]
+		if acct != nil && (acct.IsEnterprise() || acct.IsGlobal()) {
+			continue
+		}
+		for _, pkg := range snap.Packages {
+			if !isWelfareGrant("", welfareGrantText(pkg)) {
+				continue
+			}
+			expires, expireISO, noExpiry, _ := grantExpiry(pkg)
+			status, _ := grantStatus(pkg, expires, noExpiry, time.Now())
+			out.rows = append(out.rows, benefitGrantRow{
+				UID:       grantUID(snap.UID),
+				Nickname:  snap.Nickname,
+				Realm:     snap.Realm,
+				Name:      firstNonEmpty(pkg.Name, pkg.PackageCode, "Package"),
+				Size:      pkg.Size,
+				Remain:    pkg.Remain,
+				CreatedAt: pkg.CreatedAt,
+				ExpireAt:  expireISO,
+				NoExpiry:  noExpiry,
+				Status:    status,
+			})
+		}
+	}
+	sort.SliceStable(out.rows, func(i, j int) bool {
+		ti, tj := parseGrantTime(out.rows[i].CreatedAt), parseGrantTime(out.rows[j].CreatedAt)
+		if !ti.Equal(tj) {
+			return ti.After(tj)
+		}
+		if out.rows[i].Nickname != out.rows[j].Nickname {
+			return out.rows[i].Nickname < out.rows[j].Nickname
+		}
+		return out.rows[i].Name < out.rows[j].Name
+	})
+	n := len(out.rows)
+	if n > benefitGrantRecentLimit {
+		n = benefitGrantRecentLimit
+	}
+	out.recent = append([]benefitGrantRow(nil), out.rows[:n]...)
+	return out
+}
+
+// isWelfareGrant mirrors the Hub task/welfare filter. Upstream has no single
+// source field, so only explicit welfare keywords count; package names and
+// amounts alone are never used to guess.
+// welfareGrantText gathers the upstream fields that can identify a welfare
+// package. The billing package payload has no dedicated grant_reason field, so
+// the package name and sub-product description are the available source.
+func welfareGrantText(pkg upstream.CreditPackage) string {
+	return strings.Join([]string{pkg.Name, pkg.SubProductName, pkg.PackageCode}, " ")
+}
+
+func isWelfareGrant(reason, name string) bool {
+	text := strings.ToLower(strings.TrimSpace(reason) + " " + strings.TrimSpace(name))
+	for _, key := range []string{"签到", "成长", "活动", "裂变", "打卡", "旅行", "抽奖", "连登"} {
+		if strings.Contains(text, key) {
+			return true
+		}
+	}
+	for _, key := range []string{"checkin", "check-in", "growth", "activity", "campaign", "streak", "travel", "lottery"} {
+		if strings.Contains(text, key) {
+			return true
+		}
+	}
+	return false
+}
+
+// batchRun is the panel-visible outcome of the latest manual batch. The
+// scheduler still owns single-flight; this record only says whether the
+// batch is done and how many activity rows it produced.
+type batchRun struct {
+	Kind      string    `json:"kind"`
+	StartedAt time.Time `json:"started_at"`
+	Running   bool      `json:"running"`
+	Done      bool      `json:"done"`
+	Total     int       `json:"total"`
+	OK        int       `json:"ok"`
+	Failed    int       `json:"failed"`
+	Note      string    `json:"note,omitempty"`
+}
+
+const batchRunStaleAfter = 30 * time.Minute
+
+// startBenefitBatch starts one manual batch through the scheduler gate and
+// records its outcome. It returns false when another run of the same kind is
+// already active, matching the existing 409 contract.
+func (p *Panel) startBenefitBatch(kind string, fn func()) bool {
+	started := time.Now()
+	done, ok := p.cfg.Scheduler.TryRunBatchDone(kind, fn)
+	if !ok {
+		return false
+	}
+	p.batchMu.Lock()
+	if p.batchRuns == nil {
+		p.batchRuns = make(map[string]*batchRun)
+	}
+	p.batchRuns[kind] = &batchRun{Kind: kind, StartedAt: started, Running: true}
+	p.batchMu.Unlock()
+	go p.finishBenefitBatch(kind, started, done)
+	return true
+}
+
+// finishBenefitBatch reflects the activity rows written after the batch
+// started. It deliberately uses the activity store (the durable outcome
+// source) instead of inventing per-account summaries inside the scheduler.
+func (p *Panel) finishBenefitBatch(kind string, started time.Time, done <-chan struct{}) {
+	select {
+	case <-done:
+	case <-time.After(batchRunStaleAfter):
+	}
+	rec := batchRun{Kind: kind, StartedAt: started, Done: true}
+	if p.cfg.Activity == nil {
+		rec.Note = "活动记录未启用"
+	} else {
+		// Append is asynchronous and the persisted file is the durable source.
+		// Poll a bounded window so a batch does not appear complete before the
+		// final account's activity row has been flushed.
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			res, err := p.cfg.Activity.Query(activity.Filter{Since: started, Limit: 1000})
+			if err != nil {
+				rec.Note = "读取活动记录失败"
+				break
+			}
+			rec.Total = len(res.Records)
+			rec.OK, rec.Failed = 0, 0
+			for _, row := range res.Records {
+				if row.OK {
+					rec.OK++
+				} else {
+					rec.Failed++
+				}
+			}
+			if rec.Total > 0 || time.Now().After(deadline) {
+				if res.Total > len(res.Records) {
+					rec.Note = "只统计最近 1000 条活动记录"
+				}
+				break
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
+	p.batchMu.Lock()
+	p.batchRuns[kind] = &rec
+	p.batchMu.Unlock()
+}
+
+// benefitsBatches returns the latest manual batch state for the welfare page.
+// It never starts work or calls upstream.
+func (p *Panel) benefitsBatches(w http.ResponseWriter, r *http.Request) {
+	now := time.Now()
+	out := make([]batchRun, 0, 6)
+	p.batchMu.Lock()
+	for _, rec := range p.batchRuns {
+		if rec == nil {
+			continue
+		}
+		cp := *rec
+		// A process killed mid-run can leave running=true forever; present it
+		// as a completed unknown result rather than a spinner that never stops.
+		if cp.Running && now.Sub(cp.StartedAt) > batchRunStaleAfter {
+			cp.Running = false
+			cp.Done = true
+			cp.Note = "执行状态未知（可能已重启）"
+		}
+		out = append(out, cp)
+	}
+	p.batchMu.Unlock()
+	sort.SliceStable(out, func(i, j int) bool { return out[i].StartedAt.After(out[j].StartedAt) })
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "runs": out})
 }
 
 // benefitGrowth 单账号成长福利快照（Hub fetch_growth_summary 同口径）。

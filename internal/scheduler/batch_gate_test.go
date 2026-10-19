@@ -70,3 +70,34 @@ func TestTryRunBatchKindSyncSkipsWhenRunning(t *testing.T) {
 	}
 	close(release)
 }
+
+// TestTryRunBatchDoneWaitsOnlyOwnKind 批量结果不能等待全局批次集合：
+// B 启动后，A 的 done 仍应在 A 返回时立即关闭，否则福利页会一直显示
+// “执行中”，并可能触发 WaitGroup 的并发 Add/Wait 竞态。
+func TestTryRunBatchDoneWaitsOnlyOwnKind(t *testing.T) {
+	s := New(Config{})
+	releaseA := make(chan struct{})
+	releaseB := make(chan struct{})
+	startedB := make(chan struct{})
+
+	doneA, ok := s.TryRunBatchDone("checkin", func() { <-releaseA })
+	if !ok {
+		t.Fatal("checkin should start")
+	}
+	if _, ok := s.TryRunBatchDone("travel", func() {
+		close(startedB)
+		<-releaseB
+	}); !ok {
+		t.Fatal("travel should start independently")
+	}
+	<-startedB
+
+	close(releaseA)
+	select {
+	case <-doneA:
+	case <-time.After(time.Second):
+		t.Fatal("checkin done should not wait for a later travel batch")
+	}
+
+	close(releaseB)
+}

@@ -2713,3 +2713,122 @@ function runCase(c) {
 		t.Errorf("失败分支缺块也必须提示：%v", got[7])
 	}
 }
+
+// TestAppJSBenefitsVirtualWindow 福利账号表必须和账号池一样只渲染窗口行：
+// 200 个账号时 DOM 不能出现 200 行，上下占位行要维持完整滚动高度，刷新后
+// 滚动位置不能回到顶部；同时福利总积分与发放摘要应来自同一份 benefits 数据。
+func TestAppJSBenefitsVirtualWindow(t *testing.T) {
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('function benefitRealmLabel');
+const end = src.indexOf('function benefitTaskLabel', start);
+if (start < 0 || end < 0 || end < start) throw new Error('benefits virtual region not found');
+const sink = id => ({ id, innerHTML: '', textContent: '', scrollTop: 0, clientHeight: 420, addEventListener() {}, querySelector() { return null; } });
+const nodes = {};
+const $ = id => nodes[id] || (nodes[id] = sink(id));
+const ctx = {
+  $, esc: s => String(s == null ? '' : s), fmtTok: v => String(v == null ? 0 : v),
+  setText: (id, v) => { $(id).textContent = v; },
+  Math, Number, String, Array, Object, Date, isNaN,
+  benefitsBusy: new Set(), benefitsRows: [], benefitsRowH: 56, benefitsVirtualBound: false,
+  window: { matchMedia: () => ({ matches: false }) },
+};
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, end) +
+  '\nthis.renderBenefitsAccounts=renderBenefitsAccounts;this.benefitsVirtualWindow=benefitsVirtualWindow;', ctx);
+const rows = [];
+for (let i = 0; i < 200; i++) rows.push({uid: 'u' + String(i).padStart(3, '0'), nickname: '账号' + i, realm: i % 2 ? 'global' : 'cn', ref: 'r' + i, checkin_done: i % 3 === 0});
+$('bfViewport').scrollTop = 1120;
+ctx.renderBenefitsAccounts(rows);
+const html = $('bfAccountsBody').innerHTML;
+const rendered = (html.match(/data-bf-ref=/g) || []).length;
+const pads = (html.match(/class="virtual-pad"/g) || []).length;
+const keptScroll = $('bfViewport').scrollTop;
+process.stdout.write(JSON.stringify({rendered, pads, keptScroll, hasTopPad: html.indexOf('height:840px') >= 0}));`
+	out := runNodeScript(t, "benefits-virtual", script, appJSPath(t))
+	const want = `{"rendered":50,"pads":2,"keptScroll":1120,"hasTopPad":true}`
+	if out != want {
+		t.Fatalf("benefits virtual=%s\nwant %s", out, want)
+	}
+}
+
+// TestAppJSBenefitsWelfareSummary 福利总积分/发放记录必须用 summary 的可用标记
+// 区分“尚未刷新快照”和“确实为 0”，并把最近记录按时间展示。
+func TestAppJSBenefitsWelfareSummary(t *testing.T) {
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('function benefitsVirtualWindow');
+const end = src.indexOf('async function loadBenefits', start);
+if (start < 0 || end < 0 || end < start) throw new Error('benefits render region not found');
+const nodes = {};
+const mk = id => (nodes[id] = { id, innerHTML: '', textContent: '', hidden: false, scrollTop: 0, clientHeight: 420, addEventListener() {}, querySelector() { return null; } });
+const $ = id => nodes[id] || mk(id);
+const ctx = {
+  $, esc: s => String(s == null ? '' : s), fmtTok: v => String(v == null ? 0 : v),
+  setText: (id, v) => { $(id).textContent = v; }, benefitsBusy: new Set(),
+  benefitsRows: [], benefitsRowH: 56, benefitsVirtualBound: false,
+  benefitsBatchSeq: 0, benefitsBatchTimer: null,
+  api: () => Promise.resolve({runs: []}), view: 'taskscenter', setTimeout,
+  window: { matchMedia: () => ({ matches: false }) }, Math, Number, String, Array, Object, Date, isNaN,
+};
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, end) + '\nthis.renderBenefits=renderBenefits;', ctx);
+ctx.renderBenefits({
+  summary: {accounts: 1, welfare_credits_total: 80, welfare_grant_count: 2, welfare_grants_available: true, welfare_snapshot_at: '2026-10-19T09:00:00Z'},
+  accounts: [], recent_grants: [
+    {uid: '13800138', nickname: '秋叶', name: 'Buddy 加油站签到奖励', size: 30, remain: 30, created_at: '2026-10-19T08:30:00Z', status: 'active'},
+    {uid: '13800138', nickname: '秋叶', name: '成长计划奖励', size: 50, remain: 20, created_at: '2026-10-19T07:30:00Z', status: 'available'}
+  ]
+});
+const grants = $('bfGrantsBody').innerHTML;
+process.stdout.write(JSON.stringify({
+  total: $('bfWelfareCredits').textContent,
+  sub: $('bfWelfareSub').textContent,
+  rows: (grants.match(/<tr>/g) || []).length,
+  signin: grants.includes('Buddy 加油站签到奖励'),
+  growth: grants.includes('成长计划奖励')
+}));`
+	out := runNodeScript(t, "benefits-summary", script, appJSPath(t))
+	const want = `{"total":"+80","sub":"2 笔福利发放","rows":2,"signin":true,"growth":true}`
+	if out != want {
+		t.Fatalf("benefits summary=%s\nwant %s", out, want)
+	}
+}
+
+// TestAppJSBenefitBatchResults 批量动作结果区必须展示运行中/完成统计，
+// 并只渲染服务端给出的脱敏字段，不拼接任何 UID 或凭证。
+func TestAppJSBenefitBatchResults(t *testing.T) {
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('function renderBenefitBatches');
+const end = src.indexOf('async function loadBenefitBatches', start);
+if (start < 0 || end < 0 || end < start) throw new Error('benefit batch region not found');
+const nodes = {};
+const mk = id => (nodes[id] = { id, innerHTML: '', textContent: '' });
+const $ = id => nodes[id] || mk(id);
+const ctx = {
+  $, esc: s => String(s == null ? '' : s), benefitsTime: v => String(v == null ? '' : v),
+  Math, Number, String, Array, Object, BENEFIT_BATCH_LABELS: {checkin: '全部签到', streak: '连登与抽奖'},
+};
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, end) + '\nthis.renderBenefitBatches=renderBenefitBatches;', ctx);
+ctx.renderBenefitBatches([
+  {kind: 'checkin', started_at: '2026-10-19T09:00:00Z', running: false, done: true, total: 5, ok: 4, failed: 1},
+  {kind: 'streak', started_at: '2026-10-19T08:00:00Z', running: true}
+]);
+const html = $('bfBatchList').innerHTML;
+process.stdout.write(JSON.stringify({
+  note: $('bfBatchNote').textContent,
+  checkin: html.includes('全部签到'), streak: html.includes('连登与抽奖'),
+  done: html.includes('成功 4 · 失败 1 · 共 5'), running: html.includes('执行中'),
+  failedTag: html.includes('1 失败')
+}));`
+	out := runNodeScript(t, "benefit-batches", script, appJSPath(t))
+	const want = `{"note":"最近 2 轮","checkin":true,"streak":true,"done":true,"running":true,"failedTag":true}`
+	if out != want {
+		t.Fatalf("benefit batches=%s\nwant %s", out, want)
+	}
+}

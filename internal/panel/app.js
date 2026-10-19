@@ -659,6 +659,12 @@ function go(v) {
   // 停表并复位按钮，避免首次初始化或异常路径留下「扫描中…」。
   if (v !== 'taskscenter') {
     stopScanPolling();
+    // Older embedded frontends may not declare the welfare poll state; guard
+    // the cleanup so switching views can never stop working on a stale page.
+    if (typeof benefitsBatchTimer !== 'undefined' && benefitsBatchTimer) {
+      clearTimeout(benefitsBatchTimer); benefitsBatchTimer = null;
+    }
+    if (typeof benefitsBatchSeq !== 'undefined') benefitsBatchSeq++;
     const sb = $('btnScanAll');
     if (sb) { sb.disabled = false; sb.textContent = '扫描待办'; }
   }
@@ -5300,6 +5306,14 @@ let benefitsReq = null;
 let benefitsSeq = 0;
 let benefitsBusy = new Set();
 let lastBenefits = null;
+// Benefits table virtualization mirrors the account table: only the current
+// viewport is written to the DOM, while the full filtered list stays in
+// benefitsRows. The 5s snapshot refresh must not reset the scroll position.
+let benefitsRows = [];
+let benefitsRowH = 56;
+let benefitsVirtualBound = false;
+let benefitsBatchTimer = null;
+let benefitsBatchSeq = 0;
 // 福利弹窗当前绑定的服务端短引用。任务动作仍允许 accept/claim/auto；这些
 // 请求改走 benefits/* 路由，完整 UID 始终留在服务端。
 let benefitsTaskRef = null;
@@ -5308,17 +5322,66 @@ function benefitRealmLabel(realm) {
   return realm === 'global' ? '国际版' : '国内版';
 }
 
+function benefitsVirtualWindow() {
+  const rows = benefitsRows;
+  const vp = $('bfViewport');
+  const narrow = typeof window !== 'undefined' && window.matchMedia &&
+    window.matchMedia('(max-width: 760px)').matches;
+  if (!vp || narrow || rows.length < 40) {
+    return { start: 0, end: rows.length, topPad: 0, bottomPad: 0 };
+  }
+  // Narrow/未布局的视口必须回落到整页渲染；否则 scrollTop=0、clientHeight=0
+  // 时窗口会被压成 0 行，页面显示空白。
+  const rowH = Math.max(28, Number(benefitsRowH) || 56);
+  const viewportH = Number(vp.clientHeight) || 0;
+  if (viewportH <= 0) {
+    return { start: 0, end: rows.length, topPad: 0, bottomPad: 0 };
+  }
+  const first = Math.max(0, Math.floor(Number(vp.scrollTop || 0) / rowH) - 5);
+  const count = Math.ceil(viewportH / rowH) + 12;
+  const end = Math.min(rows.length, first + count);
+  return { start: first, end, topPad: first * rowH, bottomPad: Math.max(0, (rows.length - end) * rowH) };
+}
+
+function bindBenefitsVirtualScroll() {
+  if (benefitsVirtualBound) return;
+  const vp = $('bfViewport');
+  if (!vp || typeof vp.addEventListener !== 'function') return;
+  benefitsVirtualBound = true;
+  let raf = 0;
+  vp.addEventListener('scroll', () => {
+    if (raf) return;
+    const run = () => {
+      raf = 0;
+      if (!benefitsRows.length) return;
+      renderBenefitsAccounts(benefitsRows);
+    };
+    raf = typeof requestAnimationFrame === 'function'
+      ? requestAnimationFrame(run) : setTimeout(run, 16);
+  }, { passive: true });
+  if (typeof window !== 'undefined' && window.addEventListener) {
+    window.addEventListener('resize', () => {
+      if (!benefitsRows.length) return;
+      renderBenefitsAccounts(benefitsRows);
+    }, { passive: true });
+  }
+}
+
 function renderBenefitsAccounts(rows) {
   const body = $('bfAccountsBody');
   if (!body) return;
   rows = Array.isArray(rows) ? rows : [];
+  benefitsRows = rows;
   const note = $('bfAcctNote');
   if (note) note.textContent = rows.length ? rows.length + ' 个账号' : '';
+  const vp = $('bfViewport');
+  const scrollTop = vp ? Number(vp.scrollTop || 0) : 0;
   if (!rows.length) {
     body.innerHTML = '<tr><td colspan="10"><div class="empty">暂无账号；先在账号池添加或导入凭证。</div></td></tr>';
     return;
   }
-  body.innerHTML = rows.map(a => {
+  const virtual = benefitsVirtualWindow();
+  const rowHtml = rows.slice(virtual.start, virtual.end).map(a => {
     const who = a.nickname ? esc(a.nickname) : esc(a.uid || '—');
     const realm = benefitRealmLabel(a.realm);
     const checkin = a.realm === 'global'
@@ -5369,7 +5432,24 @@ function renderBenefitsAccounts(rows) {
       '<td>' + result + '</td>' +
       '<td class="bf-acts">' + acts + '</td>' +
       '</tr>';
-  }).join('');
+  });
+  let bodyHtml = '';
+  if (virtual.topPad > 0) bodyHtml += '<tr class="virtual-pad" aria-hidden="true"><td colspan="10"><i style="height:' + virtual.topPad + 'px"></i></td></tr>';
+  bodyHtml += rowHtml.join('');
+  if (virtual.bottomPad > 0) bodyHtml += '<tr class="virtual-pad" aria-hidden="true"><td colspan="10"><i style="height:' + virtual.bottomPad + 'px"></i></td></tr>';
+  body.innerHTML = bodyHtml;
+  if (vp) {
+    try { vp.scrollTop = scrollTop; } catch (e) { /* inert DOM */ }
+    const firstRow = typeof body.querySelector === 'function' ? body.querySelector('tr') : null;
+    const measured = firstRow && firstRow.getBoundingClientRect
+      ? Math.round(firstRow.getBoundingClientRect().height || 0) : 0;
+    if (measured > 24 && measured < 400 && Math.abs(measured - benefitsRowH) > 1) {
+      benefitsRowH = measured;
+      renderBenefitsAccounts(rows);
+      return;
+    }
+  }
+  bindBenefitsVirtualScroll();
 }
 
 function benefitTaskLabel(task) {
@@ -5381,6 +5461,88 @@ function benefitsTime(v) {
   const d = new Date(v);
   if (isNaN(d.getTime())) return String(v);
   return d.toLocaleString('zh-CN', {month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit'});
+}
+
+function renderBenefitGrants(rows, summary) {
+  const body = $('bfGrantsBody');
+  if (!body) return;
+  rows = Array.isArray(rows) ? rows : [];
+  const s = summary || {};
+  const note = $('bfGrantNote');
+  if (note) {
+    note.textContent = !s.welfare_grants_available
+      ? '尚未刷新积分包：先在积分构成页刷新'
+      : (s.welfare_snapshot_at ? '快照 ' + benefitsTime(s.welfare_snapshot_at) : (rows.length + ' 笔'));
+  }
+  if (!rows.length) {
+    body.innerHTML = '<tr><td colspan="7"><div class="empty">' +
+      (s.welfare_grants_available ? '暂无福利发放记录' : '暂无积分包快照；刷新积分后可查看') +
+      '</div></td></tr>';
+    return;
+  }
+  body.innerHTML = rows.map(r => {
+    const status = ({active: '生效中', available: '可用', used: '已用完', used_up: '已用完', expired: '已过期'})[r.status] || String(r.status || '—');
+    const tone = (r.status === 'expired' || r.status === 'used' || r.status === 'used_up') ? 'bad' : (r.status === 'active' ? 'ok' : '');
+    const expiry = r.no_expiry ? '不过期' : String(r.expire_at || '').slice(0, 10) || '—';
+    const source = r.grant_reason || r.name || '—';
+    return '<tr>' +
+      '<td>' + esc(String(r.created_at || '').slice(0, 16).replace('T', ' ') || '—') + '</td>' +
+      '<td title="' + esc(r.uid || '') + '">' + esc(r.nickname || r.uid || '—') + '</td>' +
+      '<td title="' + esc(source) + '">' + esc(source) + '</td>' +
+      '<td class="num">+' + fmtTok(r.size || 0) + '</td>' +
+      '<td class="num">' + fmtTok(r.remain || 0) + '</td>' +
+      '<td>' + esc(expiry) + '</td>' +
+      '<td><span class="tag ' + tone + '">' + esc(status) + '</span></td>' +
+      '</tr>';
+  }).join('');
+}
+
+const BENEFIT_BATCH_LABELS = {
+  checkin: '全部签到', travel: '旅行巡检', activity: '活跃上报',
+  keepalive: 'Token 保活', daily_chat: '国际版每日活跃', streak: '连登与抽奖',
+};
+
+function renderBenefitBatches(runs) {
+  const box = $('bfBatchList');
+  if (!box) return;
+  runs = Array.isArray(runs) ? runs : [];
+  const note = $('bfBatchNote');
+  if (note) note.textContent = runs.length ? '最近 ' + runs.length + ' 轮' : '—';
+  if (!runs.length) {
+    box.innerHTML = '<div class="empty">尚未执行批量动作</div>';
+    return;
+  }
+  box.innerHTML = runs.map(r => {
+    const label = BENEFIT_BATCH_LABELS[r.kind] || r.kind || '批量动作';
+    const status = r.running ? '<span class="tag warn">执行中</span>'
+      : (r.note === '执行状态未知（可能已重启）' ? '<span class="tag mute">状态未知</span>'
+        : (r.failed ? '<span class="tag bad">' + r.failed + ' 失败</span>' : '<span class="tag ok">完成</span>'));
+    const counts = r.done ? ('成功 ' + (r.ok || 0) + ' · 失败 ' + (r.failed || 0) + ' · 共 ' + (r.total || 0)) : '正在逐一执行';
+    return '<div class="bf-batch-row">' +
+      '<div><div class="bf-batch-k">' + esc(label) + '</div><div class="bf-batch-meta">' +
+      esc(benefitsTime(r.started_at)) + (r.note ? ' · ' + esc(r.note) : '') + '</div></div>' +
+      '<div class="bf-batch-stat">' + status + '<div class="bf-batch-meta">' + esc(counts) + '</div></div>' +
+      '</div>';
+  }).join('');
+}
+
+async function loadBenefitBatches() {
+  const my = ++benefitsBatchSeq;
+  try {
+    const d = await api('benefits/batches');
+    if (my !== benefitsBatchSeq || view !== 'taskscenter') return;
+    const runs = (d && d.runs) || [];
+    renderBenefitBatches(runs);
+    if (runs.some(r => r && r.running)) {
+      if (!benefitsBatchTimer) benefitsBatchTimer = setTimeout(() => {
+        benefitsBatchTimer = null;
+        loadBenefitBatches();
+      }, 3000);
+    }
+  } catch (e) {
+    const box = $('bfBatchList');
+    if (box && view === 'taskscenter') box.innerHTML = '<div class="empty">读取执行结果失败：' + esc(e.message) + '</div>';
+  }
 }
 
 function renderBenefits(d) {
@@ -5396,7 +5558,13 @@ function renderBenefits(d) {
   setText('bfGrowthSub', s.growth_running ? '队列执行中' : (s.growth_done || s.growth_failed ? '完成 ' + (s.growth_done || 0) + ' · 失败 ' + (s.growth_failed || 0) : '扫描后更新'));
   setText('bfTodayFailed', String(s.today_failed || 0));
   setText('bfLastActivity', s.last_activity_at ? '最近 ' + benefitsTime(s.last_activity_at) : '最近活动 —');
+  setText('bfWelfareCredits', s.welfare_grants_available ? '+' + fmtTok(s.welfare_credits_total || 0) : '-');
+  setText('bfWelfareSub', s.welfare_grants_available
+    ? (s.welfare_grant_count || 0) + ' 笔福利发放'
+    : '先刷新积分包快照');
+  renderBenefitGrants(d && d.recent_grants, s);
   renderBenefitsAccounts(d && d.accounts);
+  loadBenefitBatches();
 }
 
 async function loadBenefits() {
@@ -5501,6 +5669,20 @@ if ($('bfAccountsBody')) $('bfAccountsBody').addEventListener('click', ev => {
 });
 
 if ($('btnBenefitsRefresh')) $('btnBenefitsRefresh').onclick = () => { loadBenefits(); loadOverview(true); toast('福利概览已刷新', 'ok'); };
+if ($('bfBtnRefreshGrants')) $('bfBtnRefreshGrants').onclick = async () => {
+  const b = $('bfBtnRefreshGrants');
+  const label = b.textContent;
+  b.disabled = true; b.textContent = '刷新中…';
+  try {
+    await loadPackagesData();
+    await loadBenefits();
+    toast('积分包快照已刷新', 'ok');
+  } catch (e) {
+    toast(e && e.message ? e.message : String(e), 'err');
+  } finally {
+    b.disabled = false; b.textContent = label;
+  }
+};
 if ($('btnBenefitsActivity')) $('btnBenefitsActivity').onclick = () => go('activity');
 if ($('bfBtnScanAll')) $('bfBtnScanAll').onclick = () => { const b = $('btnScanAll'); if (b) b.click(); };
 if ($('bfBtnRunQueue')) $('bfBtnRunQueue').onclick = () => { const b = $('btnRunQueue'); if (b) b.click(); };

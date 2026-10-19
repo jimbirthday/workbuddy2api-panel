@@ -222,6 +222,17 @@ function authHeaders(extra) {
   if (k) h['Authorization'] = 'Bearer ' + k;
   return h;
 }
+function rejectUnauthorized(requestHeaders) {
+  // 登录前或密钥修改前发出的请求，可能在新登录成功后才返回 401。
+  // 只有当前密钥的响应才能清除它，避免刷新时丢失已保存的有效密钥。
+  if ((requestHeaders.Authorization || '') === (authHeaders().Authorization || '')) {
+    forgetKey();
+    openKey();
+  }
+  const err = new Error('密钥无效或未填写');
+  err.status = 401;
+  throw err;
+}
 async function api(path, opts = {}) {
   const h = authHeaders(opts.headers);
   if (opts.body) h['Content-Type'] = 'application/json';
@@ -251,7 +262,7 @@ async function api(path, opts = {}) {
   } finally {
     if (timer) clearTimeout(timer);
   }
-    if (r.status === 401) { forgetKey(); openKey(); throw new Error('密钥无效或未填写'); }
+  if (r.status === 401) rejectUnauthorized(h);
   const d = await r.json().catch(() => ({}));
     if (!r.ok) {
       // 调用方用 status 区分 501/403 等可操作状态；只带 message 会让专门的
@@ -635,9 +646,12 @@ function clearKeyInput() {
   if (el) el.value = '';
 }
 if ($('btnKey')) $('btnKey').onclick = async () => {
+  const btn = $('btnKey');
+  if (btn.disabled) return;
   const input = $('keyInput');
   const v = input ? input.value.trim() : '';
   if (!v) return;
+  btn.disabled = true;
   rememberKey(v);
   try {
     await api('overview');
@@ -647,10 +661,10 @@ if ($('btnKey')) $('btnKey').onclick = async () => {
     hideModal('keyVeil');
     start();
   } catch (e) {
-    forgetKey();
+    // 401 已由请求层清除密钥；网络故障不能清掉已保存的输入。
     const err = $('keyErr');
     if (err) { err.hidden = false; err.textContent = e && e.message ? e.message : '密钥无效'; }
-  }
+  } finally { btn.disabled = false; }
 };
 /* 表单提交兜底：阻止隐式提交导航（CSP script-src 'self' 下内联 onsubmit 不生效，
    故统一由同源 JS 兜底）。密钥框是单输入框表单：按 Enter 的默认行为是提交，无兜底
@@ -1178,7 +1192,7 @@ async function loadOverview(quiet) {
     const h = authHeaders();
     if (overviewETag) h['If-None-Match'] = overviewETag;
     const r = await fetch('/panel/api/overview', { headers: h });
-  if (r.status === 401) { forgetKey(); openKey(); throw new Error('密钥无效或未填写'); }
+    if (r.status === 401) rejectUnauthorized(h);
     if (r.status === 304) {
       if (my !== overviewSeq) return;
       // 304 表示账号/模型/余额都没变；只推进「运行 N」这类纯时间字段，
@@ -5439,6 +5453,8 @@ function bindBenefitsVirtualScroll() {
     const run = () => {
       raf = 0;
       if (!benefitsRows.length) return;
+      const virtual = benefitsVirtualWindow();
+      if (virtual.start === 0 && virtual.end === benefitsRows.length) return;
       renderBenefitsAccounts(benefitsRows);
     };
     raf = typeof requestAnimationFrame === 'function'
@@ -5452,7 +5468,7 @@ function bindBenefitsVirtualScroll() {
   }
 }
 
-function renderBenefitsAccounts(rows) {
+function renderBenefitsAccounts(rows, corrected = false) {
   const body = $('bfAccountsBody');
   if (!body) return;
   rows = Array.isArray(rows) ? rows : [];
@@ -5526,12 +5542,12 @@ function renderBenefitsAccounts(rows) {
   body.innerHTML = bodyHtml;
   if (vp) {
     try { vp.scrollTop = scrollTop; } catch (e) { /* inert DOM */ }
-    const firstRow = typeof body.querySelector === 'function' ? body.querySelector('tr') : null;
+    const firstRow = typeof body.querySelector === 'function' ? body.querySelector('tr:not(.virtual-pad)') : null;
     const measured = firstRow && firstRow.getBoundingClientRect
       ? Math.round(firstRow.getBoundingClientRect().height || 0) : 0;
-    if (measured > 24 && measured < 400 && Math.abs(measured - benefitsRowH) > 1) {
+    if (!corrected && measured > 24 && measured < 400 && Math.abs(measured - benefitsRowH) > 1) {
       benefitsRowH = measured;
-      renderBenefitsAccounts(rows);
+      renderBenefitsAccounts(rows, true);
       return;
     }
   }

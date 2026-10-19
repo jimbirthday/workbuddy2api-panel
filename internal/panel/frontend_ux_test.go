@@ -91,6 +91,43 @@ vm.runInContext(src.slice(start, stateEnd) + src.slice(requestStart, requestEnd)
 	}
 }
 
+// 登录前的旧 401 不能清掉新登录的密钥，否则刷新页面会再次要求输入。
+func TestAppJSStaleUnauthorizedPreservesNewKey(t *testing.T) {
+	script := `const fs = require('fs'), vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const state = src.slice(src.indexOf('const KEY_STORAGE'), src.indexOf('let theme ='));
+const requests = src.slice(src.indexOf('function authHeaders'), src.indexOf('// isAbortError'));
+const overview = src.slice(src.indexOf('async function loadOverview'), src.indexOf('function renderUptime'));
+const values = {};
+let release, opened = 0;
+const ctx = {
+  sessionStorage: {getItem: k => values[k] || null, setItem: (k,v) => values[k]=v, removeItem: k => delete values[k]},
+  localStorage: {removeItem() {}}, openKey() { opened++; },
+  fetch: () => new Promise(resolve => {release = resolve;}),
+  AbortController: undefined, setTimeout, clearTimeout,
+  overviewInFlight: false, overviewPending: false, overviewSeq: 0, overviewETag: '',
+};
+vm.createContext(ctx);
+vm.runInContext(state + requests + overview + '\nthis.api=api;this.overview=loadOverview;this.remember=rememberKey;this.key=()=>memKey;', ctx);
+(async () => {
+  for (const run of [() => ctx.api('benefits').catch(() => {}), () => ctx.overview(true)]) {
+    ctx.remember('old-key');
+    const pending = run();
+    ctx.remember('valid-key');
+    release({status:401,ok:false,json:async()=>({})});
+    await pending;
+    if (ctx.key() !== 'valid-key' || values['wb2api.key'] !== 'valid-key' || opened) throw new Error('late 401 cleared new login');
+    // A fresh page must recover the same accepted key.
+    vm.runInContext('memKey = readStoredKey();', ctx);
+    if (ctx.key() !== 'valid-key') throw new Error('refresh lost key');
+  }
+  process.stdout.write('ok');
+})().catch(e => {console.error(e);process.exitCode=1;});`
+	if out := runNodeScript(t, "key-stale-401", script, appJSPath(t)); out != "ok" {
+		t.Fatal(out)
+	}
+}
+
 // 日志频道选择必须作用于整页：选「系统」只看系统日志并隐藏请求记录表，
 // 选「全部 / 对话」时请求记录表恢复；轮询刷新期间也不能被重新显示。
 func TestAppJSLogChannelControlsRequestBox(t *testing.T) {
@@ -2867,6 +2904,46 @@ process.stdout.write(JSON.stringify({rendered, pads, keptScroll, hasTopPad: html
 	// 具体缓冲区大小可在不改变虚拟化契约的前提下调整。
 	if got.Rendered < 16 || got.Rendered > 80 || got.Pads != 2 || got.KeptScroll != 1120 || !got.HasTopPad {
 		t.Fatalf("benefits virtual=%+v", got)
+	}
+}
+
+// 多账号滚动时，虚拟占位行不能参与行高测量；行高变化必须在有限次重绘内收敛。
+func TestAppJSBenefitsScrollMeasurementsConverge(t *testing.T) {
+	script := `const fs = require('fs'), vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('function benefitRealmLabel');
+const end = src.indexOf('function benefitTaskStatus', start);
+let writes = 0, html = '', actualHeight = 60;
+const viewport = {scrollTop: 600, clientHeight: 420, addEventListener() {}};
+const body = {
+  get innerHTML() { return html; },
+  set innerHTML(value) { if (++writes > 40) throw new Error('render did not converge'); html = value; },
+  querySelector(selector) {
+    const pad = html.match(/^<tr class="virtual-pad"[^>]*><td[^>]*><i style="height:(\d+)px/);
+    const height = selector === 'tr' && pad ? Number(pad[1]) : actualHeight;
+    return {getBoundingClientRect: () => ({height})};
+  },
+};
+const nodes = {bfAccountsBody: body, bfViewport: viewport, bfAcctNote: {textContent: ''}};
+const ctx = {$: id => nodes[id], esc: String, fmtTok: String,
+  benefitsBusy: new Set(), benefitsRows: [], benefitsRowH: 56, benefitsVirtualBound: true,
+  window: {matchMedia: () => ({matches: false})}, Math, Number, String, Date, Array};
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, end) + '\nthis.render=renderBenefitsAccounts;', ctx);
+const rows = Array.from({length: 470}, (_,i) => ({uid:'u'+i,ref:'r'+i,nickname:'账号'+i,realm:'cn'}));
+for (const top of [600, 900, 240, 1200, 18000, 0]) {
+  writes = 0; viewport.scrollTop = top;
+  ctx.render(rows);
+  if (writes > 2) throw new Error('unbounded row-height correction: '+writes);
+  if (viewport.scrollTop !== top) throw new Error('scroll position lost');
+  if (ctx.benefitsRowH !== actualHeight) throw new Error('padding row measured as account height');
+}
+actualHeight = 92;
+writes = 0; viewport.scrollTop = 600; ctx.render(rows);
+if (writes > 2 || ctx.benefitsRowH !== 92) throw new Error('resized rows did not converge');
+process.stdout.write('ok');`
+	if out := runNodeScript(t, "benefits-scroll", script, appJSPath(t)); out != "ok" {
+		t.Fatal(out)
 	}
 }
 

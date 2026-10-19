@@ -140,7 +140,7 @@ func truthy(v any) bool {
 
 func responsesMessages(obj map[string]any) ([]any, error) {
 	messages := make([]any, 0, 4)
-	if instructions := stringValue(obj["instructions"]); instructions != "" {
+	if instructions := rawStringValue(obj["instructions"]); instructions != "" {
 		messages = append(messages, map[string]any{"role": "system", "content": instructions})
 	}
 	input := obj["input"]
@@ -213,7 +213,7 @@ func responsesMessages(obj map[string]any) ([]any, error) {
 			}
 			var argText string
 			if typ == "custom_tool_call" {
-				argJSON, _ := json.Marshal(map[string]any{"input": stringValue(item["input"])})
+				argJSON, _ := json.Marshal(map[string]any{"input": rawStringValue(item["input"])})
 				argText = string(argJSON)
 			} else if s, ok := item["arguments"].(string); ok {
 				argText = s
@@ -296,21 +296,21 @@ func appendResponseMessage(messages []any, msg map[string]any) []any {
 }
 
 func reasoningText(item map[string]any) string {
-	if s := stringValue(item["summary"]); s != "" {
+	if s := rawStringValue(item["summary"]); s != "" {
 		return s
 	}
 	if summary, ok := item["summary"].([]any); ok {
 		var parts []string
 		for _, p := range summary {
 			if m, ok := p.(map[string]any); ok {
-				if s := stringValue(m["text"]); s != "" {
+				if s := rawStringValue(m["text"]); s != "" {
 					parts = append(parts, s)
 				}
 			}
 		}
 		return strings.Join(parts, "\n")
 	}
-	if s := stringValue(item["content"]); s != "" {
+	if s := rawStringValue(item["content"]); s != "" {
 		return s
 	}
 	if c := flattenContent(item["content"]); c != nil {
@@ -336,7 +336,7 @@ func additionalTools(obj map[string]any) []any {
 
 func requestInputText(obj map[string]any) string {
 	var parts []string
-	if s := stringValue(obj["instructions"]); s != "" {
+	if s := rawStringValue(obj["instructions"]); s != "" {
 		parts = append(parts, s)
 	}
 	switch input := obj["input"].(type) {
@@ -375,7 +375,7 @@ func responsesTools(raw []any) ([]any, map[string]bool, map[string]string, error
 		if name == "" {
 			return nil, nil, nil, badRequest("invalid_tools", "tools[%d].name is required", i)
 		}
-		desc := stringValue(tool["description"])
+		desc := rawStringValue(tool["description"])
 		params := tool["parameters"]
 		if params == nil {
 			params = tool["input_schema"]
@@ -603,7 +603,7 @@ func flattenContent(v any) any {
 		typ := strings.ToLower(stringValue(part["type"]))
 		switch {
 		case typ == "input_text" || typ == "output_text" || typ == "text" || typ == "summary_text":
-			s := stringValue(part["text"])
+			s := rawStringValue(part["text"])
 			texts = append(texts, s)
 			chatParts = append(chatParts, map[string]any{"type": "text", "text": s})
 		case typ == "input_image" || typ == "image_url" || typ == "image":
@@ -656,7 +656,7 @@ func contentText(v any) string {
 		var parts []string
 		for _, raw := range c {
 			if m, ok := raw.(map[string]any); ok {
-				if s := stringValue(m["text"]); s != "" {
+				if s := rawStringValue(m["text"]); s != "" {
 					parts = append(parts, s)
 				}
 			}
@@ -686,7 +686,7 @@ func ChatToResponse(body []byte, meta ResponsesMeta) ([]byte, error) {
 		return nil, &ConvertError{Status: http.StatusBadGateway, Code: "upstream_parse", Message: "upstream returned no message"}
 	}
 	text := contentText(msg["content"])
-	reasoning := stringValue(msg["reasoning_content"])
+	reasoning := rawStringValue(msg["reasoning_content"])
 	finish := stringValue(choice["finish_reason"])
 	if finish == "" {
 		finish = "stop"
@@ -703,7 +703,7 @@ func ChatToResponse(body []byte, meta ResponsesMeta) ([]byte, error) {
 		if name == "" {
 			continue
 		}
-		args := stringValue(call["arguments"])
+		args := rawStringValue(call["arguments"])
 		if args == "" {
 			args = "{}"
 		}

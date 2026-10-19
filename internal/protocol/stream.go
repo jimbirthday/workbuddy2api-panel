@@ -195,7 +195,7 @@ func (s *ResponsesStream) Feed(payload []byte) {
 	if delta == nil {
 		return
 	}
-	if r := stringValue(delta["reasoning_content"]); r != "" {
+	if r := rawStringValue(delta["reasoning_content"]); r != "" {
 		s.sawUse = true
 		s.openReasoning()
 		s.reasoningParts = append(s.reasoningParts, r)
@@ -203,7 +203,7 @@ func (s *ResponsesStream) Feed(payload []byte) {
 			"item_id": s.rsID, "output_index": s.reasonIndex, "summary_index": 0, "delta": r,
 		})
 	}
-	if txt := stringValue(delta["content"]); txt != "" {
+	if txt := rawStringValue(delta["content"]); txt != "" {
 		s.sawUse = true
 		s.openMessage()
 		s.textParts = append(s.textParts, txt)
@@ -290,7 +290,7 @@ func (s *ResponsesStream) feedToolCall(call map[string]any) bool {
 		entry.name = name
 		usable = true
 	}
-	args := stringValue(fn["arguments"])
+	args := rawStringValue(fn["arguments"])
 	if args != "" {
 		usable = true
 		if entry.opened {
@@ -646,14 +646,14 @@ func (s *MessagesStream) Feed(payload []byte) {
 	if delta == nil {
 		return
 	}
-	if r := stringValue(delta["reasoning_content"]); r != "" {
+	if r := rawStringValue(delta["reasoning_content"]); r != "" {
 		s.sawUse = true
 		s.ensureThinking()
 		s.event("content_block_delta", map[string]any{
 			"index": s.thinkingIndex, "delta": map[string]any{"type": "thinking_delta", "thinking": r},
 		})
 	}
-	if txt := stringValue(delta["content"]); txt != "" {
+	if txt := rawStringValue(delta["content"]); txt != "" {
 		s.sawUse = true
 		s.ensureText()
 		s.event("content_block_delta", map[string]any{
@@ -735,7 +735,7 @@ func (s *MessagesStream) feedToolCall(call map[string]any) bool {
 		entry.name = name
 		usable = true
 	}
-	args := stringValue(fn["arguments"])
+	args := rawStringValue(fn["arguments"])
 	if args != "" {
 		usable = true
 		if entry.opened {

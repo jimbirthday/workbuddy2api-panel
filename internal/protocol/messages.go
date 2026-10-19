@@ -134,7 +134,7 @@ func anthropicSystemText(v any) string {
 	var out []string
 	for _, raw := range parts {
 		if m, ok := raw.(map[string]any); ok {
-			if s := stringValue(m["text"]); s != "" {
+			if s := rawStringValue(m["text"]); s != "" {
 				out = append(out, s)
 			}
 		}
@@ -150,7 +150,7 @@ func anthropicContentText(v any) string {
 		var out []string
 		for _, raw := range c {
 			if m, ok := raw.(map[string]any); ok {
-				if s := stringValue(m["text"]); s != "" {
+				if s := rawStringValue(m["text"]); s != "" {
 					out = append(out, s)
 				} else if inner := anthropicContentText(m["content"]); inner != "" {
 					out = append(out, inner)
@@ -192,7 +192,7 @@ func anthropicTools(tools []any) ([]any, []string) {
 			continue
 		}
 		fn := map[string]any{"name": name, "parameters": schema}
-		if desc := stringValue(item["description"]); desc != "" {
+		if desc := rawStringValue(item["description"]); desc != "" {
 			fn["description"] = desc
 		}
 		out = append(out, map[string]any{"type": "function", "function": fn})
@@ -309,7 +309,7 @@ func anthropicBlocks(role string, blocks []any) ([]any, error) {
 			hasNonText = true
 			contentParts = append(contentParts, map[string]any{"type": "text", "text": anthropicDocumentText(block)})
 		default:
-			text := stringValue(block["text"])
+			text := rawStringValue(block["text"])
 			if text == "" {
 				text = anthropicContentText(block["content"])
 			}
@@ -408,7 +408,7 @@ func ChatToMessages(body []byte) ([]byte, error) {
 	}
 	finish := stringValue(choice["finish_reason"])
 	content := make([]any, 0, 4)
-	if reasoning := stringValue(msg["reasoning_content"]); reasoning != "" {
+	if reasoning := rawStringValue(msg["reasoning_content"]); reasoning != "" {
 		content = append(content, map[string]any{"type": "thinking", "thinking": reasoning})
 	}
 	if text := contentText(msg["content"]); text != "" {
@@ -425,7 +425,7 @@ func ChatToMessages(body []byte) ([]byte, error) {
 		}
 		content = append(content, map[string]any{
 			"type": "tool_use", "id": id, "name": name,
-			"input": parseToolInput(stringValue(call["arguments"])),
+			"input": parseToolInput(rawStringValue(call["arguments"])),
 		})
 	}
 	if len(content) == 0 {
@@ -457,13 +457,13 @@ func chatMessageToolCalls(msg map[string]any) []map[string]any {
 				continue
 			}
 			calls = append(calls, map[string]any{
-				"id": stringValue(call["id"]), "name": stringValue(fn["name"]), "arguments": stringValue(fn["arguments"]),
+				"id": stringValue(call["id"]), "name": stringValue(fn["name"]), "arguments": rawStringValue(fn["arguments"]),
 			})
 		}
 	}
 	if fn, ok := msg["function_call"].(map[string]any); ok {
 		calls = append(calls, map[string]any{
-			"id": stringValue(msg["tool_call_id"]), "name": stringValue(fn["name"]), "arguments": stringValue(fn["arguments"]),
+			"id": stringValue(msg["tool_call_id"]), "name": stringValue(fn["name"]), "arguments": rawStringValue(fn["arguments"]),
 		})
 	}
 	return calls

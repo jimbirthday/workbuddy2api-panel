@@ -44,8 +44,15 @@ func decodeObject(body []byte) (map[string]any, error) {
 }
 
 func stringValue(v any) string {
+	return strings.TrimSpace(rawStringValue(v))
+}
+
+// rawStringValue preserves payload bytes. Text, reasoning and tool arguments
+// may arrive as whitespace-only deltas or contain meaningful indentation.
+// stringValue is reserved for identifiers and other normalized metadata.
+func rawStringValue(v any) string {
 	s, _ := v.(string)
-	return strings.TrimSpace(s)
+	return s
 }
 
 func scalarString(v any) string {

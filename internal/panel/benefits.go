@@ -6,7 +6,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/activity"
@@ -19,6 +18,11 @@ import (
 // 一个账号 hang 不能把整页拖到 HTTP 客户端 120s；超时后该账号字段留空，
 // 页面仍展示签到/活动等本地事实。
 var benefitsGrowthTimeout = 12 * time.Second
+
+// benefitsGrowthPageTimeout 是整页快照的等待上限。它必须明显低于前端通用
+// fetch 的 15s 截止时间：否则账号一多，浏览器先超时，页面连部分结果都拿不到。
+// 到期后未完成的账号按行标记超时，后台 worker 继续填充下一轮缓存。
+var benefitsGrowthPageTimeout = 8 * time.Second
 
 // benefitsOverview 是「任务与福利」页的统一只读快照：页面不再从账号表、
 // 任务扫描和活动历史三处各拼一半，避免概览数字与明细互相矛盾。接口只读
@@ -722,9 +726,8 @@ func (p *Panel) benefitsGrowthSnapshot(statuses []pool.Status, force bool) map[s
 			jobs = append(jobs, job{uid: st.UID, a: a})
 		}
 	}
-	out := make(map[string]benefitGrowth, len(jobs))
 	if len(jobs) == 0 {
-		return out
+		return map[string]benefitGrowth{}
 	}
 	// Key includes the exact account set so adding/removing/disabling an
 	// account never serves another pool's task rows. Actions call
@@ -735,35 +738,121 @@ func (p *Panel) benefitsGrowthSnapshot(statuses []pool.Status, force bool) map[s
 	}
 	sort.Strings(keys)
 	key := strings.Join(keys, "\x00")
-	now := time.Now()
-	if !force {
+	uids := make([]string, 0, len(jobs))
+	for _, j := range jobs {
+		uids = append(uids, j.uid)
+	}
+
+	for {
 		p.benefitsGrowthMu.Lock()
-		if p.benefitsGrowthSnap != nil && p.benefitsGrowthKey == key &&
-			now.Sub(p.benefitsGrowthAt) < benefitsGrowthCacheTTL {
-			cached := make(map[string]benefitGrowth, len(p.benefitsGrowthSnap))
-			for k, v := range p.benefitsGrowthSnap {
-				cached[k] = v
-			}
+		if !force && p.benefitsGrowthFlight == nil && p.benefitsGrowthSnap != nil &&
+			p.benefitsGrowthKey == key && time.Since(p.benefitsGrowthAt) < benefitsGrowthCacheTTL {
+			cached := copyGrowthSnapshot(p.benefitsGrowthSnap)
 			p.benefitsGrowthMu.Unlock()
 			return cached
 		}
+		// Single-flight per account set. A page request that hit the aggregate
+		// deadline leaves its workers running; a later focus switch or refresh
+		// must wait for that flight instead of issuing a second N-account sweep.
+		if p.benefitsGrowthFlightKey == key && p.benefitsGrowthFlight != nil {
+			flight := p.benefitsGrowthFlight
+			partial := copyGrowthSnapshot(p.benefitsGrowthSnap)
+			p.benefitsGrowthMu.Unlock()
+			select {
+			case <-flight:
+				// Loop again: non-force callers now hit the cache; an explicit
+				// refresh starts one new sweep after the older one has finished.
+				continue
+			case <-time.After(benefitsGrowthPageTimeout):
+				return partialGrowthSnapshot(partial, key, key, uids)
+			}
+		}
+
+		flight := make(chan struct{})
+		epoch := p.benefitsGrowthEpoch
+		p.benefitsGrowthFlightKey = key
+		p.benefitsGrowthFlight = flight
+		p.benefitsGrowthKey = key
+		p.benefitsGrowthSnap = make(map[string]benefitGrowth, len(jobs))
 		p.benefitsGrowthMu.Unlock()
+
+		if !p.GoBackground(func() {
+			p.runBackgroundBounded(4, len(jobs), func(i int) {
+				j := jobs[i]
+				ctx, cancel := context.WithTimeout(context.Background(), benefitsGrowthTimeout)
+				defer cancel()
+				g := p.loadBenefitGrowth(ctx, j.a)
+				if ctx.Err() != nil {
+					g.Err = "growth query timed out"
+				}
+				p.benefitsGrowthMu.Lock()
+				// Drop results from a flight that predates an action; otherwise
+				// the pre-action snapshot would overwrite the fresh state.
+				if p.benefitsGrowthEpoch == epoch {
+					if p.benefitsGrowthSnap == nil {
+						p.benefitsGrowthSnap = make(map[string]benefitGrowth, len(jobs))
+					}
+					p.benefitsGrowthSnap[j.uid] = g
+				}
+				p.benefitsGrowthMu.Unlock()
+			})
+			p.benefitsGrowthMu.Lock()
+			if p.benefitsGrowthFlight == flight {
+				if p.benefitsGrowthEpoch == epoch {
+					p.benefitsGrowthAt = time.Now()
+				}
+				p.benefitsGrowthFlightKey = ""
+				p.benefitsGrowthFlight = nil
+				close(flight)
+			}
+			p.benefitsGrowthMu.Unlock()
+		}) {
+			p.benefitsGrowthMu.Lock()
+			if p.benefitsGrowthFlight == flight {
+				p.benefitsGrowthSnap = nil
+				p.benefitsGrowthKey = ""
+				p.benefitsGrowthFlightKey = ""
+				p.benefitsGrowthFlight = nil
+				close(flight)
+			}
+			p.benefitsGrowthMu.Unlock()
+			snap := make(map[string]benefitGrowth, len(jobs))
+			for _, j := range jobs {
+				snap[j.uid] = benefitGrowth{Err: "server shutting down"}
+			}
+			return snap
+		}
+
+		select {
+		case <-flight:
+		case <-time.After(benefitsGrowthPageTimeout):
+		}
+		p.benefitsGrowthMu.Lock()
+		snap := partialGrowthSnapshot(p.benefitsGrowthSnap, p.benefitsGrowthKey, key, uids)
+		p.benefitsGrowthMu.Unlock()
+		return snap
 	}
-	var mu sync.Mutex
-	p.runBackgroundBounded(4, len(jobs), func(i int) {
-		j := jobs[i]
-		ctx, cancel := context.WithTimeout(context.Background(), benefitsGrowthTimeout)
-		defer cancel()
-		g := p.loadBenefitGrowth(ctx, j.a)
-		mu.Lock()
-		out[j.uid] = g
-		mu.Unlock()
-	})
-	p.benefitsGrowthMu.Lock()
-	p.benefitsGrowthKey = key
-	p.benefitsGrowthAt = time.Now()
-	p.benefitsGrowthSnap = out
-	p.benefitsGrowthMu.Unlock()
+}
+
+func copyGrowthSnapshot(src map[string]benefitGrowth) map[string]benefitGrowth {
+	out := make(map[string]benefitGrowth, len(src))
+	for k, v := range src {
+		out[k] = v
+	}
+	return out
+}
+
+func partialGrowthSnapshot(snap map[string]benefitGrowth, snapKey, key string, uids []string) map[string]benefitGrowth {
+	out := make(map[string]benefitGrowth, len(uids))
+	for _, uid := range uids {
+		if snapKey == key && snap != nil {
+			if g, ok := snap[uid]; ok {
+				out[uid] = g
+				continue
+			}
+		}
+		out[uid] = benefitGrowth{Err: "growth query timed out"}
+	}
 	return out
 }
 
@@ -771,6 +860,7 @@ func (p *Panel) benefitsGrowthSnapshot(statuses []pool.Status, force bool) map[s
 // welfare or task action changes upstream state.
 func (p *Panel) invalidateBenefitsGrowth() {
 	p.benefitsGrowthMu.Lock()
+	p.benefitsGrowthEpoch++
 	p.benefitsGrowthSnap = nil
 	p.benefitsGrowthAt = time.Time{}
 	p.benefitsGrowthKey = ""

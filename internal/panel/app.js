@@ -205,7 +205,11 @@ async function api(path, opts = {}) {
   if (!signal && typeof AbortController === 'function') {
     const ctl = new AbortController();
     signal = ctl.signal;
-    timer = setTimeout(() => { timed = true; try { ctl.abort(); } catch (e) { /* ignore */ } }, 15000);
+    const limit = Number(opts.timeoutMs) > 0 ? Number(opts.timeoutMs) : 15000;
+    timer = setTimeout(() => {
+      timed = true;
+      try { ctl.abort(); } catch (e) { /* ignore */ }
+    }, limit);
   }
   const o = Object.assign({}, opts, { headers: h });
   if (signal) o.signal = signal;
@@ -213,7 +217,7 @@ async function api(path, opts = {}) {
   try {
     r = await fetch('/panel/api/' + path, o);
   } catch (e) {
-    if (timed) throw new Error('请求超时（15 秒），请稍后重试');
+    if (timed) throw new Error('请求超时（' + Math.round((Number(opts.timeoutMs) > 0 ? Number(opts.timeoutMs) : 15000) / 1000) + ' 秒），请稍后重试');
     throw e;
   } finally {
     if (timer) clearTimeout(timer);
@@ -5756,17 +5760,33 @@ async function loadBenefits(force, refresh) {
       if (benefitsFocusRef && benefitsFocusRef !== 'all') qs.push('focus=' + encodeURIComponent(benefitsFocusRef));
       if (refresh) qs.push('refresh=1');
       const q = qs.length ? ('?' + qs.join('&')) : '';
-      const [benefits, tasks] = await Promise.all([
-        api('benefits' + q),
-        api('tasks' + q),
+      // 任务页的成长快照会同时查询多个国内账号；后端在 8 秒返回部分快照，
+      // 前端给接口留出比通用 15 秒更宽的余量，避免浏览器先中止、整页变空。
+      // 两个接口互不依赖，独立 settle：一个超时不能丢掉另一个的成功结果。
+      const [benefits, tasks] = await Promise.allSettled([
+        api('benefits' + q, { timeoutMs: 45000 }),
+        api('tasks' + q, { timeoutMs: 45000 }),
       ]);
       if (my !== benefitsSeq || view !== 'taskscenter') return;
-      renderBenefits(benefits || {});
-      renderTaskWorkbench(tasks || {});
-    } catch (e) {
-      const body = $('bfAccountsBody');
-      if (body && view === 'taskscenter') {
-        body.innerHTML = '<tr><td colspan="10"><div class="empty">读取福利概览失败：' + esc(e.message) + '</div></td></tr>';
+      if (benefits.status === 'fulfilled') {
+        renderBenefits(benefits.value || {});
+      } else {
+        const err = benefits.reason;
+        const body = $('bfAccountsBody');
+        if (body) {
+          body.innerHTML = '<tr><td colspan="10"><div class="empty">读取福利概览失败：' + esc(err && err.message ? err.message : String(err)) + '</div></td></tr>';
+        }
+        const grants = $('bfGrantsBody');
+        if (grants) {
+          grants.innerHTML = '<tr><td colspan="7"><div class="empty">读取积分发放记录失败：' + esc(err && err.message ? err.message : String(err)) + '</div></td></tr>';
+        }
+      }
+      if (tasks.status === 'fulfilled') {
+        renderTaskWorkbench(tasks.value || {});
+      } else {
+        const err = tasks.reason;
+        const sum = $('bfFocusSummary');
+        if (sum) sum.innerHTML = '<span class="bf-chip">任务查询失败：' + esc(err && err.message ? err.message : String(err)) + '</span>';
       }
     } finally {
       if (benefitsReq === req) benefitsReq = null;

@@ -176,6 +176,35 @@ func TestBenefitsWelfareGrantsFromSnapshot(t *testing.T) {
 	}
 }
 
+// TestBenefitsGrowthSnapshotReturnsPartialBeforeBrowserTimeout 账号的上游查询
+// 比整页截止时间慢时，/benefits 必须先返回已完成账号，并把未完成账号标成
+// 行级超时；否则前端通用 15s fetch deadline 会先触发，整张表完全不可用。
+func TestBenefitsGrowthSnapshotReturnsPartialBeforeBrowserTimeout(t *testing.T) {
+	oldPageTimeout := benefitsGrowthPageTimeout
+	benefitsGrowthPageTimeout = 40 * time.Millisecond
+	t.Cleanup(func() { benefitsGrowthPageTimeout = oldPageTimeout })
+
+	pl := pool.New("")
+	cn := &auth.Auth{UID: "13800138000", Nickname: "慢号", AccessToken: "at"}
+	pl.Add(cn)
+	up := upstream.New()
+	up.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		<-r.Context().Done()
+		return nil, r.Context().Err()
+	})}
+	p := New(Config{Version: "test", APIKey: "k", Pool: pl, Upstream: up})
+
+	start := time.Now()
+	got := p.benefitsGrowthSnapshot(pl.List(), true)
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("snapshot waited too long: %v", elapsed)
+	}
+	g, ok := got[cn.UID]
+	if !ok || g.Err != "growth query timed out" {
+		t.Fatalf("snapshot=%+v want timed-out row for %s", got, cn.UID)
+	}
+}
+
 // TestBenefitsFocusReusesGrowthSnapshot 福利页的聚焦任务明细必须来自同一次
 // 成长快照，不能为聚焦账号额外打任务列表端点；focus 使用短引用且只回显 uid8。
 func TestBenefitsFocusReusesGrowthSnapshot(t *testing.T) {

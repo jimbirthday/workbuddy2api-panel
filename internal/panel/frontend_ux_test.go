@@ -2943,7 +2943,7 @@ const ctx = {
   api: path => { calls.push(path); return Promise.resolve({}); },
 };
 vm.createContext(ctx);
-vm.runInContext(src.slice(start, end) + '\nthis.loadBenefits=loadBenefits;', ctx);
+vm.runInContext('let view="taskscenter"; let renderedTasks=false;\n' + src.slice(start, end) + '\nthis.loadBenefits=loadBenefits; this.readRendered=()=>renderedTasks;', ctx);
 ctx.loadBenefits(false, false)
   .then(() => ctx.loadBenefits(true, true))
   .then(() => process.stdout.write(JSON.stringify(calls)));
@@ -2951,6 +2951,47 @@ ctx.loadBenefits(false, false)
 	out := runNodeScript(t, "benefits-refresh", script, appJSPath(t))
 	if out != `["benefits?focus=ref-1","tasks?focus=ref-1","benefits?focus=ref-1&refresh=1","tasks?focus=ref-1&refresh=1"]` {
 		t.Fatalf("benefits requests=%s", out)
+	}
+}
+
+// TestAppJSBenefitsRequestsAreIndependent 任务页两个快照请求必须分别处理：
+// /benefits 超时只能清空账号福利表，不能连执行日志/任务选择器一起丢掉；
+// 同时两种请求都应使用任务页专用的更宽时限，而不是通用 15 秒。
+func TestAppJSBenefitsRequestsAreIndependent(t *testing.T) {
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('async function loadBenefits');
+const end = src.indexOf('\n}\n', start) + 3;
+if (start < 0 || end <= start) throw new Error('loadBenefits not found');
+const timeouts = [];
+const nodes = {};
+const mk = id => nodes[id] || (nodes[id] = {id, innerHTML: '', textContent: ''});
+const ctx = {
+  benefitsReq: null, benefitsSeq: 0, benefitsFocusRef: 'all',
+  view: 'taskscenter',
+  renderBenefits() {},
+  renderTaskWorkbench() {},
+  api: (path, opts) => {
+    timeouts.push(opts && opts.timeoutMs);
+    return path.startsWith('benefits') ? Promise.reject(new Error('部分账号查询超时')) : Promise.resolve({accounts: []});
+  },
+  $: mk, esc: s => String(s == null ? '' : s),
+  Math, Number, String, Promise,
+};
+vm.createContext(ctx);
+vm.runInContext('let view="taskscenter";\n' + src.slice(start, end) + '\nthis.loadBenefits=loadBenefits;', ctx);
+ctx.loadBenefits(false, false).then(() => process.stdout.write(JSON.stringify({
+  tasksRendered: !(nodes.bfFocusSummary && nodes.bfFocusSummary.innerHTML.includes('任务查询失败')),
+  grants: nodes.bfGrantsBody ? nodes.bfGrantsBody.innerHTML : '',
+  timeouts,
+})));`
+	out := runNodeScript(t, "benefits-independent", script, appJSPath(t))
+	if !strings.Contains(out, `"tasksRendered":true`) || !strings.Contains(out, "读取积分发放记录失败") {
+		t.Fatalf("tasks page must keep the successful half after /benefits timeout: %s", out)
+	}
+	if !strings.Contains(out, `"timeouts":[45000,45000]`) {
+		t.Fatalf("task page requests must use the extended deadline: %s", out)
 	}
 }
 

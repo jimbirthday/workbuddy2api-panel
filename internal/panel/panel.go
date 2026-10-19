@@ -176,6 +176,15 @@ type Panel struct {
 	benefitsGrowthKey  string
 	benefitsGrowthAt   time.Time
 	benefitsGrowthSnap map[string]benefitGrowth
+	// benefitsGrowthFlight 让同一账号集合的成长查询单飞。页面超时返回后
+	// 后台 worker 仍可能继续跑；下一次焦点切换/刷新若再启动一轮，会对同一
+	// 批账号重复打上游，也会让活动记录里的查询计数翻倍。
+	benefitsGrowthFlightKey string
+	benefitsGrowthFlight    chan struct{}
+	// benefitsGrowthEpoch invalidates a flight that was started before a
+	// task/welfare action. Workers that outlive invalidateBenefitsGrowth must
+	// not republish the pre-action snapshot.
+	benefitsGrowthEpoch uint64
 }
 
 // tryLockAccount 尝试锁定账号的任务执行；已在执行返回 false。

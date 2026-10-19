@@ -2763,69 +2763,71 @@ process.stdout.write(JSON.stringify({rendered, pads, keptScroll, hasTopPad: html
 	}
 }
 
-// TestAppJSBenefitsFocusContract 聚焦选择器、固定视口任务表和行内动作必须存在；
-// 渲染只用服务端短引用，不能把完整 UID 带进任务行或选择器选项。
+// TestAppJSBenefitsFocusContract 选择器必须默认「全部国内账号」，单号模式只显示
+// 该号任务；任务表是 Hub 的 5 列（无行内操作），完整 UID 不出现在 DOM。
 func TestAppJSBenefitsFocusContract(t *testing.T) {
 	script := `const fs = require('fs');
 const vm = require('vm');
 const src = fs.readFileSync(process.argv[2], 'utf8');
-const start = src.indexOf('function renderBenefitFocus');
-const end = src.indexOf('async function loadBenefits', start);
-if (start < 0 || end < 0 || end < start) throw new Error('benefits focus region not found');
+const start = src.indexOf('function benefitTaskStatus');
+const end = src.indexOf('async function runTaskAction', start);
+if (start < 0 || end < 0 || end < start) throw new Error('task workbench region not found');
 const nodes = {};
-const mk = id => (nodes[id] = { id, innerHTML: '', textContent: '', value: '', disabled: false, hidden: false, scrollTop: 0, clientHeight: 420, addEventListener() {}, querySelector() { return null; } });
+const mk = id => (nodes[id] = { id, innerHTML: '', textContent: '', value: '', disabled: false, hidden: false, addEventListener() {}, querySelector() { return null; } });
 const $ = id => nodes[id] || mk(id);
 const ctx = {
   $, esc: s => String(s == null ? '' : s), fmtTok: v => String(v == null ? 0 : v),
-  benefitsFocusRef: '', benefitsTaskRows: [], benefitsFocusLast: null, AUTO_TASKS: {AUTO_TASK: '自动完成'},
+  benefitsFocusRef: 'all', benefitsTaskRows: [], benefitsTaskData: null,
+  benefitTaskStatus: () => '', AUTO_TASKS: {},
 };
-vm.createContext(ctx);
-vm.runInContext(src.slice(start, end) + '\nthis.renderBenefitFocus=renderBenefitFocus;', ctx);
-ctx.renderBenefitFocus({
+const make = focus => {
+  const nodes = {};
+  const mk = id => (nodes[id] = { id, innerHTML: '', textContent: '', value: '', disabled: false, hidden: false, addEventListener() {}, querySelector() { return null; } });
+  const $ = id => nodes[id] || mk(id);
+  const c = {
+    $, esc: s => String(s == null ? '' : s), fmtTok: v => String(v == null ? 0 : v),
+    benefitsFocusRef: focus, benefitsTaskRows: [], benefitsTaskData: null, benefitsLogFilter: {task: '', result: '', ref: ''},
+    benefitTaskStatus: () => '', AUTO_TASKS: {},
+  };
+  vm.createContext(c);
+  vm.runInContext(src.slice(start, end) + '\nthis.renderTaskWorkbench=renderTaskWorkbench;this.renderBenefitTaskRows=renderBenefitTaskRows;', c);
+  return { c, $ };
+};
+const allCtx = make('all');
+allCtx.c.renderTaskWorkbench({
   accounts: [
-    {ref: 'ref-cn', uid: '13800138000', nickname: '国内', realm: 'cn', focused: true, enterprise: false, disabled: false},
-    {ref: 'ref-ent', uid: '13900139000', nickname: '企业', realm: 'cn', enterprise: true, disabled: false},
-    {ref: 'ref-gl', uid: 'global0001', nickname: '国际', realm: 'global', enterprise: false, disabled: false}
+    {ref: 'ref-cn', uid: '13800138', nickname: '国内', realm: 'cn'},
+    {ref: 'ref-cn2', uid: '13900139', nickname: '国内二', realm: 'cn'}
   ],
-  task_rows: [
+  summary: {accounts: 2, checkin_done: 1, checkin_pending: 1},
+  tasks: []
+});
+const allSel = allCtx.$('bfGrowthAcct'), allBody = allCtx.$('bfTaskBody').innerHTML;
+const oneCtx = make('ref-cn');
+oneCtx.c.renderTaskWorkbench({
+  accounts: [{ref: 'ref-cn', uid: '13800138', nickname: '国内', realm: 'cn'}],
+  summary: {accounts: 1, streak_days: 7, makeup_cards: 2, lottery_chances: 3, energy: 99, cat_reward: 8},
+  tasks: [
     {task_code: 'AUTO_TASK', title: '自动任务', task_desc: '说明', current: 1, target: 3, credit: 10, energy: 2, accept_status: 'accepted'},
     {task_code: 'MANUAL_TASK', title: '手动任务', current: 0, target: 1, accept_status: 'not_accepted'}
   ]
 });
-const sel = $('bfGrowthAcct');
-const body = $('bfTaskBody').innerHTML;
+const oneSel = oneCtx.$('bfGrowthAcct'), oneBody = oneCtx.$('bfTaskBody').innerHTML;
 process.stdout.write(JSON.stringify({
-  options: (sel.innerHTML.match(/<option/g) || []).length,
-  selected: sel.value,
-  focused: ctx.benefitsFocusRef,
-  viewportExists: !!$('bfTaskViewport'),
-  rows: (body.match(/<tr/g) || []).length,
-  hasAuto: body.includes('data-bf-task="auto"'),
-  hasAccept: body.includes('data-bf-task="accept"'),
-  leakedFullUID: body.includes('13800138000') || sel.innerHTML.includes('13800138000')
+  allOptions: (allSel.innerHTML.match(/<option/g) || []).length,
+  allSelected: allSel.value,
+  allHint: allBody.includes('选择单个账号'),
+  oneOptions: (oneSel.innerHTML.match(/<option/g) || []).length,
+  oneSelected: oneSel.value,
+  oneRows: (oneBody.match(/<tr/g) || []).length,
+  oneActions: oneBody.includes('data-bf-task='),
+  oneHasReward: oneBody.includes('+10 分'),
+  leakedFullUID: allSel.innerHTML.includes('13800138000') || oneBody.includes('13800138000')
 }));`
 	out := runNodeScript(t, "benefits-focus", script, appJSPath(t))
-	var got struct {
-		Options        int    `json:"options"`
-		Selected       string `json:"selected"`
-		Focused        string `json:"focused"`
-		ViewportExists bool   `json:"viewportExists"`
-		Rows           int    `json:"rows"`
-		HasAuto        bool   `json:"hasAuto"`
-		HasAccept      bool   `json:"hasAccept"`
-		LeakedFullUID  bool   `json:"leakedFullUID"`
-	}
-	if err := json.Unmarshal([]byte(out), &got); err != nil {
-		t.Fatalf("decode benefits focus: %v (%s)", err, out)
-	}
-	if got.Options != 1 || got.Selected != "ref-cn" || got.Focused != "ref-cn" || !got.ViewportExists {
-		t.Fatalf("focus selector=%+v", got)
-	}
-	if got.Rows != 2 || !got.HasAuto || !got.HasAccept {
-		t.Fatalf("task actions=%+v", got)
-	}
-	if got.LeakedFullUID {
-		t.Fatalf("full UID leaked to task rows or selector: %+v", got)
+	const want = `{"allOptions":3,"allSelected":"all","allHint":true,"oneOptions":2,"oneSelected":"ref-cn","oneRows":2,"oneActions":false,"oneHasReward":true,"leakedFullUID":false}`
+	if out != want {
+		t.Fatalf("focus workbench=%s\nwant %s", out, want)
 	}
 }
 
@@ -2937,7 +2939,7 @@ if (start < 0 || end <= start) throw new Error('loadBenefits not found');
 const calls = [];
 const ctx = {
   benefitsReq: null, benefitsSeq: 0, benefitsFocusRef: 'ref-1',
-  view: 'taskscenter', renderBenefits() {},
+  view: 'taskscenter', renderBenefits() {}, renderTaskWorkbench() {},
   api: path => { calls.push(path); return Promise.resolve({}); },
 };
 vm.createContext(ctx);
@@ -2947,7 +2949,7 @@ ctx.loadBenefits(false, false)
   .then(() => process.stdout.write(JSON.stringify(calls)));
 `
 	out := runNodeScript(t, "benefits-refresh", script, appJSPath(t))
-	if out != `["benefits?focus=ref-1","benefits?focus=ref-1&refresh=1"]` {
+	if out != `["benefits?focus=ref-1","tasks?focus=ref-1","benefits?focus=ref-1&refresh=1","tasks?focus=ref-1&refresh=1"]` {
 		t.Fatalf("benefits requests=%s", out)
 	}
 }
@@ -2974,6 +2976,12 @@ func TestTasksCenterParityDom(t *testing.T) {
 	}
 	if !strings.Contains(html, ".benefits-tasks { height:") {
 		t.Errorf("task detail must use a bounded viewport too")
+	}
+	if strings.Contains(html, "<th>任务名称 / 代码</th><th>说明</th><th>进度</th><th>奖励</th><th>状态</th><th>操作</th>") {
+		t.Errorf("task table must use Hub's 5 columns; actions belong in the header")
+	}
+	if !strings.Contains(html, `id="bfAdvanced"`) {
+		t.Errorf("legacy queue/voucher entry must be folded into advanced details")
 	}
 }
 

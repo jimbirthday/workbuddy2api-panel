@@ -572,13 +572,26 @@ func (p *Panel) benefitsLog(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "rows": []any{}})
 		return
 	}
+	q := r.URL.Query()
 	limit := 40
-	if v := strings.TrimSpace(r.URL.Query().Get("limit")); v != "" {
+	if v := strings.TrimSpace(q.Get("limit")); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 200 {
 			limit = n
 		}
 	}
-	res, err := p.cfg.Activity.Query(activity.Filter{Limit: limit})
+	uid := strings.TrimSpace(q.Get("uid"))
+	if ref := strings.TrimSpace(q.Get("ref")); ref != "" {
+		uid = statusUID8(p.benefitUIDForRef(ref))
+	}
+	res, err := p.cfg.Activity.Query(activity.Filter{
+		UID:    uid,
+		Task:   activity.Task(strings.TrimSpace(q.Get("task"))),
+		Result: strings.TrimSpace(q.Get("result")),
+		Query:  strings.TrimSpace(q.Get("q")),
+		Since:  parseTimeParam(q.Get("from")),
+		Until:  parseTimeParam(q.Get("to")),
+		Limit:  limit,
+	})
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "read activity log failed")
 		return

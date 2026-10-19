@@ -298,6 +298,8 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/tasks/scan_status", p.withAuth(p.tasksScanStatus))
 	p.mux.HandleFunc("POST /panel/api/tasks/run_queue", p.withAuth(p.tasksRunQueue))
 	p.mux.HandleFunc("GET /panel/api/tasks/queue", p.withAuth(p.tasksQueueStatus))
+	p.mux.HandleFunc("GET /panel/api/tasks", p.withAuth(p.tasksOverview))
+	p.mux.HandleFunc("POST /panel/api/tasks/run", p.withAuth(p.tasksRun))
 	p.mux.HandleFunc("GET /panel/api/activity/history", p.withAuth(p.activityHistory))
 	p.mux.HandleFunc("GET /panel/api/benefits", p.withAuth(p.benefitsOverview))
 	p.mux.HandleFunc("GET /panel/api/benefits/batches", p.withAuth(p.benefitsBatches))

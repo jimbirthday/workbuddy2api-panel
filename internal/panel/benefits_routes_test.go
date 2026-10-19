@@ -186,3 +186,51 @@ func TestBenefitsLogExposesRecentActivity(t *testing.T) {
 		t.Fatalf("nil store code=%d body=%s", rr.Code, rr.Body.String())
 	}
 }
+
+// TestBenefitsLogFilters 执行流水必须支持 Hub 同口径服务端筛选：任务、结果、
+// 账号短引用与时间范围；返回仍只含脱敏展示字段。
+func TestBenefitsLogFilters(t *testing.T) {
+	dir := t.TempDir()
+	store := activity.New(activity.Config{Path: filepath.Join(dir, activity.FileName()), MaxBytes: 1 << 20})
+	base := time.Now().Add(-time.Hour)
+	for _, rec := range []activity.Record{
+		{Time: base, UID: "13800138000", Nickname: "甲", Realm: "cn", Task: activity.TaskCheckin, Trigger: activity.TriggerManual, OK: true, Message: "签到成功"},
+		{Time: base.Add(time.Minute), UID: "13900139000", Nickname: "乙", Realm: "cn", Task: activity.TaskTravel, Trigger: activity.TriggerManual, OK: false, Message: "旅行失败"},
+	} {
+		if err := store.Append(rec); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pl := pool.New("")
+	cn := &auth.Auth{UID: "13800138000", Nickname: "甲"}
+	pl.Add(cn)
+	p := New(Config{Version: "test", APIKey: "k", Pool: pl, Activity: store})
+	p.rememberBenefitRefs(pl.List())
+	ref := benefitRefFor(cn.UID)
+
+	for _, tc := range []struct {
+		name string
+		path string
+		want string
+	}{
+		{"by ref", "/panel/api/benefits/log?ref=" + ref, "签到成功"},
+		{"by task", "/panel/api/benefits/log?task=travel", "旅行失败"},
+		{"by result", "/panel/api/benefits/log?result=failed", "旅行失败"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, tc.path, nil)
+			req.Header.Set("Authorization", "Bearer k")
+			rr := httptest.NewRecorder()
+			p.ServeHTTP(rr, req)
+			if rr.Code != http.StatusOK {
+				t.Fatalf("code=%d body=%s", rr.Code, rr.Body.String())
+			}
+			if !strings.Contains(rr.Body.String(), tc.want) {
+				t.Fatalf("body=%s want %q", rr.Body.String(), tc.want)
+			}
+			if strings.Contains(rr.Body.String(), "13800138000") {
+				t.Fatalf("filtered log leaked full UID: %s", rr.Body.String())
+			}
+		})
+	}
+}

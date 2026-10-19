@@ -360,6 +360,15 @@ const TRANGE_PRESETS = [
   ['0', '全部历史'],
   ['custom', '自定义…'],
 ];
+const ACT_TRANGE_PRESETS = [
+  ['today', '今天'],
+  ['24', '近 1 天'],
+  ['168', '近 7 天'],
+  ['720', '近 30 天'],
+  ['2160', '近 90 天'],
+  ['0', '全部历史'],
+  ['custom', '自定义…'],
+];
 const TRANGE_DEFAULT = '72';
 const trangeStates = new Map(); // hostId → { preset, from: Date|null, to: Date|null }
 
@@ -398,9 +407,10 @@ function trangeRender(id) {
   if (!host) return;
   const st = trangeState(id);
   const custom = st.preset === 'custom';
+  const presets = id === 'actRange' ? ACT_TRANGE_PRESETS : TRANGE_PRESETS;
   host.innerHTML =
     '<select class="tr-preset" aria-label="时间范围">' +
-    TRANGE_PRESETS.map(([v, label]) =>
+    presets.map(([v, label]) =>
       '<option value="' + v + '"' + (v === st.preset ? ' selected' : '') + '>' + esc(label) + '</option>').join('') +
     '</select>' +
     '<span class="tr-custom"' + (custom ? '' : ' hidden') + '>' +
@@ -450,6 +460,12 @@ function trangeEmit(id) {
 // trangeCalendarStart 返回本周（周一）或本月（1 号）的本地 00:00。
 function trangeCalendarStart(preset) {
   const d = trangeMidnight();
+  if (preset === 'tomorrow') { d.setDate(d.getDate() + 1); return d; }
+  if (preset === 'next') {
+    if (trangeState('actRange').preset === 'week') d.setDate(d.getDate() + 7);
+    else { d.setMonth(d.getMonth() + 1, 1); d.setHours(0, 0, 0, 0); }
+    return d;
+  }
   if (preset === 'week') {
     // getDay()：0=周日；把周日映射到 6，周一为 0。
     d.setDate(d.getDate() - ((d.getDay() + 6) % 7));
@@ -473,9 +489,11 @@ function trangeQuery(id, rolling) {
     return q;
   }
   if (st.preset === 'today' || st.preset === 'week' || st.preset === 'month') {
-    // 日历边界预设一律发 from（不给 to = 截至现在）；滚动端点也用 from，
-    // 因为 hours 的“整点对齐”会把周一/1 号零点切错。
-    q.set('from', sec(trangeCalendarStart(st.preset)));
+    // Calendar boundaries use an explicit end for per-day buckets. Otherwise a
+    // "today" query would include tomorrow's rows after midnight rollover.
+    const start = trangeCalendarStart(st.preset);
+    q.set('from', sec(start));
+    if (id === 'actRange') q.set('to', sec(trangeCalendarStart(st.preset === 'today' ? 'tomorrow' : 'next')));
     return q;
   }
   // 全部历史：滚动端点（用量）必须**显式**传 hours=0。
@@ -685,7 +703,7 @@ function go(v) {
   if (v === 'config') loadConfig();
   if (v === 'logs') loadLogs();
   if (v === 'usage') loadUsage();
-  if (v === 'activity') loadActivity();
+  if (v === 'activity') { renderActivityAccountOptions(); loadActivity(); }
   if (v === 'taskscenter' && typeof loadBenefits === 'function') loadBenefits();
   if (v === 'connect') loadConnect();
   if (v === 'packages') loadPackages();
@@ -818,13 +836,13 @@ function accountRowSig(s) {
 let accRenderSig = '';
 
 // accVirtualWindow 计算当前页需要写入 DOM 的行区间。固定视口 + 上下占位行
-// 保持完整滚动高度；窄屏卡片化时关闭窗口化，避免把卡片行截断。
+// 保持完整滚动高度。Virtualization is unconditional for non-empty pages: even
+// 50-row pages keep a bounded DOM, and narrow layouts keep the same fixed
+// viewport instead of falling back to a page-height table.
 function accVirtualWindow() {
   const rows = accVirtualRows;
   const vp = $('accViewport');
-  const narrow = typeof window !== 'undefined' && window.matchMedia &&
-    window.matchMedia('(max-width: 760px)').matches;
-  if (!vp || narrow || rows.length < 80) {
+  if (!vp || !rows.length) {
     accVirtualStart = 0; accVirtualEnd = rows.length;
     return { start: 0, end: rows.length, topPad: 0, bottomPad: 0 };
   }
@@ -875,7 +893,7 @@ function renderAccounts(list, forceRender) {
   if (!tb) { noteDOM('accBody'); return; }
   accAll = list || [];
   // 缓存最近一次全量数据：搜索/排序在已拉到的数据上做，改条件不必重新打 /overview。
-  accAll = list || [];
+  if (typeof renderActivityAccountOptions === 'function') renderActivityAccountOptions();
   const shown = accSortList(accAll.filter(s => accMatch(s)));
   const live = new Set(accAll.map(s => s && s.uid));
   for (const uid of Array.from(accSelected)) if (!live.has(uid)) accSelected.delete(uid);
@@ -5286,6 +5304,16 @@ async function loadActivity(more) {
   return req.promise;
 }
 let actReq = null;
+function renderActivityAccountOptions() {
+  const sel = $('actUID');
+  if (!sel || !accAll) return;
+  const cur = sel.value || '';
+  const opts = ['<option value="">全部账号</option>'].concat((accAll || []).map(a =>
+    '<option value="' + esc(String(a && a.uid || '').slice(0, 8)) + '">' +
+    esc(((a && a.nickname) || '未命名') + ' · ' + String(a && a.uid || '').slice(0, 8)) + '</option>')).join('');
+  if (sel.innerHTML !== opts) sel.innerHTML = opts;
+  sel.value = cur;
+}
 if ($('btnActivityReload')) $('btnActivityReload').onclick = loadActivity;
 if ($('actTask')) $('actTask').onchange = loadActivity;
 if ($('actResult')) $('actResult').onchange = loadActivity;
@@ -5294,10 +5322,7 @@ if ($('actQ')) $('actQ').oninput = () => {
   clearTimeout(actQTimer);
   actQTimer = setTimeout(loadActivity, 180);
 };
-if ($('actUID')) $('actUID').oninput = () => {
-  clearTimeout(actQTimer);
-  actQTimer = setTimeout(loadActivity, 180);
-};
+if ($('actUID')) $('actUID').onchange = () => loadActivity();
 if ($('btnActMore')) $('btnActMore').onclick = () => loadActivity(true);
 if ($('actRange')) trangeBind('actRange', loadActivity, '168');
 
@@ -5316,7 +5341,10 @@ let benefitsBatchTimer = null;
 let benefitsBatchSeq = 0;
 // 当前聚焦的国内个人号（服务端短引用）。focus 随请求发送，页面只保存短引用，
 // 完整 UID 始终留在服务端；空值表示由后端选择第一个可用国内号。
-let benefitsFocusRef = '';
+let benefitsFocusRef = 'all';
+let benefitsTaskData = null;
+let benefitsRunSeq = 0;
+let benefitsLogFilter = { task: '', result: '', ref: '' };
 let benefitsTaskRows = [];
 let benefitsFocusLast = null;
 let benefitsBatchDoneSig = '';
@@ -5331,9 +5359,7 @@ function benefitRealmLabel(realm) {
 function benefitsVirtualWindow() {
   const rows = benefitsRows;
   const vp = $('bfViewport');
-  const narrow = typeof window !== 'undefined' && window.matchMedia &&
-    window.matchMedia('(max-width: 760px)').matches;
-  if (!vp || narrow || rows.length < 40) {
+  if (!vp || !rows.length) {
     return { start: 0, end: rows.length, topPad: 0, bottomPad: 0 };
   }
   // Narrow/未布局的视口必须回落到整页渲染；否则 scrollTop=0、clientHeight=0
@@ -5463,42 +5489,45 @@ function renderBenefitsAccounts(rows) {
 // 是服务端短引用，text 只显示昵称 + uid8；用户切换后按 focus 重新拉取快照。
 function renderBenefitFocus(d) {
   const sel = $('bfGrowthAcct');
-  const accounts = Array.isArray(d && d.accounts) ? d.accounts : [];
-  const cn = accounts.filter(a => a && a.realm === 'cn' && !a.enterprise && !a.disabled);
+  const accounts = Array.isArray(d && d.accounts) ? d.accounts.filter(a => a && a.realm === 'cn' && !a.enterprise && !a.disabled) : [];
   benefitsFocusLast = d || null;
+  benefitsTaskData = d || null;
   if (sel) {
-    let want = benefitsFocusRef;
-    if (want && !cn.some(a => a.ref === want)) want = '';
-    if (!want) {
-      const focused = cn.find(a => a.focused);
-      want = (focused && focused.ref) || (cn[0] && cn[0].ref) || '';
-    }
+    let want = benefitsFocusRef || 'all';
+    if (want !== 'all' && !accounts.some(a => a.ref === want)) want = 'all';
     benefitsFocusRef = want;
-    const opts = cn.map(a => '<option value="' + esc(a.ref || '') + '">' +
-      esc((a.nickname || '未命名') + ' · ' + String(a.uid || '').slice(0, 8)) + '</option>').join('');
-    const next = opts || '<option value="">暂无国内个人账号</option>';
+    const opts = ['<option value="all">全部国内账号（批量）</option>'].concat(
+      accounts.map(a => '<option value="' + esc(a.ref || '') + '">' +
+        esc((a.nickname || '未命名') + ' · ' + String(a.uid || '').slice(0, 8)) + '</option>'));
+    const next = opts.join('');
     if (sel.innerHTML !== next) sel.innerHTML = next;
-    if (want) sel.value = want;
-    sel.disabled = !cn.length;
+    sel.value = want;
+    sel.disabled = !accounts.length;
   }
+  const summary = (d && d.summary) || {};
+  const cur = benefitsFocusRef === 'all' ? null : accounts.find(a => a.ref === benefitsFocusRef) || null;
   const sum = $('bfFocusSummary');
-  const cur = cn.find(a => a.ref === benefitsFocusRef) || cn[0] || null;
   if (sum) {
     if (!cur) {
-      sum.innerHTML = '<span class="bf-chip">暂无国内个人账号；企业号与国际号没有成长福利体系</span>';
+      const bits = [
+        '范围 ' + (summary.accounts || accounts.length) + ' 个国内账号',
+        '今日签到 ' + (summary.checkin_done || 0) + ' / ' + ((summary.checkin_done || 0) + (summary.checkin_pending || 0)),
+        '待签到 ' + (summary.checkin_pending || 0),
+      ];
+      sum.innerHTML = bits.map(x => '<span class="bf-chip">' + esc(x) + '</span>').join('');
     } else {
       const bits = [
-        '连登 ' + (cur.streak_days || 0) + ' 天',
-        '补签卡 ' + (cur.makeup_cards || 0),
-        '抽奖 ' + (cur.lottery_chances || 0) + ' 次',
-        '能量 ' + fmtTok(cur.energy || 0),
-        '成长待办 ' + (cur.growth_pending || 0) + ' 项',
+        '连登 ' + (summary.streak_days || 0) + ' 天',
+        '补签卡 ' + (summary.makeup_cards || 0),
+        '抽奖 ' + (summary.lottery_chances || 0) + ' 次',
+        '能量 ' + fmtTok(summary.energy || 0),
+        '猫猫 ' + ((summary.cat_daily_done ? '今日已完成' : (summary.cat_reward ? '本轮 +' + summary.cat_reward : '待巡检'))),
       ];
       if (cur.growth_error) bits.push('查询：' + cur.growth_error);
       sum.innerHTML = bits.map(x => '<span class="bf-chip">' + esc(x) + '</span>').join('');
     }
   }
-  renderBenefitTaskRows(cur ? (d && d.task_rows) : [], cur, d && d.task_rows_error);
+  renderBenefitTaskRows(cur ? (d && d.tasks) : [], cur, d && d.tasks_error);
   const disabled = !benefitsFocusRef;
   ['bfBtnFocusCheckin', 'bfBtnFocusRun', 'bfBtnFocusTravel', 'bfBtnFocusStreak'].forEach(id => {
     const b = $(id);
@@ -5519,18 +5548,17 @@ function renderBenefitTaskRows(rows, account, err) {
   if (!body) return;
   benefitsTaskRows = Array.isArray(rows) ? rows : [];
   if (!account) {
-    body.innerHTML = '<tr><td colspan="6"><div class="empty">暂无国内个人账号</div></td></tr>';
+    body.innerHTML = '<tr><td colspan="5"><div class="empty">已选择全部国内账号；选择单个账号可查看成长任务明细。</div></td></tr>';
     return;
   }
   if (err) {
-    body.innerHTML = '<tr><td colspan="6"><div class="empty err">读取成长任务失败：' + esc(err) + '</div></td></tr>';
+    body.innerHTML = '<tr><td colspan="5"><div class="empty err">读取成长任务失败：' + esc(err) + '</div></td></tr>';
     return;
   }
   if (!benefitsTaskRows.length) {
-    body.innerHTML = '<tr><td colspan="6"><div class="empty">该账号暂无成长任务；可先点「扫描待办」或稍后刷新。</div></td></tr>';
+    body.innerHTML = '<tr><td colspan="5"><div class="empty">该账号暂无成长任务；可直接点「一键做任务」或刷新。</div></td></tr>';
     return;
   }
-  const ref = esc(benefitsFocusRef || '');
   body.innerHTML = benefitsTaskRows.map(t => {
     const code = t.task_code || '';
     const cur = t.current ?? 0, tgt = t.target ?? 0;
@@ -5538,23 +5566,12 @@ function renderBenefitTaskRows(rows, account, err) {
     const reward = (t.credit ? '+' + t.credit + ' 分' : '') + (t.energy ? (t.credit ? ' · ' : '') + '+' + t.energy + ' 能' : '');
     const desc = t.task_desc || t.description || '';
     const tip = [t.title, desc, t.jump_url ? '跳转：' + t.jump_url : ''].filter(Boolean).join('\n');
-    let act = '—';
-    if (!t.claimed && !t.locked) {
-      if (t.claimable || (tgt > 0 && cur >= tgt)) {
-        act = '<button type="button" class="xs primary" data-bf-task="claim" data-code="' + esc(code) + '" data-ref="' + ref + '">领取</button>';
-      } else if (AUTO_TASKS[code]) {
-        act = '<button type="button" class="xs primary" data-bf-task="auto" data-code="' + esc(code) + '" data-ref="' + ref + '" title="' + esc(AUTO_TASKS[code]) + '">一键完成</button>';
-      } else if (t.accept_status !== 'accepted' && t.accept_status !== 'in_progress') {
-        act = '<button type="button" class="xs" data-bf-task="accept" data-code="' + esc(code) + '" data-ref="' + ref + '">接受</button>';
-      }
-    }
     return '<tr title="' + esc(tip) + '">' +
       '<td><div class="nm">' + esc(t.title || code) + '</div><div class="id">' + esc(code) + (t.tag ? ' · ' + esc(t.tag) : '') + '</div></td>' +
       '<td class="task-desc">' + esc(desc || '—') + '</td>' +
       '<td class="task-prog">' + esc(prog) + '</td>' +
       '<td>' + esc(reward || '—') + '</td>' +
-      '<td>' + benefitTaskStatus(t) + '</td>' +
-      '<td class="task-acts">' + act + '</td></tr>';
+      '<td>' + benefitTaskStatus(t) + '</td></tr>';
   }).join('');
 }
 
@@ -5687,7 +5704,11 @@ function renderBenefitLog(rows) {
 
 async function loadBenefitLog() {
   try {
-    const d = await api('benefits/log?limit=40');
+    const qs = ['limit=40'];
+    if (benefitsLogFilter.task) qs.push('task=' + encodeURIComponent(benefitsLogFilter.task));
+    if (benefitsLogFilter.result) qs.push('result=' + encodeURIComponent(benefitsLogFilter.result));
+    if (benefitsLogFilter.ref) qs.push('ref=' + encodeURIComponent(benefitsLogFilter.ref));
+    const d = await api('benefits/log?' + qs.join('&'));
     if (view !== 'taskscenter') return;
     renderBenefitLog(d && d.rows);
   } catch (e) {
@@ -5699,6 +5720,9 @@ async function loadBenefitLog() {
 function renderBenefits(d) {
   lastBenefits = d || {};
   const s = (d && d.summary) || {};
+  // These ids are absent on the Hub-style task page, but older embedded
+  // frontends still call renderBenefits with the summary cards. setText is a
+  // no-op when the node is missing; keep the contract for compatibility.
   setText('bfAccounts', String(s.accounts || 0));
   setText('bfAccountsSub', '国内 ' + (s.cn || 0) + ' / 国际 ' + (s.global || 0) + (s.enterprise ? ' · 企业 ' + s.enterprise : ''));
   setText('bfCheckinDone', String(s.checkin_done || 0));
@@ -5714,7 +5738,8 @@ function renderBenefits(d) {
     ? (s.welfare_grant_count || 0) + ' 笔福利发放'
     : '先刷新积分包快照');
   renderBenefitGrants(d && d.recent_grants, s);
-  renderBenefitFocus(d || {});
+  // The task page is served by /tasks; keep the legacy renderer only for the
+  // account welfare table so its virtual-window state remains compatible.
   renderBenefitsAccounts(d && d.accounts);
   loadBenefitBatches();
   loadBenefitLog();
@@ -5728,13 +5753,16 @@ async function loadBenefits(force, refresh) {
   req.promise = (async () => {
     try {
       const qs = [];
-      if (benefitsFocusRef) qs.push('focus=' + encodeURIComponent(benefitsFocusRef));
+      if (benefitsFocusRef && benefitsFocusRef !== 'all') qs.push('focus=' + encodeURIComponent(benefitsFocusRef));
       if (refresh) qs.push('refresh=1');
       const q = qs.length ? ('?' + qs.join('&')) : '';
-      req.path = 'benefits' + q;
-      const d = await api(req.path);
+      const [benefits, tasks] = await Promise.all([
+        api('benefits' + q),
+        api('tasks' + q),
+      ]);
       if (my !== benefitsSeq || view !== 'taskscenter') return;
-      renderBenefits(d || {});
+      renderBenefits(benefits || {});
+      renderTaskWorkbench(tasks || {});
     } catch (e) {
       const body = $('bfAccountsBody');
       if (body && view === 'taskscenter') {
@@ -5746,6 +5774,91 @@ async function loadBenefits(force, refresh) {
   })();
   benefitsReq = req;
   return req.promise;
+}
+
+// renderTaskWorkbench binds the Hub-shaped /tasks response to the visible
+// workbench. It deliberately reuses the existing account table renderer for
+// the lower overview section and only replaces the selector, summary, task
+// rows and execution log.
+function renderTaskWorkbench(d) {
+  const accounts = Array.isArray(d && d.accounts) ? d.accounts : [];
+  const sel = $('bfGrowthAcct');
+  const logAcct = $('bfLogAcct');
+  if (logAcct) {
+    const prev = benefitsLogFilter.ref || '';
+    const opts = ['<option value="">全部账号</option>'].concat(accounts.map(a => '<option value="' + esc(a.ref || '') + '">' + esc((a.nickname || '未命名') + ' · ' + String(a.uid || '').slice(0, 8)) + '</option>')).join('');
+    if (logAcct.innerHTML !== opts) logAcct.innerHTML = opts;
+    logAcct.value = accounts.some(a => a.ref === prev) ? prev : '';
+    benefitsLogFilter.ref = logAcct.value;
+  }
+  if (sel) {
+    const want = benefitsFocusRef || 'all';
+    const opts = ['<option value="all">全部国内账号（批量）</option>'].concat(
+      accounts.map(a => '<option value="' + esc(a.ref || '') + '">' +
+        esc((a.nickname || '未命名') + ' · ' + String(a.uid || '').slice(0, 8)) + '</option>'));
+    const next = opts.join('');
+    if (sel.innerHTML !== next) sel.innerHTML = next;
+    sel.value = accounts.some(a => a.ref === want) ? want : 'all';
+    benefitsFocusRef = sel.value;
+  }
+  const current = benefitsFocusRef === 'all' ? null : accounts.find(a => a.ref === benefitsFocusRef) || null;
+  const summary = (d && d.summary) || {};
+  const sum = $('bfFocusSummary');
+  if (sum) {
+    const bits = (current ? [
+      '连登 ' + (summary.streak_days || 0) + ' 天',
+      '补签卡 ' + (summary.makeup_cards || 0),
+      '抽奖 ' + (summary.lottery_chances || 0) + ' 次',
+      '能量 ' + fmtTok(summary.energy || 0),
+      '本轮猫猫 +' + fmtTok(summary.cat_reward || 0),
+    ] : [
+      '范围 ' + (summary.accounts || accounts.length) + ' 个国内账号',
+      '今日签到 ' + (summary.checkin_done || 0) + ' / ' + ((summary.checkin_done || 0) + (summary.checkin_pending || 0)),
+      '待签到 ' + (summary.checkin_pending || 0),
+    ]).concat(summary.welfare_grants_available ? ['福利积分 +' + fmtTok(summary.welfare_credits_total || 0)] : []);
+    sum.innerHTML = bits.map(x => '<span class="bf-chip">' + esc(x) + '</span>').join('');
+  }
+  benefitsTaskData = d || null;
+  renderBenefitTaskRows(current ? (d && d.tasks) : [], current, d && d.tasks_error);
+  ['bfBtnFocusCheckin', 'bfBtnFocusRun', 'bfBtnFocusTravel', 'bfBtnFocusStreak'].forEach(id => {
+    const b = $(id);
+    if (b) b.disabled = !benefitsFocusRef || !accounts.length;
+  });
+}
+
+async function runTaskAction(action, btn) {
+  const ref = benefitsFocusRef || 'all';
+  if (!ref) return;
+  const seq = ++benefitsRunSeq;
+  const label = btn ? btn.textContent : action;
+  if (btn) { btn.disabled = true; btn.textContent = '执行中…'; }
+  const box = $('bfBatchList');
+  if (box) box.innerHTML = '<div class="empty">正在执行 ' + esc(label) + '…</div>';
+  try {
+    const body = { scope: ref, action };
+    const r = await api('tasks/run', { method: 'POST', body: JSON.stringify(body) });
+    if (seq !== benefitsRunSeq) return;
+    const results = Array.isArray(r && r.results) ? r.results : [];
+    const logs = Array.isArray(r && r.logs) ? r.logs : [];
+    const ok = results.filter(x => x && x.ok).length;
+    const bad = results.length - ok;
+    if (box) {
+      box.innerHTML = '<div class="bf-batch-row"><div><div class="bf-batch-k">' + esc(label) + '</div>' +
+        '<div class="bf-batch-meta">' + esc(benefitsTime(new Date().toISOString())) + ' · 范围 ' + esc(ref === 'all' ? '全部国内账号' : ref.slice(0, 8)) + '</div></div>' +
+        '<div class="bf-batch-stat">' + (bad ? '<span class="tag bad">' + bad + ' 失败</span>' : '<span class="tag ok">完成</span>') +
+        '<div class="bf-batch-meta">成功 ' + ok + ' · 失败 ' + bad + ' · 共 ' + results.length + '</div></div></div>' +
+        (logs.length ? logs.map(x => '<div class="bf-log-row"><span class="t">' + esc(benefitsTime(new Date().toISOString())) + '</span><span class="n"></span><span class="m">' + esc(x) + '</span></div>').join('') : '');
+    }
+    toast((r && (r.message || (ok + ' 个账号成功' + (bad ? '，' + bad + ' 个失败' : '')))) || '执行完成', bad ? 'err' : 'ok');
+  } catch (e) {
+    if (box) box.innerHTML = '<div class="empty err">执行失败：' + esc(e && e.message ? e.message : String(e)) + '</div>';
+    toast(e && e.message ? e.message : String(e), 'err');
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = label; }
+    loadOverview(true);
+    await loadBenefits(true);
+    loadBenefitLog();
+  }
 }
 
 // 福利行内动作统一走短引用：页面 DOM 不出现完整 UID；动作在途时同一行的
@@ -5824,7 +5937,7 @@ function benefitsTaskPath(suffix) {
 }
 
 if ($('bfGrowthAcct')) $('bfGrowthAcct').addEventListener('change', ev => {
-  benefitsFocusRef = ev.target && ev.target.value ? String(ev.target.value) : '';
+  benefitsFocusRef = ev.target && ev.target.value ? String(ev.target.value) : 'all';
   loadBenefits(true);
 });
 
@@ -5866,16 +5979,10 @@ async function runFocusTask(kind, code, btn) {
   }
 }
 
-if ($('bfTaskBody')) $('bfTaskBody').addEventListener('click', ev => {
-  const b = ev.target.closest('button[data-bf-task]');
-  if (!b) return;
-  runFocusTask(b.dataset.bfTask, b.dataset.code, b);
-});
-
-if ($('bfBtnFocusRun')) $('bfBtnFocusRun').onclick = () => runFocusTask('auto_all', '', $('bfBtnFocusRun'));
-if ($('bfBtnFocusCheckin')) $('bfBtnFocusCheckin').onclick = () => runBenefitAction(benefitsFocusRef, 'checkin', 'Buddy 签到');
-if ($('bfBtnFocusTravel')) $('bfBtnFocusTravel').onclick = () => runBenefitAction(benefitsFocusRef, 'travel', '猫猫旅行');
-if ($('bfBtnFocusStreak')) $('bfBtnFocusStreak').onclick = () => runBenefitAction(benefitsFocusRef, 'streak', '连登与抽奖');
+if ($('bfBtnFocusRun')) $('bfBtnFocusRun').onclick = () => runTaskAction('tasks', $('bfBtnFocusRun'));
+if ($('bfBtnFocusCheckin')) $('bfBtnFocusCheckin').onclick = () => runTaskAction('checkin', $('bfBtnFocusCheckin'));
+if ($('bfBtnFocusTravel')) $('bfBtnFocusTravel').onclick = () => runTaskAction('travel', $('bfBtnFocusTravel'));
+if ($('bfBtnFocusStreak')) $('bfBtnFocusStreak').onclick = () => runTaskAction('streak', $('bfBtnFocusStreak'));
 
 if ($('bfAccountsBody')) $('bfAccountsBody').addEventListener('click', ev => {
   const btn = ev.target.closest('button[data-bf-act]');
@@ -5885,6 +5992,16 @@ if ($('bfAccountsBody')) $('bfAccountsBody').addEventListener('click', ev => {
 
 if ($('btnBenefitsRefresh')) $('btnBenefitsRefresh').onclick = () => { loadBenefits(true, true); loadOverview(true); toast('福利概览已刷新', 'ok'); };
 if ($('bfBtnLogRefresh')) $('bfBtnLogRefresh').onclick = () => { loadBenefitLog(); loadBenefitBatches(); };
+['bfLogTask', 'bfLogResult', 'bfLogAcct'].forEach(id => {
+  const el = $(id);
+  if (!el) return;
+  el.addEventListener('change', () => {
+    benefitsLogFilter.task = $('bfLogTask') ? $('bfLogTask').value : '';
+    benefitsLogFilter.result = $('bfLogResult') ? $('bfLogResult').value : '';
+    benefitsLogFilter.ref = $('bfLogAcct') ? $('bfLogAcct').value : '';
+    loadBenefitLog();
+  });
+});
 if ($('bfBtnRefreshGrants')) $('bfBtnRefreshGrants').onclick = async () => {
   const b = $('bfBtnRefreshGrants');
   const label = b.textContent;
@@ -5899,9 +6016,21 @@ if ($('bfBtnRefreshGrants')) $('bfBtnRefreshGrants').onclick = async () => {
     b.disabled = false; b.textContent = label;
   }
 };
+if ($('btnBfDailyChatAll')) $('btnBfDailyChatAll').onclick = async () => {
+  const b = $('btnBfDailyChatAll'), label = b ? b.textContent : '全部每日活跃';
+  if (b) { b.disabled = true; b.textContent = '执行中…'; }
+  try {
+    const r = await api('daily_chat_all', { method: 'POST', body: '{}' });
+    toast((r && r.message) || '国际版每日活跃已触发', 'ok');
+  } catch (e) {
+    toast(e && e.message ? e.message : String(e), 'err');
+  } finally {
+    if (b) { b.disabled = false; b.textContent = label; }
+    loadBenefits(true);
+    loadBenefitBatches();
+  }
+};
 if ($('btnBenefitsActivity')) $('btnBenefitsActivity').onclick = () => go('activity');
-if ($('bfBtnScanAll')) $('bfBtnScanAll').onclick = () => { const b = $('btnScanAll'); if (b) b.click(); };
-if ($('bfBtnRunQueue')) $('bfBtnRunQueue').onclick = () => { const b = $('btnRunQueue'); if (b) b.click(); };
 
 /* ── 页内区块导航 ─────────────────────────────────────────────────── */
 /* 长页（用量/配置）顶部生成 sticky 区块导航：只在 760px 以上显示，标签取每块

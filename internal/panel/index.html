@@ -364,7 +364,7 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 /* 账号池虚拟表格：固定视口内滚动，表头吸顶；整页不再随账号数增长。 */
 .acc-viewport { position: relative; height: clamp(360px, 56vh, 640px); max-height: none; overflow: auto;
   overscroll-behavior: contain; scrollbar-width: thin; outline: none; }
-@media (max-width: 760px) { .acc-viewport { height: auto; max-height: none; } }
+@media (max-width: 760px) { .acc-viewport { height: clamp(280px, 52vh, 480px); max-height: none; } }
 .acc-viewport:focus-visible { box-shadow: inset 0 0 0 2px var(--accent); }
 .acc-viewport > table { margin: 0; }
 .acc-viewport thead th { position: sticky; top: 0; z-index: 2; background: var(--surface-2);
@@ -380,7 +380,10 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 .bf-d { color: var(--ink-3); font-size: 12px; margin-top: 4px; line-height: 1.55; }
 .bf-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 10px; }
 .bf-group > button { margin-top: 10px; }
-.benefits-table { max-height: clamp(300px, 48vh, 580px); overflow: auto; }
+.benefits-cards { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
+.bf-focus-summary { display: flex; flex-wrap: wrap; gap: 8px; }
+.bf-chip { border: 1px solid var(--line); border-radius: 999px; padding: 4px 10px; color: var(--ink-2); font-size: 12px; background: var(--surface-2); }
+.benefits-table { height: clamp(320px, 48vh, 560px); max-height: none; overflow: auto; }
 .benefits-table .acc { min-width: 1080px; }
 .benefits-table th { position: sticky; top: 0; z-index: 2; }
 .benefits-table .virtual-pad td { padding: 0; border: 0; height: 0; }
@@ -1252,109 +1255,100 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       </div>
     </section>
 
-    <!-- 任务中心 -->
+    <!-- 任务中心：Hub 同形工作台（国际活跃 → 国内选择 + 四个动作 → 汇总 → 任务表 → 日志） -->
     <section class="view" id="view-taskscenter" hidden>
       <div class="view-head">
         <div>
           <h2>任务与福利</h2>
-          <p>每日活跃、Buddy 签到、成长任务、猫猫旅行与连登奖励；所有动作都写活动记录，失败原因可悬停查看。</p>
+          <p>Hub 同口径的福利工作台：选择全部国内账号或单个账号，执行签到、成长任务、猫猫旅行与连登抽奖；每次执行都会留下逐账号结果。</p>
         </div>
         <div class="view-acts">
           <button class="xs ghost" id="btnBenefitsRefresh">刷新概览</button>
           <button class="xs ghost" id="btnBenefitsActivity">去活动记录</button>
         </div>
       </div>
-      <div class="stats cards benefits-cards">
-        <div class="stat card"><div class="k">账号</div><div class="v" id="bfAccounts">-</div><div class="bf-sub" id="bfAccountsSub">国内 / 国际</div></div>
-        <div class="stat card good"><div class="k">今日已签到</div><div class="v" id="bfCheckinDone">-</div><div class="bf-sub" id="bfCheckinSub">待签到 —</div></div>
-        <div class="stat card"><div class="k">国际版活跃</div><div class="v" id="bfDailyChatDone">-</div><div class="bf-sub" id="bfDailyChatSub">今日待活跃 —</div></div>
-        <div class="stat card warn"><div class="k">成长待办</div><div class="v" id="bfGrowthPending">-</div><div class="bf-sub" id="bfGrowthSub">扫描后更新</div></div>
-        <div class="stat card accent"><div class="k">今日失败</div><div class="v" id="bfTodayFailed">-</div><div class="bf-sub" id="bfLastActivity">最近活动 —</div></div>
-        <div class="stat card"><div class="k">福利总积分</div><div class="v" id="bfWelfareCredits">-</div><div class="bf-sub" id="bfWelfareSub">签到 / 成长 / 活动所得</div></div>
+
+      <div class="box benefits-actions">
+        <header>
+          <h3>国际版每日活跃 <span class="hint">只作用于国际版个人账号；桌面 + 网页两条通道</span></h3>
+          <span class="grow"></span>
+          <span class="note" id="bfActionNote"></span>
+          <button class="xs primary" id="btnBfDailyChatAll">全部每日活跃</button>
+        </header>
       </div>
+
+      <div class="box benefits-focus">
+        <header>
+          <h3>国内版任务与福利 <span class="hint">选择全部时批量执行，选择单号时只作用于该账号</span></h3>
+          <span class="grow"></span>
+          <label class="sel-note">账号
+            <select id="bfGrowthAcct" aria-label="选择国内版任务范围"></select>
+          </label>
+        </header>
+        <div class="pad bf-grid">
+          <div class="bf-group">
+            <div class="bf-k">Buddy 签到</div>
+            <div class="bf-d">每日签到并刷新余额；批量范围仅包含国内个人号。</div>
+            <button class="xs" id="bfBtnFocusCheckin" data-task-action="checkin">Buddy 签到</button>
+          </div>
+          <div class="bf-group">
+            <div class="bf-k">成长任务</div>
+            <div class="bf-d">接取并执行全部可自动成长任务；含真实对话，耗时较长。</div>
+            <button class="xs primary" id="bfBtnFocusRun" data-task-action="tasks">一键做任务</button>
+          </div>
+          <div class="bf-group">
+            <div class="bf-k">猫猫旅行</div>
+            <div class="bf-d">领养、派出或领取旅行奖励；一次巡检只推进一步。</div>
+            <button class="xs" id="bfBtnFocusTravel" data-task-action="travel">猫猫旅行</button>
+          </div>
+          <div class="bf-group">
+            <div class="bf-k">连登与抽奖</div>
+            <div class="bf-d">兑换已解锁连登档位，并抽完当前可用次数。</div>
+            <button class="xs" id="bfBtnFocusStreak" data-task-action="streak">连登与抽奖</button>
+          </div>
+        </div>
+        <div class="pad bf-focus-summary" id="bfFocusSummary"></div>
+        <div class="tbl-wrap benefits-tasks acc-viewport" id="bfTaskViewport" tabindex="0" aria-label="成长任务明细表格">
+          <table class="acc">
+            <thead><tr><th>任务名称 / 代码</th><th>说明</th><th>进度</th><th>奖励</th><th>状态</th></tr></thead>
+            <tbody id="bfTaskBody"><tr><td colspan="5"><div class="empty">选择一个国内账号查看任务</div></td></tr></tbody>
+          </table>
+        </div>
+      </div>
+
       <div class="box benefits-batches">
         <header>
-          <h3>福利动作执行结果 <span class="hint">手动批量动作的最近一轮结果</span></h3>
+          <h3>执行日志 <span class="hint">本轮逐账号结果；失败原因可悬停查看</span></h3>
           <span class="grow"></span>
           <span class="note" id="bfBatchNote">—</span>
           <button class="xs" id="bfBtnLogRefresh" title="重新读取最近活动记录">刷新日志</button>
         </header>
         <div class="bf-batch-list" id="bfBatchList"><div class="empty">尚未执行批量动作</div></div>
+        <div class="fbar" id="bfLogFilter">
+          <select id="bfLogTask" aria-label="按任务筛选执行流水">
+            <option value="">全部任务</option>
+            <option value="checkin">签到</option>
+            <option value="activity">活跃上报</option>
+            <option value="travel">猫猫旅行</option>
+            <option value="keepalive">Token 保活</option>
+            <option value="daily_chat">国际版每日活跃</option>
+          </select>
+          <select id="bfLogResult" aria-label="按结果筛选执行流水">
+            <option value="">全部结果</option>
+            <option value="ok">成功</option>
+            <option value="failed">失败</option>
+          </select>
+          <select id="bfLogAcct" aria-label="按账号筛选执行流水">
+            <option value="">全部账号</option>
+          </select>
+          <span class="grow"></span>
+          <span class="note" id="bfLogNote">—</span>
+        </div>
         <div class="bf-log">
-          <div class="bf-log-head"><span>最近执行流水</span><span class="note" id="bfLogNote">—</span></div>
           <div class="bf-log-list" id="bfLogList"><div class="empty">读取中…</div></div>
         </div>
       </div>
-      <div class="box benefits-grants">
-        <header>
-          <h3>积分发放记录 <span class="hint">来自最近一次刷新积分的快照，不是逐笔账本</span></h3>
-          <span class="grow"></span>
-          <span class="note" id="bfGrantNote"></span>
-          <button class="xs" id="bfBtnRefreshGrants" title="逐账号实时查询积分包，用于更新总积分与发放记录">刷新积分</button>
-        </header>
-        <div class="tbl-wrap benefits-grants-wrap">
-          <table class="acc">
-            <thead><tr><th>发放时间</th><th>账号</th><th>包 / 来源</th><th>面额</th><th>剩余</th><th>到期</th><th>状态</th></tr></thead>
-            <tbody id="bfGrantsBody"><tr><td colspan="7"><div class="empty">读取中…</div></td></tr></tbody>
-          </table>
-        </div>
-      </div>
-      <div class="box benefits-actions">
-        <header>
-          <h3>批量福利动作 <span class="hint">只作用于有对应体系的账号，企业号自动跳过</span></h3>
-          <span class="grow"></span>
-          <span class="note" id="bfActionNote"></span>
-        </header>
-        <div class="pad bf-grid">
-          <div class="bf-group">
-            <div class="bf-k">国际版</div>
-            <div class="bf-d">每日活跃对话，计入官方 Bonus Pack。</div>
-            <button class="xs primary" id="btnBfDailyChatAll" title="仅国际版个人账号执行每日活跃对话">全部每日活跃</button>
-          </div>
-          <div class="bf-group">
-            <div class="bf-k">国内版</div>
-            <div class="bf-d">Buddy 签到、活跃上报、旅行巡检、Token 保活、连登兑换与抽奖。</div>
-            <div class="bf-row">
-              <button class="xs" id="btnBfCheckinAll">全部签到</button>
-              <button class="xs" id="btnBfActivityAll">全部活跃</button>
-              <button class="xs" id="btnBfTravelAll">旅行巡检</button>
-              <button class="xs" id="btnBfKeepaliveAll">全部保活</button>
-              <button class="xs" id="btnBfStreakAll">连登与抽奖</button>
-            </div>
-          </div>
-          <div class="bf-group">
-            <div class="bf-k">成长任务</div>
-            <div class="bf-d">扫描待办后一键执行；账号内串行，账号间受并发限制。</div>
-            <div class="bf-row">
-              <button class="xs" id="bfBtnScanAll">扫描待办</button>
-              <button class="xs primary" id="bfBtnRunQueue">执行全部待办</button>
-              <label class="sel-note">并发
-                <select id="bfQcConc"><option value="1" selected>1</option><option value="2">2</option><option value="3">3</option></select>
-              </label>
-            </div>
-          </div>
-        </div>
-      </div>
-      <div class="box benefits-focus">
-        <header>
-          <h3>国内版任务与福利 <span class="hint">Hub 同口径：选择一个账号查看成长任务，动作只作用于该账号</span></h3>
-          <span class="grow"></span>
-          <label class="sel-note">账号
-            <select id="bfGrowthAcct" aria-label="选择国内版账号"></select>
-          </label>
-          <button class="xs" id="bfBtnFocusCheckin" title="执行该账号 Buddy 签到并刷新余额">Buddy 签到</button>
-          <button class="xs primary" id="bfBtnFocusRun" title="接取并执行该账号全部可自动成长任务">一键做任务</button>
-          <button class="xs" id="bfBtnFocusTravel" title="该账号猫猫旅行巡检">猫猫旅行</button>
-          <button class="xs" id="bfBtnFocusStreak" title="该账号连登兑换与抽奖">连登与抽奖</button>
-        </header>
-        <div class="pad bf-focus-summary" id="bfFocusSummary"></div>
-        <div class="tbl-wrap benefits-tasks acc-viewport" id="bfTaskViewport" tabindex="0" aria-label="成长任务明细表格">
-          <table class="acc">
-            <thead><tr><th>任务名称 / 代码</th><th>说明</th><th>进度</th><th>奖励</th><th>状态</th><th>操作</th></tr></thead>
-            <tbody id="bfTaskBody"><tr><td colspan="6"><div class="empty">读取中…</div></td></tr></tbody>
-          </table>
-        </div>
-      </div>
+
       <div class="box">
         <header>
           <h3>账号福利概览 <span class="hint">今日签到、最近活动与成长待办</span></h3>
@@ -1368,7 +1362,21 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           </table>
         </div>
       </div>
-      <div class="box">
+
+      <details class="box benefits-grants" id="bfAdvanced">
+        <summary class="pad" style="cursor:pointer;font-weight:650">积分发放记录与旧成长队列（高级）</summary>
+        <header>
+          <h3>积分发放记录 <span class="hint">来自最近一次刷新积分的快照，不是逐笔账本</span></h3>
+          <span class="grow"></span>
+          <span class="note" id="bfGrantNote"></span>
+          <button class="xs" id="bfBtnRefreshGrants" title="逐账号实时查询积分包，用于更新总积分与发放记录">刷新积分</button>
+        </header>
+        <div class="tbl-wrap benefits-grants-wrap">
+          <table class="acc">
+            <thead><tr><th>发放时间</th><th>账号</th><th>包 / 来源</th><th>面额</th><th>剩余</th><th>到期</th><th>状态</th></tr></thead>
+            <tbody id="bfGrantsBody"><tr><td colspan="7"><div class="empty">读取中…</div></td></tr></tbody>
+          </table>
+        </div>
         <header>
           <h3>成长任务队列 <span class="hint" id="qcSummary"></span></h3>
           <span class="grow"></span>
@@ -1397,7 +1405,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <div class="d">扫描所有账号的成长任务与开学季待办，把没做的排成一列，一键执行。</div>
         </div>
         <div id="qcList"></div>
-      </div>
+      </details>
     </section>
 
     <!-- 活动记录：签到 / 每日活跃 / 活跃上报 / 旅行 / 保活的每次真实尝试 -->
@@ -1428,9 +1436,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <select id="actResult" aria-label="按结果筛选">
             <option value="">全部结果</option>
             <option value="ok">成功</option>
-            <option value="fail">失败</option>
+            <option value="failed">失败</option>
           </select>
-          <input id="actUID" type="search" placeholder="账号 uid8" aria-label="按账号 uid8 筛选" maxlength="32" title="活动历史只保存脱敏后的 uid8，可用其中的短标识精确筛选">
+          <select id="actUID" aria-label="按账号筛选活动记录"><option value="">全部账号</option></select>
           <span class="trange" id="actRange"></span>
           <span class="grow"></span>
           <span class="note" id="actCount">—</span>

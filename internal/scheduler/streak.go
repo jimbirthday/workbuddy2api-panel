@@ -8,9 +8,11 @@ package scheduler
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"time"
 
+	"github.com/linguo2625469/workbuddy2api-panel/internal/activity"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
 )
@@ -34,6 +36,32 @@ func (s *Scheduler) RunStreakBonusNow() {
 		}
 		s.streakBonusAccount(a)
 	}
+}
+
+// RunStreakBonusFor 对单个国内个人号执行连登兑换与抽奖（面板福利单号动作）。
+// 未解锁档位 / 无抽奖次数是正常状态，不返回错误；上游查询失败才返回。
+func (s *Scheduler) RunStreakBonusFor(a *auth.Auth, trigger activity.Trigger) error {
+	if a == nil {
+		return fmt.Errorf("account not found")
+	}
+	if a.AccessTokenValue() == "" {
+		return fmt.Errorf("account has no access token")
+	}
+	if a.IsGlobal() || a.IsEnterprise() {
+		return fmt.Errorf("streak bonus is only for CN personal accounts")
+	}
+	if s.cfg.Upstream == nil {
+		return fmt.Errorf("upstream client unavailable")
+	}
+	s.streakBonusAccount(a)
+	if s.cfg.Activity != nil {
+		_ = s.cfg.Activity.Append(activity.Record{
+			UID: a.UID, Nickname: a.Nickname, Realm: a.Realm(),
+			Task: activity.TaskActivity, Trigger: trigger, OK: true,
+			Message: "连登兑换与抽奖检查完成",
+		})
+	}
+	return nil
 }
 
 // streakBonusAccount 单账号：补签保连登 → 礼包/补偿 → 兑换所有已解锁档位 → 抽完所有 chances。

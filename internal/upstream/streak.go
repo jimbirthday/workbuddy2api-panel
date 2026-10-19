@@ -60,6 +60,21 @@ type StreakFull struct {
 	} `json:"redemption_status"`
 }
 
+// GrowthEnergy 成长能量余额（GET /v2/activity/growth/energy）。
+func (c *Client) GrowthEnergy(a *auth.Auth) (int64, error) {
+	data, err := c.growthJSON(a, http.MethodGet, "/v2/activity/growth/energy", nil)
+	if err != nil {
+		return 0, err
+	}
+	var resp struct {
+		Balance int64 `json:"balance"`
+	}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return 0, err
+	}
+	return resp.Balance, nil
+}
+
 // GrowthStreakFull 拉取连登完整状态。
 func (c *Client) GrowthStreakFull(a *auth.Auth) (*StreakFull, error) {
 	data, err := c.growthJSON(a, http.MethodGet, streakPath, nil)

@@ -361,6 +361,30 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 
 /* ── 账号表（签名元素：健康色条 + 积分量条）───────────────────────── */
 .tbl-wrap { overflow-x: auto; max-width: 100%; min-width: 0; }
+/* 账号池虚拟表格：固定视口内滚动，表头吸顶；整页不再随账号数增长。 */
+.acc-viewport { position: relative; max-height: clamp(340px, 62vh, 760px); overflow: auto;
+  overscroll-behavior: contain; scrollbar-width: thin; outline: none; }
+.acc-viewport:focus-visible { box-shadow: inset 0 0 0 2px var(--accent); }
+.acc-viewport > table { margin: 0; }
+.acc-viewport thead th { position: sticky; top: 0; z-index: 2; background: var(--surface-2);
+  box-shadow: inset 0 -1px 0 var(--line); }
+.acc-viewport .virtual-pad td { padding: 0; border: 0; height: 0; }
+.acc-viewport .virtual-pad i { display: block; }
+/* 任务与福利：概览卡 + 分区动作 + 账号福利表。动作区沿用 Hub 的紧凑卡片，
+   不把按钮散落到账号池表头；窄屏自动折行，避免横向溢出。 */
+.bf-sub { color: var(--ink-3); font-size: 11.5px; margin-top: 4px; }
+.bf-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 14px; }
+.bf-group { border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; background: var(--surface-2); min-width: 0; }
+.bf-k { font-weight: 650; color: var(--ink); font-size: 13px; }
+.bf-d { color: var(--ink-3); font-size: 12px; margin-top: 4px; line-height: 1.55; }
+.bf-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 10px; }
+.bf-group > button { margin-top: 10px; }
+.benefits-table { max-height: clamp(300px, 48vh, 580px); overflow: auto; }
+.benefits-table .acc { min-width: 1080px; }
+.benefits-table th { position: sticky; top: 0; z-index: 2; }
+.bf-acts { white-space: nowrap; }
+.bf-acts button { margin: 2px 4px 2px 0; }
+.view-acts { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
 .acc { width: 100%; border-collapse: collapse; font-size: 13px; min-width: 640px; }
 .acc th {
   text-align: right; font-weight: 600; font-size: 12px; color: var(--ink-3);
@@ -1012,7 +1036,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <li><a href="#activity" data-view="activity">活动记录</a></li>
       <li><a href="#usage" data-view="usage">用量</a></li>
       <li><a href="#packages" data-view="packages">积分构成</a></li>
-      <li><a href="#taskscenter" data-view="taskscenter">任务中心</a></li>
+      <li><a href="#taskscenter" data-view="taskscenter">任务与福利</a></li>
       <li><a href="#connect" data-view="connect">接入</a></li>
       <li><a href="#models" data-view="models">模型与档位</a></li>
       <li><a href="#config" data-view="config">配置</a></li>
@@ -1163,16 +1187,16 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <span class="grow"></span>
           <span class="note" id="accCount"></span>
         </div>
-        <div class="tbl-wrap">
-        <table class="acc cardify" id="accTable">
-          <thead><tr>
-            <th class="mark" aria-hidden="true"></th>
-            <th class="pick"><input type="checkbox" id="accPickAll" aria-label="全选当前页账号" title="全选当前页"></th>
-            <th>账号</th><th>状态</th><th>积分</th>
-            <th>成功 / 失败</th><th>在途</th><th>用量</th><th>最近成功</th><th class="c-acts"></th>
-          </tr></thead>
-          <tbody id="accBody"></tbody>
-        </table>
+        <div class="tbl-wrap acc-viewport" id="accViewport" tabindex="0" aria-label="账号虚拟表格，可用上下方向键浏览" style="max-height:clamp(320px,52vh,600px)">
+          <table class="acc cardify" id="accTable">
+            <thead><tr>
+              <th class="mark" aria-hidden="true"></th>
+              <th class="pick"><input type="checkbox" id="accPickAll" aria-label="全选当前页账号" title="全选当前页"></th>
+              <th>账号</th><th>状态</th><th>积分</th>
+              <th>成功 / 失败</th><th>在途</th><th>用量</th><th>最近成功</th><th class="c-acts"></th>
+            </tr></thead>
+            <tbody id="accBody"></tbody>
+          </table>
         </div>
       </div>
 
@@ -1198,8 +1222,68 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
     <section class="view" id="view-taskscenter" hidden>
       <div class="view-head">
         <div>
-          <h2>任务中心</h2>
-          <p>扫描账号待办、执行成长任务；失败原因可悬停查看，扫描不会自动执行任务。</p>
+          <h2>任务与福利</h2>
+          <p>每日活跃、Buddy 签到、成长任务、猫猫旅行与连登奖励；所有动作都写活动记录，失败原因可悬停查看。</p>
+        </div>
+        <div class="view-acts">
+          <button class="xs ghost" id="btnBenefitsRefresh">刷新概览</button>
+          <button class="xs ghost" id="btnBenefitsActivity">去活动记录</button>
+        </div>
+      </div>
+      <div class="stats cards benefits-cards">
+        <div class="stat card"><div class="k">账号</div><div class="v" id="bfAccounts">-</div><div class="bf-sub" id="bfAccountsSub">国内 / 国际</div></div>
+        <div class="stat card good"><div class="k">今日已签到</div><div class="v" id="bfCheckinDone">-</div><div class="bf-sub" id="bfCheckinSub">待签到 —</div></div>
+        <div class="stat card"><div class="k">国际版活跃</div><div class="v" id="bfDailyChatDone">-</div><div class="bf-sub" id="bfDailyChatSub">今日待活跃 —</div></div>
+        <div class="stat card warn"><div class="k">成长待办</div><div class="v" id="bfGrowthPending">-</div><div class="bf-sub" id="bfGrowthSub">扫描后更新</div></div>
+        <div class="stat card accent"><div class="k">今日失败</div><div class="v" id="bfTodayFailed">-</div><div class="bf-sub" id="bfLastActivity">最近活动 —</div></div>
+      </div>
+      <div class="box benefits-actions">
+        <header>
+          <h3>批量福利动作 <span class="hint">只作用于有对应体系的账号，企业号自动跳过</span></h3>
+          <span class="grow"></span>
+          <span class="note" id="bfActionNote"></span>
+        </header>
+        <div class="pad bf-grid">
+          <div class="bf-group">
+            <div class="bf-k">国际版</div>
+            <div class="bf-d">每日活跃对话，计入官方 Bonus Pack。</div>
+            <button class="xs primary" id="btnBfDailyChatAll" title="仅国际版个人账号执行每日活跃对话">全部每日活跃</button>
+          </div>
+          <div class="bf-group">
+            <div class="bf-k">国内版</div>
+            <div class="bf-d">Buddy 签到、活跃上报、旅行巡检、Token 保活、连登兑换与抽奖。</div>
+            <div class="bf-row">
+              <button class="xs" id="btnBfCheckinAll">全部签到</button>
+              <button class="xs" id="btnBfActivityAll">全部活跃</button>
+              <button class="xs" id="btnBfTravelAll">旅行巡检</button>
+              <button class="xs" id="btnBfKeepaliveAll">全部保活</button>
+              <button class="xs" id="btnBfStreakAll">连登与抽奖</button>
+            </div>
+          </div>
+          <div class="bf-group">
+            <div class="bf-k">成长任务</div>
+            <div class="bf-d">扫描待办后一键执行；账号内串行，账号间受并发限制。</div>
+            <div class="bf-row">
+              <button class="xs" id="bfBtnScanAll">扫描待办</button>
+              <button class="xs primary" id="bfBtnRunQueue">执行全部待办</button>
+              <label class="sel-note">并发
+                <select id="bfQcConc"><option value="1" selected>1</option><option value="2">2</option><option value="3">3</option></select>
+              </label>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="box">
+        <header>
+          <h3>账号福利概览 <span class="hint">今日签到、最近活动与成长待办</span></h3>
+          <span class="grow"></span>
+          <span class="note" id="bfAcctNote"></span>
+        </header>
+        <div class="tbl-wrap benefits-table">
+          <table class="acc">
+            <thead><tr><th>账号</th><th>区域</th><th>今日签到</th><th>每日活跃</th><th>成长待办</th><th>连登 / 补签 / 抽奖 / 能量</th><th>猫猫状态</th><th>最近活动</th><th>结果</th><th>操作</th></tr></thead>
+            <tbody id="bfAccountsBody"></tbody>
+          </table>
         </div>
       </div>
       <div class="box">
@@ -1234,7 +1318,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       </div>
     </section>
 
-    <!-- 活动记录：签到 / 活跃 / 旅行 / 保活的每次真实尝试 -->
+    <!-- 活动记录：签到 / 每日活跃 / 活跃上报 / 旅行 / 保活的每次真实尝试 -->
     <section class="view" id="view-activity" hidden>
       <div class="view-head">
         <div>
@@ -1257,6 +1341,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             <option value="activity">活跃上报</option>
             <option value="travel">猫猫旅行</option>
             <option value="keepalive">Token 保活</option>
+            <option value="daily_chat">国际版每日活跃</option>
           </select>
           <select id="actResult" aria-label="按结果筛选">
             <option value="">全部结果</option>

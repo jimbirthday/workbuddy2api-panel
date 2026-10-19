@@ -72,6 +72,22 @@ func (s *Scheduler) runTravel(trigger activity.Trigger) {
 	}
 }
 
+// RunTravelFor 对单个账号执行一趟旅行巡检（面板福利单号动作）。
+// 门控与批量路径一致：global / 企业号 / 无 refresh token 直接拒绝。
+func (s *Scheduler) RunTravelFor(a *auth.Auth) error {
+	if a == nil {
+		return fmt.Errorf("account not found")
+	}
+	if a.RefreshTokenValue() == "" {
+		return fmt.Errorf("account has no refresh token")
+	}
+	if a.IsGlobal() || a.IsEnterprise() {
+		return fmt.Errorf("travel is only for CN personal accounts")
+	}
+	s.travelOne(a, activity.TriggerManual)
+	return nil
+}
+
 // travelOne 单账号单趟状态机：查有无猫 + 查状态 + 最多一个动作，不轮询不等待。
 func (s *Scheduler) travelOne(a *auth.Auth, trigger activity.Trigger) {
 	buddy, err := s.cfg.Upstream.BuddyInfo(a)

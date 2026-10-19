@@ -68,6 +68,14 @@ let accFilter = { q: '', sort: 'default', state: '', realm: '' };
 let accSelected = new Set();
 let accPage = 1;
 let accPageSize = 100;
+// 虚拟表格状态：当前页行、真实行高、上次渲染窗口。
+// 只影响 DOM 中保留多少行，不改变筛选、排序和分页语义。
+let accVirtualRows = [];
+let accVirtualRowH = 44;
+let accVirtualStart = 0;
+let accVirtualEnd = 0;
+let accVirtualSignature = '';
+let accVirtualBound = false;
 try {
   const saved = Number(localStorage.getItem('wb-acc-page-size'));
   if ([0, 50, 100, 200].includes(saved)) accPageSize = saved;
@@ -636,7 +644,7 @@ function loadPackagesData() {
   return run.finally(() => { if (packagesInFlight === run) packagesInFlight = null; });
 }
 
-const TITLES = { accounts: '账号池', activity: '活动记录', usage: '用量', packages: '积分构成', taskscenter: '任务中心', connect: '接入', models: '模型与档位', config: '配置', logs: '运行日志' };
+const TITLES = { accounts: '账号池', activity: '活动记录', usage: '用量', packages: '积分构成', taskscenter: '任务与福利', connect: '接入', models: '模型与档位', config: '配置', logs: '运行日志' };
 // cfgDirty 标记配置页是否有未保存修改。页面内切视图用 confirm，关闭/刷新用
 // beforeunload 的浏览器原生提示。loadConfig 回填后清除，避免误报。
 let cfgDirty = false;
@@ -672,6 +680,7 @@ function go(v) {
   if (v === 'logs') loadLogs();
   if (v === 'usage') loadUsage();
   if (v === 'activity') loadActivity();
+  if (v === 'taskscenter' && typeof loadBenefits === 'function') loadBenefits();
   if (v === 'connect') loadConnect();
   if (v === 'packages') loadPackages();
   // 到期提醒卡片：默认可见，进页面即用 overview 快照渲染（零上游请求，随首页统计
@@ -802,7 +811,60 @@ function accountRowSig(s) {
 // 整表 innerHTML 重建（470 行时这是每 5 秒一次的大块 DOM 分配与布局）。
 let accRenderSig = '';
 
-function renderAccounts(list) {
+// accVirtualWindow 计算当前页需要写入 DOM 的行区间。固定视口 + 上下占位行
+// 保持完整滚动高度；窄屏卡片化时关闭窗口化，避免把卡片行截断。
+function accVirtualWindow() {
+  const rows = accVirtualRows;
+  const vp = $('accViewport');
+  const narrow = typeof window !== 'undefined' && window.matchMedia &&
+    window.matchMedia('(max-width: 760px)').matches;
+  if (!vp || narrow || rows.length < 80) {
+    accVirtualStart = 0; accVirtualEnd = rows.length;
+    return { start: 0, end: rows.length, topPad: 0, bottomPad: 0 };
+  }
+  const rowH = Math.max(24, Number(accVirtualRowH) || 44);
+  const viewportH = Number(vp.clientHeight) || 520;
+  const first = Math.max(0, Math.floor(Number(vp.scrollTop || 0) / rowH) - 6);
+  const count = Math.ceil(viewportH / rowH) + 14;
+  const end = Math.min(rows.length, first + count);
+  accVirtualStart = first;
+  accVirtualEnd = end;
+  return { start: first, end, topPad: first * rowH, bottomPad: Math.max(0, (rows.length - end) * rowH) };
+}
+
+// bindAccVirtualScroll 在滚动时只重算窗口。签名没变时 renderAccounts 会
+// 提前返回，因此这里直接调用 renderAccounts(accAll)，复用同一套筛选与
+// 焦点保护逻辑；5 秒轮询与此路径不会并发重建两份 DOM。
+function bindAccVirtualScroll() {
+  if (accVirtualBound) return;
+  const vp = $('accViewport');
+  if (!vp || typeof vp.addEventListener !== 'function') return;
+  accVirtualBound = true;
+  let raf = 0;
+  vp.addEventListener('scroll', () => {
+    if (raf) return;
+    const run = () => {
+      raf = 0;
+      if (!accAll || !accAll.length) return;
+      accRenderSig = '';
+      // 滚动是纯视图动作：焦点可能正停在表内按钮上（用户刚点过某行）。
+      // renderAccounts 的焦点保护会直接返回，导致窗口停在旧位置、继续滚动
+      // 看到空白。这里显式跳过焦点保护，只重建虚拟窗口。
+      renderAccounts(accAll, true);
+    };
+    raf = typeof requestAnimationFrame === 'function'
+      ? requestAnimationFrame(run) : setTimeout(run, 16);
+  }, { passive: true });
+  if (typeof window !== 'undefined' && window.addEventListener) {
+    window.addEventListener('resize', () => {
+      if (!accAll || !accAll.length) return;
+      accRenderSig = '';
+      renderAccounts(accAll, true);
+    }, { passive: true });
+  }
+}
+
+function renderAccounts(list, forceRender) {
   const tb = $('accBody');
   if (!tb) { noteDOM('accBody'); return; }
   accAll = list || [];
@@ -848,12 +910,18 @@ function renderAccounts(list) {
   };
   if (!list.length) {
     tb.innerHTML = '<tr><td colspan="10"><div class="empty"><div class="big">账号池是空的</div>点击右上角「添加账号」，用浏览器登录一个 WorkBuddy 账号</div></td></tr>';
+    accVirtualRows = [];
+    accVirtualSignature = '';
+    accRenderSig = '';
     restoreScroll();
     return;
   }
   if (!shown.length) {
     tb.innerHTML = '<tr><td colspan="10" class="empty-cell"><div class="empty">没有符合当前筛选条件的账号' +
       '<div style="margin-top:10px"><button type="button" class="xs" data-a="clear-filter">清除筛选</button></div></div></td></tr>';
+    accVirtualRows = [];
+    accVirtualSignature = '';
+    accRenderSig = '';
     restoreScroll();
     return;
   }
@@ -864,14 +932,46 @@ function renderAccounts(list) {
   const busySig = Array.from(busyKeys).sort().join('\x02');
   const fullSig = tableSig + '\x03' + busySig + '\x04' + accFilter.q + '\x05' + accFilter.sort +
     '\x06' + accFilter.state + '\x07' + accFilter.realm;
-  if (focusInTable) return;
-  if (fullSig === accRenderSig && tb.childNodes && tb.childNodes.length) return;
+  if (focusInTable && !forceRender) return;
+  if (fullSig === accRenderSig && tb.childNodes && tb.childNodes.length) { bindAccVirtualScroll(); return; }
   accRenderSig = fullSig;
   // 有总额度（credits_total）→ 进度条按自身 剩余/总额 百分比；旧数据无总额 → 退回池内最高=100%
   // 企业版不限量（credits_total === -1）的 credits 是 1<<40 量级的哨兵值，若计入会把
   // 池内最高额度抬到 1.1e12，导致所有普通账号的进度条恒为 0%。求 maxCred 时排除它们。
   const maxCred = Math.max(1, ...shown.filter(s => s.credits_total !== -1).map(s => s.credits || 0));
-  tb.innerHTML = pageRows.map(s => {
+  // 分页语义保持不变；窗口化只缩小「当前页」实际写入 DOM 的行数。
+  accVirtualRows = pageRows;
+  const virtual = accVirtualWindow();
+  const rowHtml = accVirtualRows.slice(virtual.start, virtual.end).map(s => accRowHtml(s, maxCred));
+  let bodyHtml = '';
+  if (virtual.topPad > 0) bodyHtml += '<tr class="virtual-pad" aria-hidden="true"><td colspan="10"><i style="height:' + virtual.topPad + 'px"></i></td></tr>';
+  bodyHtml += rowHtml.join('');
+  if (virtual.bottomPad > 0) bodyHtml += '<tr class="virtual-pad" aria-hidden="true"><td colspan="10"><i style="height:' + virtual.bottomPad + 'px"></i></td></tr>';
+  tb.innerHTML = bodyHtml;
+  // 首次渲染后按真实行高校准窗口；只在测量值与当前值不同时再渲染一轮，
+  // 避免每帧「渲染→测量→重渲染」循环。
+  if (virtual.end > virtual.start && typeof tb.querySelector === 'function') {
+    const firstRow = tb.querySelector('tr[title^="uid:"]');
+    const measured = firstRow && firstRow.getBoundingClientRect
+      ? Math.round(firstRow.getBoundingClientRect().height || 0) : 0;
+    if (measured > 20 && measured < 400 && Math.abs(measured - accVirtualRowH) > 1) {
+      accVirtualRowH = measured;
+      accVirtualSignature = '';
+      accRenderSig = '';
+      tb.innerHTML = '';
+      renderAccounts(accAll);
+      return;
+    }
+  }
+  bindAccVirtualScroll();
+  restoreScroll();
+}
+
+// accRowHtml 渲染单个账号行。字段与旧内联实现逐项一致；窗口化渲染复用
+// 同一函数，避免两份展示口径漂移。
+function accRowHtml(s, maxCred) {
+  {
+
     const bl = (new Date(s.breaker_until || 0) - Date.now()) / 1000;
     const dg = (new Date(s.degrade_until || 0) - Date.now()) / 1000;
     const cool = Math.max(s.cool_remaining_sec || 0, bl > 0 ? bl : 0, dg > 0 ? dg : 0);
@@ -943,8 +1043,7 @@ function renderAccounts(list) {
       '<td class="num" data-label="最近成功" style="color:var(--ink-3)">' + ago(s.last_success) + '</td>' +
       '<td class="acts" data-label="操作">' + actButtons(s, frozen) +
       '</td></tr>';
-  }).join('');
-  restoreScroll();
+  }
 }
 
 /* actButtons 渲染单行的动作按钮。在途动作（busyKeys 命中）恢复 disabled 与
@@ -1384,6 +1483,12 @@ bindAllAction('btnCheckinAll', 'checkin_all', '将对全部个人账号执行签
 bindAllAction('btnTravelAll', 'travel_all', '将对全部账号执行旅行巡检（含领养链路，耗时较长）。确认开始？', '旅行巡检已开始（含领养链路），结果见日志');
 bindAllAction('btnActivityAll', 'activity_all', '将对全部账号执行活跃上报。确认开始？', '活跃上报已开始，结果见日志');
 bindAllAction('btnKeepaliveAll', 'keepalive_all', '将对全部账号执行保活（维持会话活跃）。确认开始？', '全部保活已开始，结果见日志');
+bindAllAction('btnBfCheckinAll', 'checkin_all', '将对全部个人账号执行签到（企业账号与已签到账号自动跳过）。确认开始？', '全部签到已开始，结果见活动记录');
+bindAllAction('btnBfTravelAll', 'travel_all', '将对全部账号执行旅行巡检（含领养链路，耗时较长）。确认开始？', '旅行巡检已开始，结果见活动记录');
+bindAllAction('btnBfActivityAll', 'activity_all', '将对全部账号执行成长活跃上报。确认开始？', '活跃上报已开始，结果见活动记录');
+bindAllAction('btnBfKeepaliveAll', 'keepalive_all', '将对全部账号执行 Token 保活。确认开始？', '全部保活已开始，结果见活动记录');
+bindAllAction('btnBfStreakAll', 'streak_all', '将执行连登补签、档位兑换与抽奖（未解锁档位/无次数会自动跳过）。确认开始？', '连登与抽奖已开始，结果见活动记录');
+bindAllAction('btnBfDailyChatAll', 'daily_chat_all', '将对全部国际版个人账号发起一次每日活跃对话（不计入真实流量模型额度）。确认开始？', '国际版每日活跃已开始，结果见活动记录');
 
 // 批量启停：后端逐号执行，返回 changed 数；确认文案明确区分「启用=解冻」与「禁用=判死需手动解冻」。
 function bindSetAll(id, enabled, confirmText) {
@@ -2723,7 +2828,7 @@ function refreshVisible() {
   if (document.visibilityState === 'hidden') return;
   if (view === 'accounts') loadOverview(true);
   else if (view === 'logs') loadLogs();
-  else if (view === 'taskscenter') reattachQueueView();
+  else if (view === 'taskscenter') { reattachQueueView(); loadBenefits(); }
 }
 function start() {
   // 首轮数据延后一拍：页面脚本求值完成后立即进入轮询单飞判定，避免初始请求
@@ -2794,6 +2899,7 @@ const AUTO_TASKS = {
 
 function openTasks(uid, account) {
   taskUID = uid;
+  benefitsTaskRef = null;
   openTasks.account = account || null;
   setText('taskWho', String(uid || '').slice(0, 16));
   // 企业号没有个人成长体系。打开弹窗时就按账号属性预隐藏批量操作，避免慢响应
@@ -2809,7 +2915,7 @@ function openTasks(uid, account) {
   if (reload) reload.hidden = false;
   loadTasks();
 }
-function closeTasks() { hideModal('taskVeil'); taskUID = null; }
+function closeTasks() { hideModal('taskVeil'); taskUID = null; benefitsTaskRef = null; }
 if ($('btnCloseTask')) $('btnCloseTask').onclick = closeTasks;
 
 // 账号设置弹窗：备注 + 手动调度权重。只提交这两个字段；weight=1 即不干预。
@@ -2905,12 +3011,15 @@ if ($('btnTaskReload')) $('btnTaskReload').onclick = loadTasks;
 
 // 全部接受：把该账号未接受的任务一次性报名（幂等，跳过已接受/已领取）。
 if ($('btnTaskAcceptAll')) $('btnTaskAcceptAll').onclick = async () => {
-  if (!taskUID) return;
+  if (!taskUID && !benefitsTaskRef) return;
   const btn = $('btnTaskAcceptAll');
   if (!btn) return;
   btn.disabled = true; btn.textContent = '接受中…';
   try {
-    const r = await api('accounts/' + encodeURIComponent(taskUID) + '/tasks/accept_all', { method: 'POST' });
+    const path = taskUID
+      ? 'accounts/' + encodeURIComponent(taskUID) + '/tasks/accept_all'
+      : benefitsTaskPath('accept_all');
+    const r = await api(path, { method: 'POST' });
     const n = r.accepted || 0;
     if (r.failed && r.failed.length) {
       toast(`已接受 ${n} 个，${r.failed.length} 个被上游拒绝（可重试）`, 'err');
@@ -2923,13 +3032,16 @@ if ($('btnTaskAcceptAll')) $('btnTaskAcceptAll').onclick = async () => {
 
 // 一键完成全部可自动任务（耗时较长：含真实对话，逐项回读验证）。
 if ($('btnTaskAutoAll')) $('btnTaskAutoAll').onclick = async () => {
-  if (!taskUID) return;
+  if (!taskUID && !benefitsTaskRef) return;
   const btn = $('btnTaskAutoAll');
   if (!btn) return;
   if (!confirm('将依次执行：补报对话事件、领取 Buddy、glm-5.2 对话、尝试上报。\n过程约 1-2 分钟（含真实对话），确认继续？')) return;
   btn.disabled = true; btn.textContent = '执行中…';
   try {
-    const r = await api('accounts/' + encodeURIComponent(taskUID) + '/tasks/auto_all', { method: 'POST' });
+    const path = taskUID
+      ? 'accounts/' + encodeURIComponent(taskUID) + '/tasks/auto_all'
+      : benefitsTaskPath('auto_all');
+    const r = await api(path, { method: 'POST' });
     const okN = (r.results || []).filter(x => x.status === 'done').length;
     const skipN = (r.results || []).filter(x => x.status === 'skipped').length;
     const errN = (r.results || []).filter(x => x.status === 'error').length;
@@ -2950,7 +3062,10 @@ async function loadTasks() {
   st.innerHTML = '<span class="dots">查询中</span>';
   tb.hidden = true;
   try {
-    const d = await api('accounts/' + encodeURIComponent(taskUID) + '/tasks');
+    const path = taskUID
+      ? 'accounts/' + encodeURIComponent(taskUID) + '/tasks'
+      : benefitsTaskPath('');
+    const d = await api(path);
     if (my !== tasksSeq) return;
     const list = d.tasks || [];
     const enterprise = !!d.enterprise || !!(openTasks.account && openTasks.account.enterprise);
@@ -2973,7 +3088,18 @@ async function loadTasks() {
     }
     // 有进度或可领取的排前面，已领取沉底——一眼看到"现在该做什么"。
     list.sort((a, b) => (a.claimed - b.claimed) || (b.claimable - a.claimable) || String(a.task_code).localeCompare(String(b.task_code)));
-    if (!setHTML('taskBody', list.map(t => {
+    if (!setHTML('taskBody', taskRowsHTML(list))) return;
+    st.hidden = true;
+    tb.hidden = false;
+  } catch (e) {
+    if (my !== tasksSeq) return;
+    st.className = 'state err';
+    st.textContent = e.message;
+  }
+}
+
+function taskRowsHTML(list) {
+  return (Array.isArray(list) ? list : []).map(t => {
       // 进度：current 可能缺失（0 或被上游省略）——用 ?? 兜底，避免渲染成 "undefined / N"
       const cur = t.current ?? 0, tgt = t.target ?? 0;
       const prog = tgt ? cur + ' / ' + tgt : (tgt === 0 && cur > 0 ? String(cur) : '—');
@@ -3000,26 +3126,22 @@ async function loadTasks() {
         '<td class="num">' + esc(reward) + '</td>' +
         '<td>' + badge + '</td>' +
         '<td class="acts">' + acted + '</td></tr>';
-    }).join(''))) return;
-    st.hidden = true;
-    tb.hidden = false;
-  } catch (e) {
-    if (my !== tasksSeq) return;
-    st.className = 'state err';
-    st.textContent = e.message;
-  }
+  }).join('');
 }
 
 if ($('taskBody')) $('taskBody').addEventListener('click', async ev => {
   const b = ev.target.closest('button[data-t]');
-  if (!b || !taskUID) return;
+  if (!b || (!taskUID && !benefitsTaskRef)) return;
   const kind = b.dataset.t, code = b.dataset.c;
   b.disabled = true;
   try {
     if (kind === 'auto') {
       // 一键完成：后端执行动作 → 回读进度 → 汇报（耗时可到分钟级，含真实对话）
       b.textContent = '执行中…';
-      const r = await api('accounts/' + encodeURIComponent(taskUID) + '/tasks/auto', {
+      const path = taskUID
+        ? 'accounts/' + encodeURIComponent(taskUID) + '/tasks/auto'
+        : benefitsTaskPath('auto');
+      const r = await api(path, {
         method: 'POST', body: JSON.stringify({ task_code: code })
       });
       if (r.skipped) {
@@ -3035,7 +3157,9 @@ if ($('taskBody')) $('taskBody').addEventListener('click', async ev => {
       }
       loadOverview(true);
     } else {
-      const path = 'accounts/' + encodeURIComponent(taskUID) + '/tasks/' + (kind === 'claim' ? 'claim' : 'accept');
+      const path = taskUID
+        ? 'accounts/' + encodeURIComponent(taskUID) + '/tasks/' + (kind === 'claim' ? 'claim' : 'accept')
+        : benefitsTaskPath(kind === 'claim' ? 'claim' : 'accept');
       const body = kind === 'claim' ? { task_code: code } : { task_codes: [code] };
       await api(path, { method: 'POST', body: JSON.stringify(body) });
       toast(kind === 'claim' ? '已领取奖励' : '已接受任务', 'ok');
@@ -3523,7 +3647,7 @@ if ($('btnScanAll')) $('btnScanAll').onclick = async () => {
   startScanPolling();
 };
 if ($('btnRunQueue')) $('btnRunQueue').onclick = async () => {
-  const concEl = $('qcConc');
+  const concEl = $('qcConc') || $('bfQcConc');
   const conc = Number(concEl && concEl.value) || 1;
   if (!confirm('扫描全部账号待办并排队执行（账号并发 ' + conc + '，账号内串行）。\n含真实对话的任务耗时较长，确认继续？')) return;
   const b = $('btnRunQueue');
@@ -5170,6 +5294,220 @@ if ($('actUID')) $('actUID').oninput = () => {
 };
 if ($('btnActMore')) $('btnActMore').onclick = () => loadActivity(true);
 if ($('actRange')) trangeBind('actRange', loadActivity, '168');
+
+/* ── 任务与福利 ─────────────────────────────────────────────────────── */
+let benefitsReq = null;
+let benefitsSeq = 0;
+let benefitsBusy = new Set();
+let lastBenefits = null;
+// 福利弹窗当前绑定的服务端短引用。任务动作仍允许 accept/claim/auto；这些
+// 请求改走 benefits/* 路由，完整 UID 始终留在服务端。
+let benefitsTaskRef = null;
+
+function benefitRealmLabel(realm) {
+  return realm === 'global' ? '国际版' : '国内版';
+}
+
+function renderBenefitsAccounts(rows) {
+  const body = $('bfAccountsBody');
+  if (!body) return;
+  rows = Array.isArray(rows) ? rows : [];
+  const note = $('bfAcctNote');
+  if (note) note.textContent = rows.length ? rows.length + ' 个账号' : '';
+  if (!rows.length) {
+    body.innerHTML = '<tr><td colspan="10"><div class="empty">暂无账号；先在账号池添加或导入凭证。</div></td></tr>';
+    return;
+  }
+  body.innerHTML = rows.map(a => {
+    const who = a.nickname ? esc(a.nickname) : esc(a.uid || '—');
+    const realm = benefitRealmLabel(a.realm);
+    const checkin = a.realm === 'global'
+      ? '<span class="tag mute">无签到体系</span>'
+      : (a.enterprise ? '<span class="tag mute">企业号</span>'
+        : (a.checkin_done ? '<span class="tag ok">已签到</span>' : '<span class="tag warn">待签到</span>'));
+    const pending = a.growth_pending ? a.growth_pending + ' 项' : (a.enterprise || a.realm === 'global' ? '—' : '0 项');
+    const daily = a.realm === 'global' && !a.enterprise
+      ? (a.daily_chat_today ? '<span class="tag ok">已活跃</span>' : '<span class="tag warn">待活跃</span>')
+      : '<span class="tag mute">—</span>';
+    const growth = a.growth_available
+      ? ('连登 ' + (a.streak_days || 0) + ' 天 · 补签 ' + (a.makeup_cards || 0) +
+        ' · 抽奖 ' + (a.lottery_chances || 0) + ' · 能量 ' + fmtTok(a.energy || 0))
+      : (a.growth_error ? '<span class="tag bad" title="' + esc(a.growth_error) + '">查询失败</span>' : '—');
+    const cat = a.growth_available
+      ? (a.cat_state ? esc(a.cat_state) + (a.cat_reward ? ' · +' + fmtTok(a.cat_reward) : '') : '—')
+      : '—';
+    const lastTask = a.last_task ? benefitTaskLabel(a.last_task) : '—';
+    const result = a.last_task
+      ? (a.last_ok ? '<span class="tag ok">成功</span>' : '<span class="tag bad">失败</span>')
+      : '—';
+    const ref = a.ref || '';
+    const busy = ref && benefitsBusy.has(ref);
+    const btn = (act, label, cls, title) => ref
+      ? '<button type="button" class="xs ' + (cls || '') + '" data-bf-act="' + esc(act) +
+        '" data-bf-ref="' + esc(ref) + '"' + (busy && act !== 'tasks' ? ' disabled' : '') +
+        (title ? ' title="' + esc(title) + '"' : '') + '>' + esc(label) + '</button>'
+      : '';
+    let acts = '';
+    if (!a.enterprise && a.realm !== 'global') {
+      acts += btn('checkin', '签到', '', '执行 Buddy 签到并刷新余额');
+      acts += btn('streak', '连登', '', '连登兑换与抽奖');
+      acts += btn('travel', '旅行', '', '猫猫旅行巡检');
+      acts += btn('tasks', '成长任务', '', '查看成长任务队列');
+    } else if (a.realm === 'global' && !a.enterprise) {
+      acts += btn('daily_chat', '每日活跃', 'primary', '国际版每日活跃对话');
+    }
+    if (!acts) acts = '—';
+    return '<tr>' +
+      '<td><div class="nm">' + who + '</div><div class="id">' + esc(a.uid || '') + '</div></td>' +
+      '<td><span class="realm-tag">' + esc(realm) + '</span></td>' +
+      '<td>' + checkin + '</td>' +
+      '<td>' + daily + '</td>' +
+      '<td class="num">' + esc(pending) + '</td>' +
+      '<td>' + growth + '</td>' +
+      '<td>' + cat + '</td>' +
+      '<td>' + (a.last_task ? '<div>' + esc(lastTask) + '</div><div class="note">' + esc(benefitsTime(a.last_at)) + '</div>' : '—') + '</td>' +
+      '<td>' + result + '</td>' +
+      '<td class="bf-acts">' + acts + '</td>' +
+      '</tr>';
+  }).join('');
+}
+
+function benefitTaskLabel(task) {
+  return ({checkin: '签到', activity: '活跃上报', travel: '猫猫旅行', keepalive: 'Token 保活', daily_chat: '每日活跃'})[task] || task || '—';
+}
+
+function benefitsTime(v) {
+  if (!v) return '—';
+  const d = new Date(v);
+  if (isNaN(d.getTime())) return String(v);
+  return d.toLocaleString('zh-CN', {month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit'});
+}
+
+function renderBenefits(d) {
+  lastBenefits = d || {};
+  const s = (d && d.summary) || {};
+  setText('bfAccounts', String(s.accounts || 0));
+  setText('bfAccountsSub', '国内 ' + (s.cn || 0) + ' / 国际 ' + (s.global || 0) + (s.enterprise ? ' · 企业 ' + s.enterprise : ''));
+  setText('bfCheckinDone', String(s.checkin_done || 0));
+  setText('bfCheckinSub', '待签到 ' + (s.checkin_pending || 0));
+  setText('bfDailyChatDone', String(s.daily_chat_done || 0));
+  setText('bfDailyChatSub', '待活跃 ' + (s.daily_chat_pending || 0));
+  setText('bfGrowthPending', String(s.growth_pending || 0));
+  setText('bfGrowthSub', s.growth_running ? '队列执行中' : (s.growth_done || s.growth_failed ? '完成 ' + (s.growth_done || 0) + ' · 失败 ' + (s.growth_failed || 0) : '扫描后更新'));
+  setText('bfTodayFailed', String(s.today_failed || 0));
+  setText('bfLastActivity', s.last_activity_at ? '最近 ' + benefitsTime(s.last_activity_at) : '最近活动 —');
+  renderBenefitsAccounts(d && d.accounts);
+}
+
+async function loadBenefits() {
+  if (benefitsReq) return benefitsReq;
+  const my = ++benefitsSeq;
+  const req = { promise: null };
+  req.promise = (async () => {
+    try {
+      const d = await api('benefits');
+      if (my !== benefitsSeq || view !== 'taskscenter') return;
+      renderBenefits(d || {});
+    } catch (e) {
+      const body = $('bfAccountsBody');
+      if (body && view === 'taskscenter') {
+        body.innerHTML = '<tr><td colspan="10"><div class="empty">读取福利概览失败：' + esc(e.message) + '</div></td></tr>';
+      }
+    } finally {
+      if (benefitsReq === req) benefitsReq = null;
+    }
+  })();
+  benefitsReq = req;
+  return req.promise;
+}
+
+// 福利行内动作统一走短引用：页面 DOM 不出现完整 UID；动作在途时同一行的
+// 按钮禁用，完成后刷新快照，避免 5 秒轮询把「执行中」状态冲掉。
+async function runBenefitAction(ref, act, label) {
+  if (!ref || benefitsBusy.has(ref)) return;
+  benefitsBusy.add(ref);
+  const confirmText = {
+    checkin: '确认执行签到并刷新余额？',
+    streak: '确认执行连登兑换与抽奖？未解锁档位/无次数会自动跳过。',
+    daily_chat: '确认对该国际版账号执行每日活跃对话？',
+    travel: '确认执行猫猫旅行巡检？',
+  }[act];
+  if (confirmText && !confirm(confirmText)) {
+    benefitsBusy.delete(ref);
+    return;
+  }
+  renderBenefitsAccounts((lastBenefits && lastBenefits.accounts) || []);
+  try {
+    if (act === 'tasks') {
+      benefitsTaskRef = ref;
+      const d = await api('benefits/' + encodeURIComponent(ref) + '/tasks');
+      openTasksForRef(ref, d && d.tasks, d && d.enterprise);
+    } else {
+      let path = '';
+      if (act === 'daily_chat') path = 'benefits/' + encodeURIComponent(ref) + '/daily_chat';
+      else if (act === 'streak') path = 'benefits/' + encodeURIComponent(ref) + '/streak';
+      else if (act === 'travel') path = 'benefits/' + encodeURIComponent(ref) + '/travel';
+      else if (act === 'checkin') {
+        // 签到仍复用账号动作端点；完整 UID 由后端短引用解析后由前端使用？
+        // 这里不能拿完整 UID，因此改走福利专用签到入口（见 statusActionRef）。
+        path = 'benefits/' + encodeURIComponent(ref) + '/checkin';
+      }
+      const r = await api(path, { method: 'POST' });
+      const msg = (r && (r.message || r.checkin_message)) || (label + '完成');
+      toast(msg, r && r.success === false ? 'err' : 'ok');
+    }
+  } catch (e) {
+    toast(e && e.message ? e.message : String(e), 'err');
+  } finally {
+    benefitsBusy.delete(ref);
+    loadBenefits();
+    loadOverview(true);
+  }
+}
+
+// openTasksForRef 用短引用打开成长任务弹窗。任务弹窗内部按完整 UID 调接口，
+// 因此后端先解析引用，前端只需要拿回任务列表并复用现有渲染。
+function openTasksForRef(ref, tasks, enterprise) {
+  taskUID = null;
+  benefitsTaskRef = ref || null;
+  setText('taskWho', '福利账号 ' + String(ref || '').slice(0, 8));
+  const veil = $('taskVeil');
+  if (!veil) { noteDOM('taskVeil'); return; }
+  showModal('taskVeil', 'btnCloseTask');
+  const st = $('taskState'), tb = $('taskTable'), body = $('taskBody');
+  const list = Array.isArray(tasks) ? tasks : [];
+  const acts = ['btnTaskAcceptAll', 'btnTaskAutoAll'];
+  acts.forEach(id => { const b = $(id); if (b) b.hidden = !!enterprise; });
+  if (!list.length) {
+    if (tb) tb.hidden = true;
+    if (st) {
+      st.hidden = false;
+      st.className = 'state';
+      st.textContent = enterprise ? '企业账号无个人成长任务体系' : '该账号暂无任务';
+    }
+    return;
+  }
+  if (st) st.hidden = true;
+  if (tb) tb.hidden = false;
+  if (body) body.innerHTML = taskRowsHTML(list);
+  if ($('btnTaskReload')) $('btnTaskReload').hidden = true;
+}
+
+// 福利弹窗内的任务动作：按短引用走同一福利路由，后端解析后复用账号动作。
+function benefitsTaskPath(suffix) {
+  return 'benefits/' + encodeURIComponent(benefitsTaskRef) + '/tasks/' + suffix;
+}
+
+if ($('bfAccountsBody')) $('bfAccountsBody').addEventListener('click', ev => {
+  const btn = ev.target.closest('button[data-bf-act]');
+  if (!btn) return;
+  runBenefitAction(btn.dataset.bfRef, btn.dataset.bfAct, btn.textContent || '动作');
+});
+
+if ($('btnBenefitsRefresh')) $('btnBenefitsRefresh').onclick = () => { loadBenefits(); loadOverview(true); toast('福利概览已刷新', 'ok'); };
+if ($('btnBenefitsActivity')) $('btnBenefitsActivity').onclick = () => go('activity');
+if ($('bfBtnScanAll')) $('bfBtnScanAll').onclick = () => { const b = $('btnScanAll'); if (b) b.click(); };
+if ($('bfBtnRunQueue')) $('bfBtnRunQueue').onclick = () => { const b = $('btnRunQueue'); if (b) b.click(); };
 
 /* ── 页内区块导航 ─────────────────────────────────────────────────── */
 /* 长页（用量/配置）顶部生成 sticky 区块导航：只在 760px 以上显示，标签取每块

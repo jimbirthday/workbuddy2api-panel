@@ -13,7 +13,9 @@ package panel
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -25,6 +27,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/activity"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
@@ -93,6 +96,11 @@ type Panel struct {
 	// 不同账号之间不互斥（并行照旧）。TryLock 语义，锁条目常驻（账号数有界）。
 	taskMu    sync.Mutex
 	taskLocks map[string]*sync.Mutex
+	// benefitRefMu/benefitRefs 是福利页动作的服务端短引用映射。页面只拿到
+	// uid8 展示值与不可逆引用，完整 UID 不进入浏览器；引用随每次快照刷新重建，
+	// 使已移除账号的旧按钮自然失效，且不会因 uid8 碰撞命中错误账号。
+	benefitRefMu sync.Mutex
+	benefitRefs  map[string]string
 
 	// bgWG 跟踪面板后台异步任务（扫描、队列、导入等）。StopWaiting 先关
 	// bgStop 再等待，保证 Wait 期间不会再有 Add（WaitGroup 不允许 Add 与
@@ -224,11 +232,12 @@ func New(cfg Config) *Panel {
 		cfg.RedisMode = "noop"
 	}
 	p := &Panel{
-		cfg:     cfg,
-		mux:     http.NewServeMux(),
-		started: time.Now(),
-		logs:    NewRing(500),
-		logins:  map[string]loginSession{},
+		cfg:         cfg,
+		mux:         http.NewServeMux(),
+		started:     time.Now(),
+		logs:        NewRing(500),
+		logins:      map[string]loginSession{},
+		benefitRefs: map[string]string{},
 	}
 	p.routes()
 	return p
@@ -274,11 +283,24 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/tasks/run_queue", p.withAuth(p.tasksRunQueue))
 	p.mux.HandleFunc("GET /panel/api/tasks/queue", p.withAuth(p.tasksQueueStatus))
 	p.mux.HandleFunc("GET /panel/api/activity/history", p.withAuth(p.activityHistory))
+	p.mux.HandleFunc("GET /panel/api/benefits", p.withAuth(p.benefitsOverview))
 	p.mux.HandleFunc("GET /panel/api/school/vouchers", p.withAuth(p.schoolVouchers))
 	p.mux.HandleFunc("POST /panel/api/checkin_all", p.withAuth(p.checkinAll))
 	p.mux.HandleFunc("POST /panel/api/travel_all", p.withAuth(p.travelAll))
 	p.mux.HandleFunc("POST /panel/api/activity_all", p.withAuth(p.activityAll))
 	p.mux.HandleFunc("POST /panel/api/keepalive_all", p.withAuth(p.keepaliveAll))
+	p.mux.HandleFunc("POST /panel/api/daily_chat_all", p.withAuth(p.dailyChatAll))
+	p.mux.HandleFunc("POST /panel/api/streak_all", p.withAuth(p.streakAll))
+	p.mux.HandleFunc("POST /panel/api/benefits/{ref}/daily_chat", p.withAuth(p.benefitsDailyChat))
+	p.mux.HandleFunc("POST /panel/api/benefits/{ref}/streak", p.withAuth(p.benefitsStreak))
+	p.mux.HandleFunc("POST /panel/api/benefits/{ref}/travel", p.withAuth(p.benefitsTravel))
+	p.mux.HandleFunc("GET /panel/api/benefits/{ref}/tasks", p.withAuth(p.benefitsTasks))
+	p.mux.HandleFunc("POST /panel/api/benefits/{ref}/tasks/accept", p.withAuth(p.benefitsTaskAction))
+	p.mux.HandleFunc("POST /panel/api/benefits/{ref}/tasks/accept_all", p.withAuth(p.benefitsTaskAction))
+	p.mux.HandleFunc("POST /panel/api/benefits/{ref}/tasks/claim", p.withAuth(p.benefitsTaskAction))
+	p.mux.HandleFunc("POST /panel/api/benefits/{ref}/tasks/auto", p.withAuth(p.benefitsTaskAction))
+	p.mux.HandleFunc("POST /panel/api/benefits/{ref}/tasks/auto_all", p.withAuth(p.benefitsTaskAction))
+	p.mux.HandleFunc("POST /panel/api/benefits/{ref}/checkin", p.withAuth(p.benefitsCheckin))
 	p.mux.HandleFunc("POST /panel/api/balance_all", p.withAuth(p.balanceAll))
 	p.mux.HandleFunc("GET /panel/api/packages", p.withAuth(p.packages))
 	p.mux.HandleFunc("GET /panel/api/usage", p.withAuth(p.usage))
@@ -1023,6 +1045,235 @@ func (p *Panel) keepaliveAll(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Printf("panel: 手动全量保活已触发")
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true})
+}
+
+// dailyChatAll 手动触发国际版每日活跃对话（异步执行）。
+func (p *Panel) dailyChatAll(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.Scheduler == nil {
+		writeErr(w, http.StatusNotImplemented, "scheduler not available")
+		return
+	}
+	if !p.cfg.Scheduler.TryRunBatch("daily_chat", p.cfg.Scheduler.RunDailyChatNow) {
+		writeErr(w, http.StatusConflict, "already_running")
+		return
+	}
+	log.Printf("panel: 手动国际版每日活跃已触发")
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true})
+}
+
+// streakAll 手动触发国内版连登兑换与抽奖（异步执行，幂等跳过未解锁档位/无次数）。
+func (p *Panel) streakAll(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.Scheduler == nil {
+		writeErr(w, http.StatusNotImplemented, "scheduler not available")
+		return
+	}
+	if !p.cfg.Scheduler.TryRunBatch("streak", p.cfg.Scheduler.RunStreakBonusNow) {
+		writeErr(w, http.StatusConflict, "already_running")
+		return
+	}
+	log.Printf("panel: 手动连登兑换与抽奖已触发")
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true})
+}
+
+// benefitRefFor 为完整 UID 生成稳定的服务端短引用。引用是 sha256 前 16 字节，
+// 不可逆；同一批快照内同一账号稳定，便于前端把行与动作关联起来。
+func benefitRefFor(uid string) string {
+	sum := sha256.Sum256([]byte("wb2api-benefit-ref\x00" + strings.TrimSpace(uid)))
+	return fmt.Sprintf("%x", sum[:16])
+}
+
+// rememberBenefitRefs 重建福利页的引用表。每次快照刷新整体替换，账号移除后
+// 旧引用立即失效；只保留当前池内账号，避免历史 UID 常驻内存。
+func (p *Panel) rememberBenefitRefs(statuses []pool.Status) {
+	refs := make(map[string]string, len(statuses))
+	for _, st := range statuses {
+		uid := strings.TrimSpace(st.UID)
+		if uid == "" {
+			continue
+		}
+		refs[benefitRefFor(uid)] = uid
+	}
+	p.benefitRefMu.Lock()
+	p.benefitRefs = refs
+	p.benefitRefMu.Unlock()
+}
+
+// benefitsAccount 取福利单号动作的目标账号，并检查它属于该动作的体系。
+// 入参是页面持有的短引用；完整 UID 只在服务端解析，不随页面下发。
+func (p *Panel) benefitsAccount(ref string, wantGlobal bool) (*auth.Auth, string) {
+	ref = strings.TrimSpace(ref)
+	if ref == "" {
+		return nil, "invalid benefit ref"
+	}
+	p.benefitRefMu.Lock()
+	uid, ok := p.benefitRefs[ref]
+	p.benefitRefMu.Unlock()
+	if !ok || uid == "" {
+		return nil, "benefit ref expired; refresh the benefits page"
+	}
+	a := p.cfg.Pool.AuthByUID(uid)
+	if a == nil {
+		return nil, "account not found"
+	}
+	if a.AccessTokenValue() == "" {
+		return nil, "account has no access token"
+	}
+	if a.IsEnterprise() {
+		return nil, "enterprise accounts have no personal benefits"
+	}
+	if a.IsGlobal() != wantGlobal {
+		if wantGlobal {
+			return nil, "daily chat is only for international accounts"
+		}
+		return nil, "this action is only for CN accounts"
+	}
+	return a, ""
+}
+
+// benefitsDailyChat 单号国际版每日活跃（同步返回结果，便于页面立刻刷新）。
+func (p *Panel) benefitsDailyChat(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.Upstream == nil {
+		writeErr(w, http.StatusNotImplemented, "upstream client unavailable")
+		return
+	}
+	a, msg := p.benefitsAccount(r.PathValue("ref"), true)
+	if a == nil {
+		writeErr(w, http.StatusBadRequest, msg)
+		return
+	}
+	uid := a.UID
+	if !p.tryLockAccount(uid) {
+		writeErr(w, http.StatusConflict, "account operation already running")
+		return
+	}
+	defer p.unlockAccount(uid)
+	res := p.cfg.Upstream.DailyChatWeb(a, "deepseek-v4.1-flash")
+	_ = p.cfg.Activity.Append(activity.Record{
+		UID: uid, Nickname: a.Nickname, Realm: a.Realm(), Task: activity.TaskDailyChat,
+		Trigger: activity.TriggerManual, OK: res.OK,
+		Message: dailyChatResultMessage(res),
+	})
+	p.invalidateOverview()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "success": res.OK, "conversation": res.Conversation,
+		"status": res.Status, "chunks": res.Chunks, "elapsed_ms": res.ElapsedMS,
+		"error": res.Error, "message": dailyChatResultMessage(res),
+	})
+}
+
+func dailyChatResultMessage(res upstream.WebDailyResult) string {
+	if res.OK {
+		return "每日活跃完成（网页通道 " + res.Status + "，" + strconv.FormatInt(res.Chunks, 10) + " 段输出）"
+	}
+	if res.Error != "" {
+		return "每日活跃失败：" + res.Error
+	}
+	return "每日活跃失败"
+}
+
+// benefitsStreak 单号连登兑换/抽奖（复用调度器幂等动作）。
+func (p *Panel) benefitsStreak(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.Scheduler == nil || p.cfg.Upstream == nil {
+		writeErr(w, http.StatusNotImplemented, "scheduler not available")
+		return
+	}
+	a, msg := p.benefitsAccount(r.PathValue("ref"), false)
+	if a == nil {
+		writeErr(w, http.StatusBadRequest, msg)
+		return
+	}
+	uid := a.UID
+	if !p.tryLockAccount(uid) {
+		writeErr(w, http.StatusConflict, "account operation already running")
+		return
+	}
+	defer p.unlockAccount(uid)
+	if err := p.cfg.Scheduler.RunStreakBonusFor(a, activity.TriggerManual); err != nil {
+		writeErr(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	p.invalidateOverview()
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": "连登兑换与抽奖检查完成"})
+}
+
+// benefitsTravel 单号旅行巡检（与调度器同一条领养→派出→领奖链路）。
+func (p *Panel) benefitsTravel(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.Scheduler == nil || p.cfg.Upstream == nil {
+		writeErr(w, http.StatusNotImplemented, "scheduler not available")
+		return
+	}
+	a, msg := p.benefitsAccount(r.PathValue("ref"), false)
+	if a == nil {
+		writeErr(w, http.StatusBadRequest, msg)
+		return
+	}
+	if !p.tryLockAccount(a.UID) {
+		writeErr(w, http.StatusConflict, "account operation already running")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": "旅行巡检已排队"})
+	if !p.GoBackground(func() {
+		defer p.unlockAccount(a.UID)
+		_ = p.cfg.Scheduler.RunTravelFor(a)
+		p.invalidateOverview()
+	}) {
+		p.unlockAccount(a.UID)
+	}
+}
+
+// benefitsTasks 与 accountTasks 同一条查询链路，但入参是福利页的短引用。
+// 页面按行点「成长任务」时不应把完整 UID 写进 DOM；服务端解析引用后再复用
+// 既有任务查询逻辑，避免两条口径漂移。
+func (p *Panel) benefitsTasks(w http.ResponseWriter, r *http.Request) {
+	a, msg := p.benefitsAccount(r.PathValue("ref"), false)
+	if a == nil {
+		writeErr(w, http.StatusBadRequest, msg)
+		return
+	}
+	next := r.Clone(r.Context())
+	next.SetPathValue("uid", a.UID)
+	p.accountTasks(w, next)
+}
+
+// benefitsTaskAction 把福利弹窗内的任务动作转交给既有账号动作端点。URL 的
+// 最后一段决定动作（accept/accept_all/claim/auto/auto_all），路径参数 uid
+// 由服务端从短引用解析后注入；请求体原样透传。
+func (p *Panel) benefitsTaskAction(w http.ResponseWriter, r *http.Request) {
+	a, msg := p.benefitsAccount(r.PathValue("ref"), false)
+	if a == nil {
+		writeErr(w, http.StatusBadRequest, msg)
+		return
+	}
+	next := r.Clone(r.Context())
+	next.SetPathValue("uid", a.UID)
+	suffix := strings.TrimPrefix(r.URL.Path, "/panel/api/benefits/"+r.PathValue("ref")+"/tasks/")
+	switch suffix {
+	case "accept":
+		p.accountTaskAccept(w, next)
+	case "accept_all":
+		p.taskAcceptAll(w, next)
+	case "claim":
+		p.accountTaskClaim(w, next)
+	case "auto":
+		p.accountTaskAuto(w, next)
+	case "auto_all":
+		p.accountTaskAutoAll(w, next)
+	default:
+		writeErr(w, http.StatusNotFound, "unknown task action")
+	}
+}
+
+// benefitsCheckin 单号签到（福利页短引用入口）。完整 UID 只在服务端解析，
+// 之后复用账号签到端点，保持余额刷新/解冻语义一致。
+func (p *Panel) benefitsCheckin(w http.ResponseWriter, r *http.Request) {
+	a, msg := p.benefitsAccount(r.PathValue("ref"), false)
+	if a == nil {
+		writeErr(w, http.StatusBadRequest, msg)
+		return
+	}
+	next := r.Clone(r.Context())
+	next.SetPathValue("uid", a.UID)
+	p.accountCheckin(w, next)
 }
 
 // balanceAll 手动全量刷新余额：并发查上游、写回池内 credits（含解冻语义），

@@ -32,6 +32,9 @@ const (
 	TaskActivity  Task = "activity"
 	TaskTravel    Task = "travel"
 	TaskKeepalive Task = "keepalive"
+	// TaskDailyChat 国际版每日活跃对话。与 TaskActivity 的国内成长连登上报
+	// 语义不同：它真的发起一次轻量对话并计入官方每日活跃 Bonus Pack。
+	TaskDailyChat Task = "daily_chat"
 )
 
 // Trigger 触发来源。
@@ -1043,7 +1046,7 @@ func hasSensitiveHint(msg string) bool {
 
 func validTask(task Task) bool {
 	switch task {
-	case TaskCheckin, TaskActivity, TaskTravel, TaskKeepalive:
+	case TaskCheckin, TaskActivity, TaskTravel, TaskKeepalive, TaskDailyChat:
 		return true
 	default:
 		return false

@@ -1,9 +1,38 @@
 'use strict';
 /* ── 状态 ─────────────────────────────────────────────────────────── */
 const LS_THEME = 'wb2api.theme';
-/* 管理密钥只放内存：localStorage 会跨会话、跨标签页常驻，任何一次 XSS 或共用
-   浏览器都能直接拿到完整管理权限。页面刷新后重新输入一次，是刻意换来的安全边界。 */
+const KEY_STORAGE = 'wb2api.key';
+/* 管理密钥只放 sessionStorage：同一标签页刷新后自动恢复，关闭标签页即失效。
+   不写 localStorage，避免跨会话、跨标签页常驻；旧版本残留在 localStorage 的
+   明文密钥在这里顺手清掉。 */
 let memKey = '';
+function readStoredKey() {
+  try {
+    return typeof sessionStorage !== 'undefined' && sessionStorage
+      ? (sessionStorage.getItem(KEY_STORAGE) || '')
+      : '';
+  } catch (_) { return ''; }
+}
+function writeStoredKey(k) {
+  try {
+    if (typeof sessionStorage === 'undefined' || !sessionStorage) return;
+    if (k) sessionStorage.setItem(KEY_STORAGE, k);
+    else sessionStorage.removeItem(KEY_STORAGE);
+  } catch (_) { /* 隐私模式/存储不可用：仅保留内存态 */ }
+}
+function rememberKey(k) {
+  memKey = k || '';
+  writeStoredKey(memKey);
+}
+function forgetKey() {
+  rememberKey('');
+}
+try {
+  if (typeof localStorage !== 'undefined' && localStorage && typeof localStorage.removeItem === 'function') {
+    localStorage.removeItem(KEY_STORAGE);
+  }
+} catch (_) { /* ignore */ }
+memKey = readStoredKey();
 let theme = localStorage.getItem(LS_THEME) || 'auto';   // auto | light | dark
 let view = 'accounts';
 let overviewData = null, cfgLoaded = null;
@@ -222,7 +251,7 @@ async function api(path, opts = {}) {
   } finally {
     if (timer) clearTimeout(timer);
   }
-  if (r.status === 401) { openKey(); throw new Error('密钥无效或未填写'); }
+    if (r.status === 401) { forgetKey(); openKey(); throw new Error('密钥无效或未填写'); }
   const d = await r.json().catch(() => ({}));
     if (!r.ok) {
       // 调用方用 status 区分 501/403 等可操作状态；只带 message 会让专门的
@@ -609,7 +638,7 @@ if ($('btnKey')) $('btnKey').onclick = async () => {
   const input = $('keyInput');
   const v = input ? input.value.trim() : '';
   if (!v) return;
-  memKey = v;
+  rememberKey(v);
   try {
     await api('overview');
     clearKeyInput();
@@ -618,7 +647,7 @@ if ($('btnKey')) $('btnKey').onclick = async () => {
     hideModal('keyVeil');
     start();
   } catch (e) {
-    memKey = '';
+    forgetKey();
     const err = $('keyErr');
     if (err) { err.hidden = false; err.textContent = e && e.message ? e.message : '密钥无效'; }
   }
@@ -1149,7 +1178,7 @@ async function loadOverview(quiet) {
     const h = authHeaders();
     if (overviewETag) h['If-None-Match'] = overviewETag;
     const r = await fetch('/panel/api/overview', { headers: h });
-    if (r.status === 401) { openKey(); throw new Error('密钥无效或未填写'); }
+  if (r.status === 401) { forgetKey(); openKey(); throw new Error('密钥无效或未填写'); }
     if (r.status === 304) {
       if (my !== overviewSeq) return;
       // 304 表示账号/模型/余额都没变；只推进「运行 N」这类纯时间字段，
@@ -2693,7 +2722,7 @@ if (cfgForm) cfgForm.onsubmit = async ev => {
     // 密钥可能已改：本次会话沿用新值，避免下一次轮询被 401。
     const keyEl = $('cfgKey');
     const k = keyEl ? keyEl.value.trim() : '';
-    if (k && k !== MASKED_SECRET) memKey = k;
+    if (k && k !== MASKED_SECRET) rememberKey(k);
     // 保存成功不立即回读：用户在保存请求期间继续输入时，回读会把新输入
     // 覆盖成服务端快照。需要重新载入时由「放弃修改」或重新进入配置页触发。
     cfgDirty = false;

@@ -33,6 +33,64 @@ func runNodeScript(t *testing.T, name, script string, args ...string) string {
 	return strings.TrimSpace(string(out))
 }
 
+// 管理密钥只跨当前标签页的刷新保存：sessionStorage 用于恢复，401 后必须清理；
+// 旧版本写在 localStorage 的明文密钥也要在新页面加载时移除。
+func TestAppJSKeySessionStorageLifecycle(t *testing.T) {
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('const KEY_STORAGE');
+const stateEnd = src.indexOf('let theme =', start);
+const requestStart = src.indexOf('function authHeaders', stateEnd);
+const requestEnd = src.indexOf('// isAbortError', requestStart);
+if (start < 0 || stateEnd < 0 || requestStart < 0 || requestEnd < 0) throw new Error('key handling region not found');
+const values = { 'wb2api.key': 'stored-key' };
+const sessionStorage = {
+  getItem: k => Object.prototype.hasOwnProperty.call(values, k) ? values[k] : null,
+  setItem: (k, v) => { values[k] = String(v); },
+  removeItem: k => { delete values[k]; },
+};
+let removedLegacy = false, opened = 0;
+const localStorage = {
+  getItem: () => null,
+  setItem() {},
+  removeItem: k => { if (k === 'wb2api.key') removedLegacy = true; },
+};
+const ctx = {
+  sessionStorage, localStorage,
+  openKey: () => { opened++; },
+  fetch: () => Promise.resolve({ status: 401, ok: false }),
+  AbortController: undefined,
+  setTimeout,
+  clearTimeout,
+};
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, stateEnd) + src.slice(requestStart, requestEnd) +
+  '\nthis.api=api; this.rememberKey=rememberKey; this.forgetKey=forgetKey; this.getMemKey=() => memKey;', ctx);
+(async () => {
+  const restored = ctx.getMemKey();
+  ctx.rememberKey('new-key');
+  const saved = values['wb2api.key'];
+  ctx.rememberKey('next-key');
+  let err = '';
+  try { await ctx.api('overview'); } catch (e) { err = e.message; }
+  process.stdout.write(JSON.stringify({
+    restored,
+    saved,
+    after401: ctx.getMemKey(),
+    storedAfter401: values['wb2api.key'] || '',
+    opened,
+    legacyRemoved: removedLegacy,
+    error: err,
+  }));
+})();`
+	out := runNodeScript(t, "key-session", script, appJSPath(t))
+	const want = `{"restored":"stored-key","saved":"new-key","after401":"","storedAfter401":"","opened":1,"legacyRemoved":true,"error":"密钥无效或未填写"}`
+	if out != want {
+		t.Fatalf("key session lifecycle=%s\nwant %s", out, want)
+	}
+}
+
 func appJSPath(t *testing.T) string {
 	t.Helper()
 	path, err := filepath.Abs("app.js")

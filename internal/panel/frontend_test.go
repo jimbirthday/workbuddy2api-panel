@@ -110,6 +110,7 @@ const sandbox = new Proxy({
   location: { hash: process.env.SMOKE_HASH || '#taskscenter' },
   history: { replaceState() {} },
   localStorage: { getItem: () => null, setItem() {} },
+  sessionStorage: { getItem: () => null, setItem() {}, removeItem() {} },
   navigator: { clipboard: { writeText: () => Promise.resolve() } },
   document: { querySelectorAll: () => [], querySelector: () => inert, getElementById: () => inert, addEventListener() {}, documentElement: inert, head: inert, body: inert, createElement: () => inert, cookie: '' },
   fetch: () => new Promise(() => {}),

@@ -734,7 +734,7 @@ function go(v) {
   const mdBody = $('mdBody');
   if (v === 'models' && (!mdBody || !mdBody.children || !mdBody.children.length)) loadModels();
   if (v === 'config') loadConfig();
-  if (v === 'logs') loadLogs();
+  if (v === 'logs') { syncLogChannelView(); loadLogs(); }
   if (v === 'usage') loadUsage();
   if (v === 'activity') { renderActivityAccountOptions(); loadActivity(); }
   if (v === 'taskscenter' && typeof loadBenefits === 'function') loadBenefits();
@@ -1799,6 +1799,13 @@ let logCh = 'all';
 // 最近 N 行上过滤即可，避免为了看一条 ERROR 重新扫盘。
 let logLevel = '', logQ = '';
 let logQT = null;
+// 请求记录表和运行日志同属一个日志页；频道选择必须作用于整页，否则选「系统」
+// 后上方请求记录仍常驻，看起来像系统频道混入了请求日志。
+// all：全部区块；chat：请求记录 + 对话日志；task/sys：只保留运行日志。
+function syncLogChannelView() {
+  const reqBox = $('reqBox');
+  if (reqBox) reqBox.hidden = logCh !== 'all' && logCh !== 'chat';
+}
 function logLevelOf(e) {
   const txt = String((e && e.text) || '');
   if (/\b(error|fatal|panic)\b|失败|错误/i.test(txt)) return 'ERROR';
@@ -1823,7 +1830,12 @@ if ($('logChips')) $('logChips').addEventListener('click', ev => {
   if (!b) return;
   logCh = b.dataset.ch;
   document.querySelectorAll('#logChips .chip').forEach(c => c.classList.toggle('on', c === b));
+  syncLogChannelView();
+  // 切换频道后按新频道重绘；随后再拉一轮，保证刚写入的日志也按新频道展示。
+  // renderLogs 只做本地筛选，不依赖在途请求，切换不会短暂闪回旧频道内容。
+  logSig = '';
   renderLogs(lastLogEntries);
+  loadLogs(true);
 });
 // 级别立即重绘；关键字防抖 120ms，输入长正文时不必每个键都重建 500 行。
 const logLevelEl = $('logLevel');
@@ -1900,6 +1912,7 @@ async function loadLogs(manual) {
   // 「最近 N 条」里根本不会有那些记录，必须让服务端按时间取。
   const rq = trangeQuery('reqRange', false);
   rq.set('limit', limit);
+  if (typeof syncLogChannelView === 'function') syncLogChannelView();
   let failMetrics = null, failArchive = null;
   try {
     // 三块数据互不依赖：运行日志优先渲染（它最常用且最轻），指标/归档再各自
@@ -1925,14 +1938,17 @@ async function loadLogs(manual) {
       // 日志容器整体 innerHTML 替换会把正在向上翻阅的用户拉回旧位置，也产生无谓
       // 的 DOM/布局开销。签名未变（同一批行）时跳过重绘；滚动位置只在用户仍位于
       // 底部（或显式开启自动滚动）时跟随。
-      const sig = lastLogEntries.map(e => [e.ts || '', e.ch || '', e.text || ''].join('\u0001')).join('\u0002');
+      const sig = (typeof logCh === 'string' ? logCh : 'all') + '\u0000' +
+        lastLogEntries.map(e => [e.ts || '', e.ch || '', e.text || ''].join('\u0001')).join('\u0002');
       // 首次渲染时容器里是空内容（或占位提示），不能只凭签名跳过；用初始哨兵
       // 区分「尚未画过」与「画过同一批」。否则首屏日志会一直是空白占位。
       // 旧版单测只求值 loadLogs 这一段，不能依赖外部的 logRenderHTML /
       // logLevelOf；这里保留自包含模板，renderLogs 只服务本地筛选控件。
       if (sig !== logSig || !logSig) {
-        box.innerHTML = lastLogEntries.length
-        ? lastLogEntries.map(e => {
+        const ch = typeof logCh === 'string' ? logCh : 'all';
+        const visible = lastLogEntries.filter(e => ch === 'all' || (e && e.ch) === ch);
+        box.innerHTML = visible.length
+        ? visible.map(e => {
           const txt = String(e.text || '');
           const lvl = /\b(error|fatal|panic)\b|失败|错误/i.test(txt) ? 'ERROR'
             : /\bwarn(ing)?\b|冷却|熔断|限流/i.test(txt) ? 'WARN'
@@ -1946,7 +1962,7 @@ async function loadLogs(manual) {
             '<i class="lm">' + esc(txt) + '</i>' +
             '</span>';
         }).join('')
-        : '<span style="color:var(--ink-3)">暂无日志</span>';
+        : '<span style="color:var(--ink-3)">' + (ch === 'all' ? '暂无日志' : '没有符合筛选条件的日志') + '</span>';
         logSig = sig;
         if (logPin && atEnd) box.scrollTop = box.scrollHeight;
       } else if (logPin && atEnd) {

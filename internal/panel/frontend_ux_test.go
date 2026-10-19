@@ -91,6 +91,54 @@ vm.runInContext(src.slice(start, stateEnd) + src.slice(requestStart, requestEnd)
 	}
 }
 
+// 日志频道选择必须作用于整页：选「系统」只看系统日志并隐藏请求记录表，
+// 选「全部 / 对话」时请求记录表恢复；轮询刷新期间也不能被重新显示。
+func TestAppJSLogChannelControlsRequestBox(t *testing.T) {
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('async function loadLogs');
+const end = src.indexOf('function renderRequestMetrics', start);
+if (start < 0 || end < 0) throw new Error('loadLogs not found');
+const box = {innerHTML: '', scrollTop: 0, clientHeight: 0, scrollHeight: 0};
+const reqBox = {hidden: true};
+const chips = [];
+const ctx = {
+  logsReq: false, logSig: '', logPin: true, logCh: 'sys', logLevel: '', logQ: '',
+  api: path => String(path) === 'logs'
+    ? Promise.resolve({entries: [
+      {ts: '2026-01-01T00:00:00Z', ch: 'sys', text: 'system line'},
+      {ts: '2026-01-01T00:00:01Z', ch: 'chat', text: 'chat line'},
+    ]})
+    : String(path) === 'request_metrics'
+      ? Promise.resolve({archive: {enabled: true}})
+      : Promise.resolve({entries: [{request_id: 'r1'}]}),
+  $: id => id === 'logBox' ? box : id === 'reqBox' ? reqBox : {textContent: '', className: '', value: '100', hidden: false},
+  setText: () => {}, noteDOM: () => {},
+  trangeQuery: () => ({set() {}, toString: () => ''}),
+  syncLogChannelView: () => { reqBox.hidden = ctx.logCh !== 'all' && ctx.logCh !== 'chat'; },
+  renderRequestMetrics: () => {}, lastLogMetrics: null, lastLogRows: {entries: []}, lastLogErrors: {},
+  esc: s => String(s), fmtLogTime: s => String(s), Promise, Array, Object, String, Number,
+};
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, end) + '\nthis.loadLogs=loadLogs;', ctx);
+(async () => {
+  await ctx.loadLogs();
+  const systemOnly = box.innerHTML.includes('system line') && !box.innerHTML.includes('chat line');
+  const hiddenAtSys = reqBox.hidden;
+  ctx.logCh = 'all';
+  await ctx.loadLogs();
+  const allRows = box.innerHTML.includes('system line') && box.innerHTML.includes('chat line');
+  const shownAtAll = reqBox.hidden === false;
+  process.stdout.write(JSON.stringify({systemOnly, hiddenAtSys, allRows, shownAtAll}));
+})();`
+	out := runNodeScript(t, "log-channel", script, appJSPath(t))
+	const want = `{"systemOnly":true,"hiddenAtSys":true,"allRows":true,"shownAtAll":true}`
+	if out != want {
+		t.Fatalf("log channel=%s\nwant %s", out, want)
+	}
+}
+
 func appJSPath(t *testing.T) string {
 	t.Helper()
 	path, err := filepath.Abs("app.js")

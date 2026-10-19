@@ -47,6 +47,12 @@ func (s *sseLineReader) readLine() ([]byte, error) {
 // "data:" 后零个或多个空格，也接受 JSON 紧贴冒号的 "data:{...}"；上游确实
 // 存在这两种合法变体。非 data 行（含 "database:" 这类同前缀字段）返回 nil。
 func sseDataPayload(line []byte) []byte {
+	return SSEDataPayload(line)
+}
+
+// SSEDataPayload extracts a data field using the same rules for forwarding and
+// usage accounting. It accepts data: with or without whitespace after the colon.
+func SSEDataPayload(line []byte) []byte {
 	line = bytes.TrimRight(line, "\r\n")
 	if !bytes.HasPrefix(line, []byte(sseDataPrefix)) {
 		return nil
@@ -655,7 +661,11 @@ func normalizeFrame(obj map[string]any) map[string]any {
 				nc["index"] = idx
 			}
 			delta := map[string]any{}
-			if d, ok := c["delta"].(map[string]any); ok {
+			d, _ := c["delta"].(map[string]any)
+			if d == nil {
+				d, _ = c["message"].(map[string]any)
+			}
+			if d != nil {
 				if v, ok := d["role"].(string); ok && v != "" {
 					delta["role"] = v
 				}
@@ -814,6 +824,7 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 	// gotAnswer 跨帧记录本流是否出现过可用回答内容（正文/思考/tool_calls）。
 	// 收尾帧只有在此为 true 时才计入有效帧，避免 role-only + stop 空流假成功。
 	gotAnswer := false
+	sawTerminal := false // explicit finish_reason or an upstream error frame
 	// pending 扣住正文之前的帧（role-only 首帧、心跳、注释）。这些帧都不是可用
 	// 回答，先写出去只会提交 200 成功头，让空流/正文前错误无法回真实状态码。
 	// 有界：只保留最早的 maxHeldStreamBytes 字节，超出部分丢弃——被缓冲的帧按
@@ -1015,6 +1026,7 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 					}
 					return 1, nil
 				case fastFrameFinish:
+					sawTerminal = true
 					if werr := writeSSE(string(raw)); werr != nil {
 						return 0, werr
 					}
@@ -1035,11 +1047,30 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 			}
 			return 0, nil
 		}
+		// Some providers send full message objects inside SSE. Promote them
+		// before repair/name handling so detection and forwarded content agree.
+		if choices, ok := obj["choices"].([]any); ok {
+			for _, raw := range choices {
+				choice, _ := raw.(map[string]any)
+				if choice == nil {
+					continue
+				}
+				if delta, _ := choice["delta"].(map[string]any); delta == nil {
+					if msg, ok := choice["message"].(map[string]any); ok {
+						choice["delta"] = msg
+					}
+				}
+			}
+		}
+		if frameHasFinishReason(obj) {
+			sawTerminal = true
+		}
 		// 上游错误帧透传（error-passthrough）：带 error 键的帧**原样写出**，不走
 		// normalizeFrame 白名单——白名单会剥掉 error 字段，客户端就看不到上游
 		// code/msg/requestId。error.message 即上游原文（如 6004 限流、审核拦截），
 		// 计入有效帧（避免误判空流补写 "empty upstream stream"）。
 		if frameIsError(obj) {
+			sawTerminal = true
 			// 正文还没写出：扣住这一帧，让调用方换号。不写响应头、不通知观察者
 			// （观察者挂在「已经透传」之后；换号成功时客户端不该看到这次失败）。
 			// OpenAI 形态（{"error":{...}}）与业务信封形态（{"code":<非0>,"msg":...}）
@@ -1087,12 +1118,14 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 
 	lr := newSSELineReader(r)
 	validFrames := 0
+	sawDone := false
 readLoop:
 	for {
 		line, err := lr.readLine()
 		trimmed := bytes.TrimRight(line, "\r\n")
 		if payload := sseDataPayload(trimmed); payload != nil {
 			if bytes.Equal(payload, []byte("[DONE]")) {
+				sawDone = true
 				// 上游显式结束：停止读取，DONE 之后的任何数据（含垃圾帧）一律不再透传。
 				// [DONE] 统一在循环结束后写出，保证恰好一个。
 				break readLoop
@@ -1125,6 +1158,12 @@ readLoop:
 	// 会提交 200，客户端把上游缺陷误读成一次成功的空回答。
 	if validFrames == 0 {
 		return errEmptyStream
+	}
+	// A connection closing after content is not proof of completion. Keep
+	// compatibility with providers omitting DONE only when they sent an explicit
+	// finish_reason (or error); otherwise expose a truncated upstream stream.
+	if !sawDone && !sawTerminal {
+		return &StreamReadError{Err: io.ErrUnexpectedEOF}
 	}
 	if werr := flushPending(); werr != nil {
 		return werr

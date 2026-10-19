@@ -18,6 +18,7 @@ type sseEmitter struct {
 	w       http.ResponseWriter
 	fl      http.Flusher
 	started bool
+	err     error
 }
 
 func newSSEEmitter(w http.ResponseWriter) *sseEmitter {
@@ -39,25 +40,33 @@ func (e *sseEmitter) start() {
 }
 
 func (e *sseEmitter) event(name string, payload any) {
+	if e.err != nil {
+		return
+	}
 	raw, err := json.Marshal(payload)
 	if err != nil {
+		e.err = err
 		return
 	}
 	e.start()
-	_, _ = fmt.Fprintf(e.w, "event: %s\ndata: %s\n\n", name, raw)
-	if e.fl != nil {
+	_, e.err = fmt.Fprintf(e.w, "event: %s\ndata: %s\n\n", name, raw)
+	if e.err == nil && e.fl != nil {
 		e.fl.Flush()
 	}
 }
 
 func (e *sseEmitter) data(payload any) {
+	if e.err != nil {
+		return
+	}
 	raw, err := json.Marshal(payload)
 	if err != nil {
+		e.err = err
 		return
 	}
 	e.start()
-	_, _ = fmt.Fprintf(e.w, "data: %s\n\n", raw)
-	if e.fl != nil {
+	_, e.err = fmt.Fprintf(e.w, "data: %s\n\n", raw)
+	if e.err == nil && e.fl != nil {
 		e.fl.Flush()
 	}
 }
@@ -151,7 +160,7 @@ func (s *ResponsesStream) emit(name string, payload map[string]any) {
 
 // Feed consumes one Chat Completions SSE data payload.
 func (s *ResponsesStream) Feed(payload []byte) {
-	if s.failed {
+	if s.failed || s.em.err != nil {
 		return
 	}
 	if IsErrorChunk(payload) {
@@ -159,15 +168,7 @@ func (s *ResponsesStream) Feed(payload []byte) {
 		if code == "" {
 			code = "upstream_error"
 		}
-		s.failed = true
-		if s.em.started {
-			// Content already reached the client: keep the error in-band.
-			s.em.event("error", map[string]any{"type": "error", "message": msg, "code": code})
-			return
-		}
-		// Nothing has been committed yet: hold the error so Finish can let the
-		// HTTP layer emit a real 502/429 JSON envelope.
-		s.pendingErr = &StreamError{Status: streamErrorStatus(code, msg), Code: code, Message: msg, Detail: ExtractError(payload)}
+		s.Fail(&StreamError{Status: streamErrorStatus(code, msg), Code: code, Message: msg, Detail: ExtractError(payload)})
 		return
 	}
 	var chunk map[string]any
@@ -221,10 +222,28 @@ func (s *ResponsesStream) Feed(payload []byte) {
 			s.feedToolCall(call)
 		}
 	}
-	if fc, ok := delta["function_call"].(map[string]any); ok && stringValue(fc["name"]) != "" {
+	if fc, ok := delta["function_call"].(map[string]any); ok && len(fc) > 0 {
 		s.sawUse = true
 		s.feedToolCall(map[string]any{"index": float64(0), "function": fc})
 	}
+}
+
+// Err returns the first downstream write error, allowing the caller to stop
+// consuming the upstream stream immediately.
+func (s *ResponsesStream) Err() error { return s.em.err }
+
+// Fail ends translation without emitting a successful completion. Before the
+// first event, Finish returns the error for the HTTP layer to render as JSON.
+func (s *ResponsesStream) Fail(err *StreamError) {
+	if s.failed {
+		return
+	}
+	s.failed = true
+	if !s.em.started {
+		s.pendingErr = err
+		return
+	}
+	s.em.event("error", map[string]any{"type": "error", "message": err.Message, "code": err.Code})
 }
 
 func (s *ResponsesStream) ensureStart() {
@@ -295,12 +314,9 @@ func (s *ResponsesStream) feedToolCall(call map[string]any) bool {
 		usable = true
 		if entry.opened {
 			entry.args.WriteString(args)
-			if toolIsCustom(entry.name, s.meta) {
-				s.emit("response.custom_tool_call_input.delta", map[string]any{
-					"output_index": entry.output, "item_id": entry.itemID,
-					"call_id": entry.callID, "delta": args,
-				})
-			} else {
+			// Custom input is a JSON-wrapped string. Buffer its fragments until
+			// Finish can unwrap escapes and emit the exact input once.
+			if !toolIsCustom(entry.name, s.meta) {
 				s.emit("response.function_call_arguments.delta", map[string]any{
 					"output_index": entry.output, "item_id": entry.itemID,
 					"call_id": entry.callID, "delta": args,
@@ -371,11 +387,7 @@ func (s *ResponsesStream) openTool(entry *responseTool) {
 	if pending := entry.pending.String(); pending != "" {
 		entry.args.WriteString(pending)
 		entry.pending.Reset()
-		if custom {
-			s.emit("response.custom_tool_call_input.delta", map[string]any{
-				"output_index": entry.output, "item_id": entry.itemID, "call_id": entry.callID, "delta": pending,
-			})
-		} else {
+		if !custom {
 			s.emit("response.function_call_arguments.delta", map[string]any{
 				"output_index": entry.output, "item_id": entry.itemID, "call_id": entry.callID, "delta": pending,
 			})
@@ -462,8 +474,14 @@ func (s *ResponsesStream) responseObject(status string) map[string]any {
 // content are returned as *StreamError without writing a 200 SSE header; the
 // HTTP layer turns them into native JSON error responses.
 func (s *ResponsesStream) Finish() error {
+	if s.em.err != nil {
+		return s.em.err
+	}
 	if s.failed {
-		return s.pendingErr
+		if s.pendingErr != nil {
+			return s.pendingErr
+		}
+		return nil
 	}
 	if !s.em.started {
 		s.failed = true
@@ -495,6 +513,9 @@ func (s *ResponsesStream) Finish() error {
 		args := entry.args.String()
 		if toolIsCustom(entry.name, s.meta) {
 			input := unwrapCustomInput(args)
+			s.emit("response.custom_tool_call_input.delta", map[string]any{
+				"output_index": entry.output, "item_id": entry.itemID, "call_id": entry.callID, "delta": input,
+			})
 			s.emit("response.custom_tool_call_input.done", map[string]any{
 				"output_index": entry.output, "item_id": entry.itemID, "call_id": entry.callID, "input": input,
 			})
@@ -534,8 +555,8 @@ func (s *ResponsesStream) Finish() error {
 	if s.finish == "length" {
 		status = "incomplete"
 	}
-	s.emit("response.completed", map[string]any{"response": s.responseObject(status)})
-	return nil
+	s.emit("response."+status, map[string]any{"response": s.responseObject(status)})
+	return s.em.err
 }
 
 // emitError renders a held failure as a native SSE error event. Used by the
@@ -601,24 +622,18 @@ func (s *MessagesStream) ensureStart() {
 
 // Feed consumes one Chat Completions SSE data payload.
 func (s *MessagesStream) Feed(payload []byte) {
-	if s.failed {
+	if s.failed || s.em.err != nil {
 		return
 	}
 	if IsErrorChunk(payload) {
 		msg, code := ExtractErrorMessage(payload)
-		s.failed = true
 		status := streamErrorStatus(code, msg)
-		if s.em.started {
-			// Content already reached the client: keep the error in-band.
-			s.event("error", map[string]any{"error": map[string]any{"type": anthropicErrorType(status), "message": msg}})
-			return
-		}
 		// Nothing committed yet: Finish returns this so the HTTP layer can send
 		// a native 502/429 JSON envelope.
 		if code == "" {
 			code = "upstream_error"
 		}
-		s.pendingErr = &StreamError{Status: status, Code: code, Message: msg, Detail: ExtractError(payload)}
+		s.Fail(&StreamError{Status: status, Code: code, Message: msg, Detail: ExtractError(payload)})
 		return
 	}
 	var chunk map[string]any
@@ -670,10 +685,26 @@ func (s *MessagesStream) Feed(payload []byte) {
 			s.feedToolCall(call)
 		}
 	}
-	if fc, ok := delta["function_call"].(map[string]any); ok && stringValue(fc["name"]) != "" {
+	if fc, ok := delta["function_call"].(map[string]any); ok && len(fc) > 0 {
 		s.sawUse = true
 		s.feedToolCall(map[string]any{"index": float64(0), "function": fc})
 	}
+}
+
+// Err returns the first downstream write error.
+func (s *MessagesStream) Err() error { return s.em.err }
+
+// Fail prevents a normal message_stop after an upstream failure.
+func (s *MessagesStream) Fail(err *StreamError) {
+	if s.failed {
+		return
+	}
+	s.failed = true
+	if !s.em.started {
+		s.pendingErr = err
+		return
+	}
+	s.event("error", map[string]any{"error": map[string]any{"type": anthropicErrorType(err.Status), "message": err.Message}})
 }
 
 func (s *MessagesStream) ensureThinking() {
@@ -812,8 +843,14 @@ func (s *MessagesStream) openTool(entry *messagesTool) {
 // Empty streams and pre-content errors return *StreamError without committing a
 // 200 SSE header; the HTTP layer renders a native JSON error envelope.
 func (s *MessagesStream) Finish() error {
+	if s.em.err != nil {
+		return s.em.err
+	}
 	if s.failed {
-		return s.pendingErr
+		if s.pendingErr != nil {
+			return s.pendingErr
+		}
+		return nil
 	}
 	if !s.em.started {
 		s.failed = true
@@ -835,7 +872,7 @@ func (s *MessagesStream) Finish() error {
 		"usage": anthropicUsage(s.usage),
 	})
 	s.event("message_stop", map[string]any{})
-	return nil
+	return s.em.err
 }
 
 // emitError renders a held failure as a native Anthropic SSE error event.

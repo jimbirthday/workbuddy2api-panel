@@ -11,6 +11,7 @@ import (
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/protocol"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
 // responses serves POST /v1/responses by translating to Chat Completions and
@@ -285,6 +286,7 @@ type protocolStreamWriter struct {
 	resp      *protocol.ResponsesStream
 	msg       *protocol.MessagesStream
 	rawWriter http.ResponseWriter
+	finished  bool
 }
 
 const (
@@ -406,8 +408,14 @@ func (p *protocolStreamWriter) consume(b []byte) error {
 		}
 		if p.resp != nil {
 			p.resp.Feed(payload)
+			if err := p.resp.Err(); err != nil {
+				return err
+			}
 		} else if p.msg != nil {
 			p.msg.Feed(payload)
+			if err := p.msg.Err(); err != nil {
+				return err
+			}
 		}
 	}
 }
@@ -417,6 +425,9 @@ func (p *protocolStreamWriter) consume(b []byte) error {
 // native JSON error envelope, never as a 200 SSE stream ending in an error
 // event (which SDKs report as a successful-but-empty response).
 func (p *protocolStreamWriter) Finish() {
+	if p.finished {
+		return
+	}
 	if p.mode == protocolModeUndecided {
 		if p.status != 0 && p.status != http.StatusOK {
 			p.mode = protocolModeJSON
@@ -425,26 +436,66 @@ func (p *protocolStreamWriter) Finish() {
 		} else if p.status == http.StatusOK {
 			p.startSSE()
 		} else {
+			p.finished = true
 			writeProtocolError(p.dst, p.proto, http.StatusBadGateway, "upstream_parse", "upstream returned no response")
 			return
 		}
 	}
 	if p.mode == protocolModeJSON {
+		p.finished = true
 		// Headers were already set on dst by the chat stage; passing an empty
 		// header map avoids Add-ing a map onto itself while ranging it.
 		writeProtocolNonStream(p.dst, p.proto, p.status, http.Header{}, p.buf.Bytes(), p.meta)
 		return
 	}
-	var err error
+	_ = p.FinishStream(nil)
+}
+
+// FinishStream is called by the chat stage before accounting success. It
+// propagates final downstream write errors and prevents successful terminal
+// events after an upstream read failure. Finish remains idempotent at the route.
+func (p *protocolStreamWriter) FinishStream(streamErr error) error {
+	if p.finished {
+		return streamErr
+	}
+	if streamErr != nil && !upstream.IsStreamReadError(streamErr) {
+		p.finished = true // client write failure/cancellation: stop emitting
+		return streamErr
+	}
+	if streamErr == nil && p.mode != protocolModeSSE {
+		return nil // buffered JSON is rendered by the route's Finish
+	}
+	if p.mode != protocolModeSSE {
+		p.startSSE()
+	}
+	p.finished = true
+	if streamErr != nil {
+		failure := &protocol.StreamError{Status: http.StatusBadGateway, Code: "upstream_read_error", Message: streamErr.Error()}
+		if p.resp != nil {
+			p.resp.Fail(failure)
+		} else if p.msg != nil {
+			p.msg.Fail(failure)
+		}
+	}
+	var err, writeErr error
 	if p.resp != nil {
 		err = p.resp.Finish()
+		writeErr = p.resp.Err()
 	}
 	if p.msg != nil {
 		err = p.msg.Finish()
+		writeErr = p.msg.Err()
+	}
+	if writeErr != nil {
+		return writeErr
 	}
 	if err != nil {
 		writeProtocolStreamError(p.dst, p.proto, err)
+		if streamErr == nil {
+			streamErr = &upstream.StreamReadError{Err: err}
+		}
 	}
+	return streamErr
 }
 
 // writeProtocolStreamError renders a pre-commit protocol failure as the native

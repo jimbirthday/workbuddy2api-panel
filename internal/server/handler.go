@@ -1290,6 +1290,15 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				st.outcome = reqlog.OutcomeStreamError
 				return
 			}
+			// Protocol completion can itself write buffered tool input and final
+			// events. Finalize before marking this attempt/account successful.
+			if finisher, ok := w.(interface{ FinishStream(error) error }); ok && !upstream.IsEmptyStreamError(sErr) {
+				finishErr := sErr
+				if r.Context().Err() != nil {
+					finishErr = r.Context().Err()
+				}
+				sErr = finisher.FinishStream(finishErr)
+			}
 			switch {
 			case upstream.IsEmptyStreamError(sErr):
 				// 上游 200 但空流（0 有效帧）：StreamHint 现在一个字节都不写

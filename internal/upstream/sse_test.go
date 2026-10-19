@@ -613,9 +613,9 @@ func TestStreamNoIdFallsBackToSentinel(t *testing.T) {
 }
 
 func TestStreamDoneFallback(t *testing.T) {
-	// 上游流在无 [DONE] 时 EOF，Stream 必须兜底写一个 [DONE]
+	// 上游明确 stop 后省略 [DONE]，Stream 仍可兜底补齐；只有正文的 EOF 不能补。
 	rec := httptest.NewRecorder()
-	err := Stream(rec, strings.NewReader("data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n"))
+	err := Stream(rec, strings.NewReader("data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -936,7 +936,7 @@ func TestStreamNormalPassthroughRegression(t *testing.T) {
 		raw  string
 	}{
 		{"带 DONE 的正常流", sseFixture},
-		{"漏发 DONE 自动补", "data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n"},
+		{"明确 stop 但漏发 DONE 自动补", "data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\n"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

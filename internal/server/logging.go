@@ -173,11 +173,10 @@ func (s *chatStatsReader) parseSSELine(line string) {
 // parseSSELineBytes 与 parseSSELine 语义一致，但直接消费 bufio 的临时缓冲，
 // 避免流式透传时每行都把 []byte 转成 string（ReadString）再转回 []byte（解码）。
 func (s *chatStatsReader) parseSSELineBytes(line []byte) {
-	line = bytes.TrimRight(line, "\r\n")
-	if !bytes.HasPrefix(line, []byte("data: ")) {
+	payload := upstream.SSEDataPayload(line)
+	if payload == nil {
 		return
 	}
-	payload := line[len("data: "):]
 	if bytes.Equal(payload, []byte("[DONE]")) {
 		return
 	}

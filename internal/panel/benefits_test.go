@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -218,10 +219,10 @@ func TestBenefitsFocusReusesGrowthSnapshot(t *testing.T) {
 	pl.Add(ent)
 	pl.Add(gl)
 
-	calls := 0
+	var calls atomic.Int64
 	up := upstream.New()
 	up.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		calls++
+		calls.Add(1)
 		body := `{"code":0,"msg":"ok","data":{"tasks":[]}}`
 		switch {
 		case strings.Contains(r.URL.Path, "/activity/growth/streak"):
@@ -277,7 +278,7 @@ func TestBenefitsFocusReusesGrowthSnapshot(t *testing.T) {
 	if out.TaskRows == nil {
 		t.Fatal("task_rows must be an empty array, not null")
 	}
-	firstCalls := calls
+	firstCalls := calls.Load()
 
 	req = httptest.NewRequest(http.MethodGet, "/panel/api/benefits?focus="+benefitRefFor(second.UID), nil)
 	req.Header.Set("Authorization", "Bearer k")
@@ -297,7 +298,7 @@ func TestBenefitsFocusReusesGrowthSnapshot(t *testing.T) {
 	}
 	// 切换 focus 只复用同一份成长快照；不应再额外打任务列表端点。
 	// 首次 12 次 = 2 个国内个人号 ×（streak/lottery/energy/travel/task/mp-task）。
-	if delta := calls - firstCalls; delta != 0 {
+	if delta := calls.Load() - firstCalls; delta != 0 {
 		t.Fatalf("focus caused extra upstream calls: delta=%d first=%d", delta, firstCalls)
 	}
 	// ?refresh=1 必须绕过缓存并重新拉取同一组账号。
@@ -308,7 +309,7 @@ func TestBenefitsFocusReusesGrowthSnapshot(t *testing.T) {
 	if rr.Code != http.StatusOK {
 		t.Fatalf("refresh code=%d body=%s", rr.Code, rr.Body.String())
 	}
-	if delta := calls - firstCalls; delta != firstCalls {
+	if delta := calls.Load() - firstCalls; delta != firstCalls {
 		t.Fatalf("refresh did not re-query upstream: delta=%d want=%d", delta, firstCalls)
 	}
 }

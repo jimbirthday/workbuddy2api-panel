@@ -548,7 +548,10 @@ func (t *requestTrace) event(status int) reqlog.Event {
 	}
 	e.ClientIP = t.clientIP
 	e.UserAgent = t.userAgent
-	if e.Outcome == "" {
+	// Protocol conversion happens after chatCompletions has set its outcome.
+	// A late conversion failure must override that preliminary success while
+	// retaining specific stream-error/interrupted outcomes.
+	if e.Outcome == "" || (e.Outcome == reqlog.OutcomeSuccess && (status < 200 || status >= 300)) {
 		if status >= 200 && status < 300 {
 			e.Outcome = reqlog.OutcomeSuccess
 		} else {

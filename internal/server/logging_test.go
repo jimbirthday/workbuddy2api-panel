@@ -219,6 +219,25 @@ func TestRequestMetricsRecordsStream(t *testing.T) {
 	}
 }
 
+func TestRequestTraceFinalStatusOverridesPreliminarySuccess(t *testing.T) {
+	for _, outcome := range []string{reqlog.OutcomeSuccess, reqlog.OutcomeStreamError, reqlog.OutcomeInterrupted} {
+		t.Run(outcome, func(t *testing.T) {
+			tr := &requestTrace{
+				start: time.Now(), path: "/v1/responses",
+				stat: &chatStat{outcome: outcome, totalTokens: 65, hasCredit: true, credit: 0.01},
+			}
+			e := tr.event(http.StatusBadGateway)
+			want := outcome
+			if want == reqlog.OutcomeSuccess {
+				want = reqlog.OutcomeHTTPError
+			}
+			if e.OK || e.Outcome != want || e.Status != http.StatusBadGateway || e.TotalTokens != 65 || !e.HasCredit || e.Credit != 0.01 {
+				t.Fatalf("event=%+v, want failed outcome=%s with usage retained", e, want)
+			}
+		})
+	}
+}
+
 // 调用来源必须进归档事件：X-Forwarded-For 首段（反代后真实客户端）+ 截断后的 UA。
 func TestRequestMetricsCapturesClientInfo(t *testing.T) {
 	up := newFakeUpstream(t, func(string) (int, string, bool) {

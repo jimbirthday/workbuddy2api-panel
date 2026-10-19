@@ -13,6 +13,40 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
 )
 
+// Legal SSE preambles must not turn a valid answer into buffered JSON and a
+// late 502 after the chat stage has already recorded tokens and success.
+func TestProtocolStreamAcceptsSSEPreambles(t *testing.T) {
+	for _, preamble := range []string{": ping\n\n", "event: message\n", "\n", "id: upstream-1\nretry: 1000\n"} {
+		for _, path := range []string{"/v1/responses", "/v1/messages"} {
+			t.Run(path+"/"+preamble, func(t *testing.T) {
+				up := newFakeUpstream(t, func(string) (int, string, bool) {
+					return 200, preamble + sseOK, true
+				})
+				rec := reqlog.New(reqlog.Config{})
+				h := NewHandler(Config{
+					Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999}),
+					Upstream: up, RequestLog: rec,
+				})
+				body := `{"model":"glm-5.2","input":"hi","stream":true}`
+				want := "response.completed"
+				if path == "/v1/messages" {
+					body = `{"model":"glm-5.2","max_tokens":8,"stream":true,"messages":[{"role":"user","content":"hi"}]}`
+					want = "message_stop"
+				}
+				rr := httptest.NewRecorder()
+				h.ServeHTTP(rr, httptest.NewRequest("POST", path, strings.NewReader(body)))
+				if rr.Code != http.StatusOK || !strings.Contains(rr.Body.String(), want) {
+					t.Fatalf("valid SSE must complete: code=%d body=%s", rr.Code, rr.Body)
+				}
+				e := rec.Snapshot().Recent[0]
+				if !e.OK || e.Status != http.StatusOK || e.Outcome != reqlog.OutcomeSuccess || e.TotalTokens != 2 {
+					t.Fatalf("event=%+v", e)
+				}
+			})
+		}
+	}
+}
+
 // 协议入口必须与 chat 共用 trace：X-Request-Id、path、key_id、usage 都落账，
 // 且 200 流里只有 role-only + [DONE] 时不能记成成功。
 func TestProtocolResponsesTraceAndEmptyStreamNotSuccess(t *testing.T) {

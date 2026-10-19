@@ -325,29 +325,23 @@ func (p *protocolStreamWriter) Write(b []byte) (int, error) {
 	}
 	if p.mode == protocolModeUndecided {
 		// Chat's non-stream path aggregates into JSON, its stream path forwards
-		// SSE. A leading '{' or '[' is unambiguous JSON, so do not buffer the
-		// body; anything else is SSE and is held only until its first line.
-		trimmed := bytes.TrimLeft(b, " \t\r\n")
-		if p.buf.Len() == 0 && len(trimmed) > 0 && (trimmed[0] == '{' || trimmed[0] == '[') {
-			p.mode = protocolModeJSON
-			return p.buf.Write(b)
-		}
-		if !bytes.Contains(b, []byte("\n")) && p.buf.Len()+len(b) > protocolPendingLimit {
-			return 0, fmt.Errorf("upstream stream line exceeds %d bytes", protocolPendingLimit)
-		}
+		// SSE. Detect JSON by its first non-whitespace byte across writes. SSE
+		// may begin with comments, event/id/retry fields or blank lines, so the
+		// first line need not be data:.
 		p.buf.Write(b)
-		if bytes.Contains(p.buf.Bytes(), []byte("\n")) {
-			if bytes.HasPrefix(p.buf.Bytes(), []byte("data:")) {
-				p.mode = protocolModeSSE
-				p.startSSE()
-				pending := append([]byte(nil), p.buf.Bytes()...)
-				p.buf.Reset()
-				if err := p.consume(pending); err != nil {
-					return 0, err
-				}
-				return len(b), nil
-			}
+		trimmed := bytes.TrimLeft(p.buf.Bytes(), " \t\r\n")
+		if len(trimmed) > 0 && (trimmed[0] == '{' || trimmed[0] == '[') {
 			p.mode = protocolModeJSON
+			return len(b), nil
+		}
+		if len(trimmed) > 0 {
+			p.startSSE()
+			if err := p.consume(p.buf.Bytes()); err != nil {
+				return 0, err
+			}
+			p.buf.Reset()
+		} else if p.buf.Len() > protocolPendingLimit {
+			return 0, fmt.Errorf("upstream stream line exceeds %d bytes", protocolPendingLimit)
 		}
 		return len(b), nil
 	}

@@ -7,9 +7,21 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/activity"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 )
+
+func (p *Panel) recordManualActivity(a *auth.Auth, task activity.Task, ok bool, message string) {
+	if p.cfg.Activity == nil || a == nil {
+		return
+	}
+	_ = p.cfg.Activity.Append(activity.Record{
+		UID: a.UID, Nickname: a.Nickname, Realm: a.Realm(),
+		Task: task, Trigger: activity.TriggerManual, OK: ok, Message: message,
+	})
+}
 
 // activityHistory 账号活动历史（签到 / 活跃 / 旅行 / 保活）的每一次真实尝试。
 // 过滤在服务端完成，返回最新在前的记录；Store 由 main 以 state 同目录的
@@ -21,7 +33,7 @@ func (p *Panel) activityHistory(w http.ResponseWriter, r *http.Request) {
 	}
 	q := r.URL.Query()
 	query := strings.TrimSpace(q.Get("q"))
-	if len(query) > 64 {
+	if utf8.RuneCountInString(query) > 64 {
 		writeErr(w, http.StatusBadRequest, "q must be at most 64 characters")
 		return
 	}

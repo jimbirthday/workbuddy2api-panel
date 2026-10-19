@@ -188,6 +188,10 @@ body {
 .ln .lch.c-sys { background: var(--surface-2); color: var(--ink-3); }
 
 /* 任务中心 */
+.bf-run-results { padding: 8px 16px; border-bottom: 1px solid var(--line-soft); }
+.bf-run-results summary { cursor: pointer; color: var(--ink-2); }
+.bf-run-results .bf-log-row { grid-template-columns: minmax(80px, 160px) minmax(0, 1fr); }
+.bf-run-results .m { overflow-wrap: anywhere; }
 .tc-empty { display: flex; flex-direction: column; align-items: center; gap: 6px; padding: 42px 16px; color: var(--ink-3); }
 .tc-empty svg { width: 42px; height: 42px; opacity: .55; margin-bottom: 6px; }
 .tc-empty .t { font-weight: 550; color: var(--ink-2); }
@@ -383,7 +387,7 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 .benefits-cards { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
 .bf-focus-summary { display: flex; flex-wrap: wrap; gap: 8px; }
 .bf-chip { border: 1px solid var(--line); border-radius: 999px; padding: 4px 10px; color: var(--ink-2); font-size: 12px; background: var(--surface-2); }
-.benefits-table { height: clamp(320px, 48vh, 560px); max-height: none; overflow: auto; }
+.benefits-table { height: auto; max-height: clamp(320px, 48vh, 560px); overflow: auto; }
 .benefits-table .acc { min-width: 1080px; }
 .benefits-table th { position: sticky; top: 0; z-index: 2; }
 .benefits-table .virtual-pad td { padding: 0; border: 0; height: 0; }
@@ -398,7 +402,14 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 .bf-log-row .t { color: var(--ink-3); white-space: nowrap; }
 .bf-log-row .n { color: var(--ink-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .bf-log-row .m { color: var(--ink-2); overflow-wrap: anywhere; }
-@media (max-width: 760px) { .bf-log-row { grid-template-columns: 78px 1fr auto; } .bf-log-row .n { display: none; } }
+@media (max-width: 700px) {
+  .bf-log-row { grid-template-columns: 92px minmax(0, 1fr) auto; }
+  .bf-log-row .m { grid-column: 1 / -1; grid-row: 2; }
+  .bf-run-results .bf-log-row { grid-template-columns: 72px minmax(0, 1fr); }
+  .bf-run-results .bf-log-row .m { grid-column: 2; grid-row: 1; }
+  #view-taskscenter button, #view-taskscenter select, #view-taskscenter input,
+  #view-activity button, #view-activity select, #view-activity input, #taskVeil button { min-height: 44px; }
+}
 .bf-batch-row { display: grid; grid-template-columns: minmax(120px, 1fr) auto; gap: 4px 12px;
   padding: 8px 0; border-bottom: 1px solid var(--line-soft); }
 .bf-batch-row:last-child { border-bottom: none; }
@@ -414,7 +425,7 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 .benefits-focus select { max-width: 230px; }
 .bf-focus-summary { display: flex; flex-wrap: wrap; gap: 8px 18px; color: var(--ink-2); font-size: 12px; }
 .bf-focus-summary .bf-chip { border: 1px solid var(--line); border-radius: 999px; padding: 4px 10px; background: var(--surface-2); }
-.benefits-tasks { height: clamp(280px, 40vh, 440px); overflow: auto; }
+.benefits-tasks { height: auto; max-height: clamp(280px, 40vh, 440px); overflow: auto; }
 @media (max-width: 760px) { .benefits-tasks { height: auto; max-height: 420px; } }
 .benefits-tasks .acc { min-width: 860px; }
 .benefits-tasks th { position: sticky; top: 0; z-index: 2; }
@@ -1001,7 +1012,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
     .act-hist thead { display: none; }
     .act-hist, .act-hist tbody, .act-hist tr, .act-hist td { display: block; width: 100%; }
     .act-hist tr { border-bottom: 1px solid var(--line); padding: 7px 10px; }
-    .act-hist td { border: 0; padding: 3px 0; }
+    .act-hist td { border: 0; padding: 3px 0; text-align: left; overflow-wrap: anywhere; }
     .act-hist td::before { content: attr(data-label); display: inline-block; width: 4.5em; color: var(--ink-3); font-size: 11px; }
     .act-hist .mark { display: none; }
     /* 账号表/请求表窄屏卡片化：每行按 data-label 展开，不再要求横向拖动。
@@ -1016,6 +1027,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       min-width: 5.2em; color: var(--ink-3); font-size: 11px; font-weight: 400; }
     .acc.cardify tbody td[data-label=""]::before, .acc.cardify tbody td:not([data-label])::before { content: ''; min-width: 0; }
     .acc.cardify .mark { display: none; }
+    .benefits-table .acc.cardify tbody td, .benefits-tasks .acc.cardify tbody td,
+    #taskTable.cardify tbody td { text-align: left; white-space: normal; overflow-wrap: anywhere; }
+
     .acc.cardify .who { max-width: none; min-width: 0; }
     .acc.cardify .who .nm, .acc.cardify .who .id { white-space: normal; overflow-wrap: anywhere; }
     .acc.cardify .usage-cell { min-width: 0; }
@@ -1260,7 +1274,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <div class="view-head">
         <div>
           <h2>任务与福利</h2>
-          <p>Hub 同口径的福利工作台：选择全部国内账号或单个账号，执行签到、成长任务、猫猫旅行与连登抽奖；每次执行都会留下逐账号结果。</p>
+          <p>选择账号执行签到、成长任务、旅行或连登抽奖。任务在后台运行，可在下方查看进度与逐账号结果。</p>
         </div>
         <div class="view-acts">
           <button class="xs ghost" id="btnBenefitsRefresh">刷新概览</button>
@@ -1288,28 +1302,28 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <div class="pad bf-grid">
           <div class="bf-group">
             <div class="bf-k">Buddy 签到</div>
-            <div class="bf-d">每日签到并刷新余额；批量范围仅包含国内个人号。</div>
-            <button class="xs" id="bfBtnFocusCheckin" data-task-action="checkin">Buddy 签到</button>
+            <div class="bf-d">每日签到；范围仅包含已启用的国内个人账号。</div>
+            <button class="xs" id="bfBtnFocusCheckin" data-task-action="checkin" disabled>Buddy 签到</button>
           </div>
           <div class="bf-group">
             <div class="bf-k">成长任务</div>
-            <div class="bf-d">接取并执行全部可自动成长任务；含真实对话，耗时较长。</div>
-            <button class="xs primary" id="bfBtnFocusRun" data-task-action="tasks">一键做任务</button>
+            <div class="bf-d">单号执行可自动任务；全部账号使用下方队列，支持扫描与并发。</div>
+            <button class="xs primary" id="bfBtnFocusRun" data-task-action="tasks" disabled>一键做任务</button>
           </div>
           <div class="bf-group">
             <div class="bf-k">猫猫旅行</div>
             <div class="bf-d">领养、派出或领取旅行奖励；一次巡检只推进一步。</div>
-            <button class="xs" id="bfBtnFocusTravel" data-task-action="travel">猫猫旅行</button>
+            <button class="xs" id="bfBtnFocusTravel" data-task-action="travel" disabled>猫猫旅行</button>
           </div>
           <div class="bf-group">
             <div class="bf-k">连登与抽奖</div>
             <div class="bf-d">兑换已解锁连登档位，并抽完当前可用次数。</div>
-            <button class="xs" id="bfBtnFocusStreak" data-task-action="streak">连登与抽奖</button>
+            <button class="xs" id="bfBtnFocusStreak" data-task-action="streak" disabled>连登与抽奖</button>
           </div>
         </div>
         <div class="pad bf-focus-summary" id="bfFocusSummary"></div>
         <div class="tbl-wrap benefits-tasks acc-viewport" id="bfTaskViewport" tabindex="0" aria-label="成长任务明细表格">
-          <table class="acc">
+          <table class="acc cardify">
             <thead><tr><th>任务名称 / 代码</th><th>说明</th><th>进度</th><th>奖励</th><th>状态</th></tr></thead>
             <tbody id="bfTaskBody"><tr><td colspan="5"><div class="empty">选择一个国内账号查看任务</div></td></tr></tbody>
           </table>
@@ -1318,9 +1332,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 
       <div class="box benefits-batches">
         <header>
-          <h3>执行日志 <span class="hint">本轮逐账号结果；失败原因可悬停查看</span></h3>
+          <h3>执行日志 <span class="hint">最近执行进度与结果；详细历史见活动记录</span></h3>
           <span class="grow"></span>
-          <span class="note" id="bfBatchNote">—</span>
+          <span class="note" id="bfBatchNote" role="status" aria-live="polite">—</span>
           <button class="xs" id="bfBtnLogRefresh" title="重新读取最近活动记录">刷新日志</button>
         </header>
         <div class="bf-batch-list" id="bfBatchList"><div class="empty">尚未执行批量动作</div></div>
@@ -1329,6 +1343,8 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             <option value="">全部任务</option>
             <option value="checkin">签到</option>
             <option value="activity">活跃上报</option>
+            <option value="growth">成长任务</option>
+            <option value="streak">连登与抽奖</option>
             <option value="travel">猫猫旅行</option>
             <option value="keepalive">Token 保活</option>
             <option value="daily_chat">国际版每日活跃</option>
@@ -1355,28 +1371,16 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <span class="grow"></span>
           <span class="note" id="bfAcctNote"></span>
         </header>
-        <div class="tbl-wrap benefits-table acc-viewport" id="bfViewport" tabindex="0" aria-label="账号福利虚拟表格，可用上下方向键浏览">
-          <table class="acc">
+        <div class="tbl-wrap benefits-table acc-viewport" id="bfViewport" tabindex="0" aria-label="账号福利概览，可用上下方向键浏览">
+          <table class="acc cardify">
             <thead><tr><th>账号</th><th>区域</th><th>今日签到</th><th>每日活跃</th><th>成长待办</th><th>连登 / 补签 / 抽奖 / 能量</th><th>猫猫状态</th><th>最近活动</th><th>结果</th><th>操作</th></tr></thead>
             <tbody id="bfAccountsBody"></tbody>
           </table>
         </div>
       </div>
 
-      <details class="box benefits-grants" id="bfAdvanced">
-        <summary class="pad" style="cursor:pointer;font-weight:650">积分发放记录与旧成长队列（高级）</summary>
-        <header>
-          <h3>积分发放记录 <span class="hint">来自最近一次刷新积分的快照，不是逐笔账本</span></h3>
-          <span class="grow"></span>
-          <span class="note" id="bfGrantNote"></span>
-          <button class="xs" id="bfBtnRefreshGrants" title="逐账号实时查询积分包，用于更新总积分与发放记录">刷新积分</button>
-        </header>
-        <div class="tbl-wrap benefits-grants-wrap">
-          <table class="acc">
-            <thead><tr><th>发放时间</th><th>账号</th><th>包 / 来源</th><th>面额</th><th>剩余</th><th>到期</th><th>状态</th></tr></thead>
-            <tbody id="bfGrantsBody"><tr><td colspan="7"><div class="empty">读取中…</div></td></tr></tbody>
-          </table>
-        </div>
+      <details class="box" id="bfAdvanced">
+        <summary class="pad" style="cursor:pointer;font-weight:650">全部成长任务队列</summary>
         <header>
           <h3>成长任务队列 <span class="hint" id="qcSummary"></span></h3>
           <span class="grow"></span>
@@ -1402,9 +1406,24 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             <circle cx="35" cy="33" r="8"/><path d="m40 38 5 5"/>
           </svg>
           <div class="t">还没有扫描过</div>
-          <div class="d">扫描所有账号的成长任务与开学季待办，把没做的排成一列，一键执行。</div>
+          <div class="d">扫描已启用的国内个人账号，查看可自动完成的成长任务，再按队列执行。</div>
         </div>
         <div id="qcList"></div>
+      </details>
+      <details class="box benefits-grants">
+        <summary class="pad" style="cursor:pointer;font-weight:650">积分发放快照</summary>
+        <header>
+          <h3>积分发放记录 <span class="hint">来自最近一次刷新积分的快照，不是逐笔账本</span></h3>
+          <span class="grow"></span>
+          <span class="note" id="bfGrantNote"></span>
+          <button class="xs" id="bfBtnRefreshGrants" title="逐账号实时查询积分包，用于更新总积分与发放记录">刷新积分</button>
+        </header>
+        <div class="tbl-wrap benefits-grants-wrap">
+          <table class="acc">
+            <thead><tr><th>发放时间</th><th>账号</th><th>包 / 来源</th><th>面额</th><th>剩余</th><th>到期</th><th>状态</th></tr></thead>
+            <tbody id="bfGrantsBody"><tr><td colspan="7"><div class="empty">读取中…</div></td></tr></tbody>
+          </table>
+        </div>
       </details>
     </section>
 
@@ -1413,22 +1432,24 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <div class="view-head">
         <div>
           <h2>活动记录</h2>
-          <p>签到、活跃、旅行与保活的每次真实尝试，含失败原因与触发来源。</p>
+          <p>查看签到、成长任务、活跃、旅行、连登与保活的执行历史，按账号、结果和时间筛选。</p>
         </div>
       </div>
       <div class="box">
         <header>
           <h3>账号活动记录 <span class="hint">每次真实尝试，含失败原因</span></h3>
           <span class="grow"></span>
-          <span class="note" id="actNote">—</span>
+          <span class="note" id="actNote" role="status" aria-live="polite">—</span>
           <button class="xs" id="btnActivityReload">刷新</button>
         </header>
         <div class="fbar" id="actFilter">
-          <input id="actQ" type="search" placeholder="搜索账号 / 任务 / 结果 / 消息" aria-label="搜索活动记录">
+          <input id="actQ" type="search" maxlength="64" placeholder="搜索账号昵称 / 消息" aria-label="搜索活动记录">
           <select id="actTask" aria-label="按任务筛选">
             <option value="">全部任务</option>
             <option value="checkin">签到</option>
             <option value="activity">活跃上报</option>
+            <option value="growth">成长任务</option>
+            <option value="streak">连登与抽奖</option>
             <option value="travel">猫猫旅行</option>
             <option value="keepalive">Token 保活</option>
             <option value="daily_chat">国际版每日活跃</option>
@@ -1441,7 +1462,6 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <select id="actUID" aria-label="按账号筛选活动记录"><option value="">全部账号</option></select>
           <span class="trange" id="actRange"></span>
           <span class="grow"></span>
-          <span class="note" id="actCount">—</span>
         </div>
         <div class="tbl-wrap">
           <table class="acc zebra act-hist">
@@ -2109,15 +2129,15 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 
 <!-- 积分任务 -->
 <div class="veil" id="taskVeil">
-  <div class="dlg" role="dialog" aria-modal="true" style="width:940px">
+  <div class="dlg" role="dialog" aria-modal="true" aria-labelledby="taskDialogTitle" style="width:940px">
     <header>
-      <h3>积分任务 <span class="hint" id="taskWho"></span></h3>
+      <h3 id="taskDialogTitle">积分任务 <span class="hint" id="taskWho"></span></h3>
       <div class="hint">查询上游任务进度；「接受」为报名（幂等），「领取」在进度达标后可用。所有操作走网关，无需外部脚本。</div>
     </header>
     <div class="body">
       <div class="state" id="taskState"><span class="dots">加载中</span></div>
       <div class="tbl-wrap">
-        <table class="acc md" id="taskTable" hidden>
+        <table class="acc md cardify" id="taskTable" hidden>
           <thead><tr><th class="mark" aria-hidden="true"></th><th>任务</th><th>进度</th><th>奖励</th><th>状态</th><th class="c-acts"></th></tr></thead>
           <tbody id="taskBody"></tbody>
         </table>

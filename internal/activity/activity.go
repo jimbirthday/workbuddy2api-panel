@@ -7,6 +7,7 @@ package activity
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -28,6 +29,8 @@ import (
 type Task string
 
 const (
+	TaskGrowth    Task = "growth"
+	TaskStreak    Task = "streak"
 	TaskCheckin   Task = "checkin"
 	TaskActivity  Task = "activity"
 	TaskTravel    Task = "travel"
@@ -144,6 +147,8 @@ type Store struct {
 	closeOnce sync.Once
 	appErr    error
 	dropped   uint64
+	enqueued  uint64 // protected by appMu
+	processed uint64 // atomic; includes failed write attempts
 
 	// queryCache 缓存最近一次整文件扫描的结果。活动历史是只追加的 JSONL，
 	// 面板连续切筛选/翻页时同样的 Query 会反复读整份文件；这里以「文件大小 +
@@ -223,6 +228,7 @@ func (s *Store) appendLoop() {
 		if err := s.appendBatch(batch); err != nil {
 			s.setErr(err)
 		}
+		atomic.AddUint64(&s.processed, uint64(bytes.Count(batch, []byte{'\n'})))
 		batch = batch[:0]
 	}
 	for {
@@ -290,21 +296,16 @@ func (s *Store) Append(rec Record) error {
 
 	if s.async {
 		s.startAsync()
-		// 关闭后不能再入队。这里只做快速判定；入队本身是非阻塞的，不需要把磁盘
-		// I/O 或消费者锁带进来。
+		// Serialize enqueue with Close so all accepted records are drained.
 		s.appMu.Lock()
-		closed := s.appClosed
-		s.appMu.Unlock()
-		if closed {
+		defer s.appMu.Unlock()
+		if s.appClosed {
 			atomic.AddUint64(&s.dropped, 1)
 			return ErrQueueFull
 		}
-		// 关闭与入队的竞态由消费者排空协议兜底：Close 先置 appClosed，再关闭
-		// appClose；appendLoop 收到关闭后会把队列中已经入队的行全部写完。因此
-		// Append 在这里返回 nil 时，记录要么被消费者取走，要么在 Close 的排空
-		// 阶段被写入；绝不会停留在无人消费的队列里。
 		select {
 		case s.appQueue <- line:
+			s.enqueued++
 			return nil
 		default:
 			atomic.AddUint64(&s.dropped, 1)
@@ -379,6 +380,32 @@ func (s *Store) appendBatch(batch []byte) error {
 	return nil
 }
 
+// Flush waits until records accepted before this call have been written.
+// It does not block producers or close the store.
+func (s *Store) Flush(ctx context.Context) error {
+	if s == nil || !s.async || s.path == "" {
+		return nil
+	}
+	s.appMu.Lock()
+	target := s.enqueued
+	s.appMu.Unlock()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if atomic.LoadUint64(&s.processed) >= target {
+			s.appMu.Lock()
+			err := s.appErr
+			s.appMu.Unlock()
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
 // Close 停止异步写协程并排空队列。同步模式无需调用；可重复调用。
 // 返回最后一次写入错误（若有），但不会因错误阻塞退出。
 func (s *Store) Close() error {
@@ -387,9 +414,7 @@ func (s *Store) Close() error {
 	}
 	s.startAsync()
 	s.closeOnce.Do(func() {
-		// 先置关闭标记，再让 appendLoop 排空。Append 读该标记后仍可能把一条
-		// 记录送入队列；appendLoop 在收到 appClose 后会继续消费到空，所以
-		// 这类在途入队也会落盘。标记只用极短的锁切换，不覆盖磁盘 I/O。
+		// 与 Append 的入队共用短锁；关闭标记生效后不会再接受记录。
 		s.appMu.Lock()
 		s.appClosed = true
 		s.appMu.Unlock()
@@ -1046,7 +1071,7 @@ func hasSensitiveHint(msg string) bool {
 
 func validTask(task Task) bool {
 	switch task {
-	case TaskCheckin, TaskActivity, TaskTravel, TaskKeepalive, TaskDailyChat:
+	case TaskCheckin, TaskActivity, TaskTravel, TaskKeepalive, TaskDailyChat, TaskGrowth, TaskStreak:
 		return true
 	default:
 		return false

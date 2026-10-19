@@ -899,6 +899,17 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "account not found")
 		return
 	}
+	if p.cfg.Upstream == nil {
+		writeErr(w, http.StatusNotImplemented, "upstream not available")
+		return
+	}
+	if !p.tryLockAccount(uid) {
+		writeErr(w, http.StatusConflict, "account operation already running")
+		return
+	}
+	defer p.unlockAccount(uid)
+	defer p.invalidateBenefitsGrowth()
+	defer p.invalidateOverview()
 	checkinMsg := ""
 	checkinDone := false
 	// 企业版无签到体系（上游 400 code 10001「企业账号不支持该操作」）：不发起该调用，
@@ -906,18 +917,10 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 	// 前端对企业号不渲染「签到」按钮；此处是 API 侧防御（外部脚本/旧缓存前端仍可能调用）。
 	if a.IsEnterprise() {
 		checkinMsg = "企业账号无签到体系（已跳过签到，仅刷新额度）"
-	} else if err := p.cfg.Upstream.DailyCheckin(a); err != nil {
-		checkinMsg = err.Error() // "今天已签到"等业务错误照常查余额
-		// 幂等拒绝同样是「今日已签」，标记后按钮显示「已签」。
-		if upstream.IsAlreadyCheckin(err) {
-			p.cfg.Pool.NoteCheckinDone(uid)
-			checkinDone = true
-		}
 	} else {
-		p.cfg.Pool.NoteCheckinDone(uid)
-		checkinDone = true
+		checkinDone, checkinMsg = p.checkinAccount(a)
 	}
-	resp := map[string]any{"ok": true, "checkin_done": checkinDone}
+	resp := map[string]any{"ok": true, "checkin_done": checkinDone, "success": checkinDone || a.IsEnterprise()}
 	if a.IsEnterprise() {
 		resp["enterprise"] = true
 	}

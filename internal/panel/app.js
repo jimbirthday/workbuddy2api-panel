@@ -1471,7 +1471,8 @@ if ($('accBody')) $('accBody').addEventListener('click', async ev => {
   try {
     if (a === 'checkin') {
       const r = await api('accounts/' + encodeURIComponent(u) + '/checkin', { method: 'POST' });
-      toast('签到完成' + (r.credits != null ? '，积分 ' + r.credits + (r.credits_total > 0 ? '/' + r.credits_total : '') : '') + (r.checkin_message ? '（' + r.checkin_message + '）' : ''), 'ok');
+      if (r.success === false) toast('签到失败：' + (r.checkin_message || '请查看活动记录'), 'err');
+      else toast('签到完成' + (r.credits != null ? '，积分 ' + r.credits + (r.credits_total > 0 ? '/' + r.credits_total : '') : '') + (r.checkin_message ? '（' + r.checkin_message + '）' : ''), 'ok');
     } else if (a === 'balance') {
       const r = await api('accounts/' + encodeURIComponent(u) + '/balance', { method: 'POST' });
       const ent = acct && acct.enterprise;
@@ -2918,6 +2919,8 @@ let hiddenPaused = false;
 function onVisibilityChange() {
   if (document.visibilityState === 'hidden') {
     hiddenPaused = true;
+    if (benefitsBatchTimer) { clearTimeout(benefitsBatchTimer); benefitsBatchTimer = null; }
+    benefitsBatchSeq++;
     if (loginTimer) { clearInterval(loginTimer); loginTimer = null; }
     // 任务中心/队列/扫描各自有 0.5–3s 的定时器；隐藏页时继续请求只会白占
     // 连接与面板资源。扫描与队列本身在后端继续，回页由 reattach* 接回。
@@ -2974,7 +2977,7 @@ function openTasks(uid, account) {
   taskUID = uid;
   benefitsTaskRef = null;
   openTasks.account = account || null;
-  setText('taskWho', String(uid || '').slice(0, 16));
+  setText('taskWho', (account && account.nickname) || String(uid || '').slice(0, 8));
   // 企业号没有个人成长体系。打开弹窗时就按账号属性预隐藏批量操作，避免慢响应
   // 期间按钮闪现、被误点后打出一轮注定 403 的请求；个人号仍恢复显示。
   const ent = !!(account && account.enterprise);
@@ -2988,7 +2991,7 @@ function openTasks(uid, account) {
   if (reload) reload.hidden = false;
   loadTasks();
 }
-function closeTasks() { hideModal('taskVeil'); taskUID = null; benefitsTaskRef = null; }
+function closeTasks() { tasksSeq++; hideModal('taskVeil'); taskUID = null; benefitsTaskRef = null; }
 if ($('btnCloseTask')) $('btnCloseTask').onclick = closeTasks;
 
 // 账号设置弹窗：备注 + 手动调度权重。只提交这两个字段；weight=1 即不干预。
@@ -3103,28 +3106,24 @@ if ($('btnTaskAcceptAll')) $('btnTaskAcceptAll').onclick = async () => {
   finally { btn.disabled = false; btn.textContent = '全部接受'; loadTasks(); }
 };
 
-// 一键完成全部可自动任务（耗时较长：含真实对话，逐项回读验证）。
+// 全量成长任务复用后台动作入口，避免弹窗长连接超时后无法找到执行结果。
 if ($('btnTaskAutoAll')) $('btnTaskAutoAll').onclick = async () => {
-  if (!taskUID && !benefitsTaskRef) return;
+  const scope = taskUID || benefitsTaskRef;
   const btn = $('btnTaskAutoAll');
-  if (!btn) return;
-  if (!confirm('将依次执行：补报对话事件、领取 Buddy、glm-5.2 对话、尝试上报。\n过程约 1-2 分钟（含真实对话），确认继续？')) return;
-  btn.disabled = true; btn.textContent = '执行中…';
+  if (!scope || !btn || btn.disabled) return;
+  if (!confirm('将执行该账号全部可自动成长任务，包含真实对话。任务在后台执行，确认继续？')) return;
+  btn.disabled = true; btn.textContent = '提交中…';
   try {
-    const path = taskUID
-      ? 'accounts/' + encodeURIComponent(taskUID) + '/tasks/auto_all'
-      : benefitsTaskPath('auto_all');
-    const r = await api(path, { method: 'POST' });
-    const okN = (r.results || []).filter(x => x.status === 'done').length;
-    const skipN = (r.results || []).filter(x => x.status === 'skipped').length;
-    const errN = (r.results || []).filter(x => x.status === 'error').length;
-    toast(`执行完成：成功 ${okN} 项，跳过 ${skipN} 项${errN ? '，失败 ' + errN + ' 项' : ''}`, errN ? 'err' : 'ok');
+    const r = await api('tasks/run', { method: 'POST', body: JSON.stringify({ scope, action: 'tasks', async: true }) });
+    toast(r.started ? '已提交，执行结果见任务与福利' : '没有可执行的账号', r.started ? 'ok' : 'warn');
+    closeTasks();
+    go('taskscenter');
   } catch (e) { toast(e.message, 'err'); }
-  finally { btn.disabled = false; btn.textContent = '一键完成可自动任务'; loadTasks(); }
+  finally { btn.disabled = false; btn.textContent = '一键完成可自动任务'; }
 };
 
 async function loadTasks() {
-  if (!taskUID) return;
+  if (!taskUID && !benefitsTaskRef) return;
   // 请求序号守卫：快速切换账号/重复刷新时，先发的慢响应可能后到，把新账号的
   // 任务表覆盖回旧账号的（易用性修复 2）。
   const my = ++tasksSeq;
@@ -3139,9 +3138,9 @@ async function loadTasks() {
       ? 'accounts/' + encodeURIComponent(taskUID) + '/tasks'
       : benefitsTaskPath('');
     const d = await api(path);
-    if (my !== tasksSeq) return;
+    if (my !== tasksSeq || (!taskUID && !benefitsTaskRef)) return;
     const list = d.tasks || [];
-    const enterprise = !!d.enterprise || !!(openTasks.account && openTasks.account.enterprise);
+    const enterprise = !!d.enterprise || !!(taskUID && openTasks.account && openTasks.account.enterprise);
     const acts = ['btnTaskAcceptAll', 'btnTaskAutoAll'];
     acts.forEach(id => { const b = $(id); if (b) b.hidden = enterprise; });
     if (!list.length) {
@@ -3165,7 +3164,7 @@ async function loadTasks() {
     st.hidden = true;
     tb.hidden = false;
   } catch (e) {
-    if (my !== tasksSeq) return;
+    if (my !== tasksSeq || (!taskUID && !benefitsTaskRef)) return;
     st.className = 'state err';
     st.textContent = e.message;
   }
@@ -3194,11 +3193,11 @@ function taskRowsHTML(list) {
       // 操作指引（description/task_desc）挂 title 提示：如何完成交给用户看
       const tip = [t.title, t.task_desc || t.description, t.jump_url ? '跳转：' + t.jump_url : ''].filter(Boolean).join('\n');
       return '<tr title="' + esc(tip) + '"><td class="mark" aria-hidden="true"><i></i></td>' +
-        '<td class="who"><div class="nm">' + esc(t.title || t.task_code) + '</div><div class="id">' + esc(t.task_code) + (t.tag ? ' · ' + esc(t.tag) : '') + '</div></td>' +
-        '<td class="num">' + esc(prog) + '</td>' +
-        '<td class="num">' + esc(reward) + '</td>' +
-        '<td>' + badge + '</td>' +
-        '<td class="acts">' + acted + '</td></tr>';
+        '<td data-label="任务" class="who"><div class="nm">' + esc(t.title || t.task_code) + '</div><div class="id">' + esc(t.task_code) + (t.tag ? ' · ' + esc(t.tag) : '') + '</div></td>' +
+        '<td data-label="进度" class="num">' + esc(prog) + '</td>' +
+        '<td data-label="奖励" class="num">' + esc(reward) + '</td>' +
+        '<td data-label="状态">' + badge + '</td>' +
+        '<td data-label="操作" class="acts">' + acted + '</td></tr>';
   }).join('');
 }
 
@@ -3215,7 +3214,7 @@ if ($('taskBody')) $('taskBody').addEventListener('click', async ev => {
         ? 'accounts/' + encodeURIComponent(taskUID) + '/tasks/auto'
         : benefitsTaskPath('auto');
       const r = await api(path, {
-        method: 'POST', body: JSON.stringify({ task_code: code })
+        method: 'POST', body: JSON.stringify({ task_code: code }), timeoutMs: 310000
       });
       if (r.skipped) {
         toast(r.message || '已跳过', 'ok');
@@ -5216,7 +5215,7 @@ if ($('usRange')) trangeBind('usRange', loadUsage);
 /* ── 活动记录 ─────────────────────────────────────────────────────── */
 /* 只读活动历史：签到/活跃/旅行/保活每次真实尝试。筛选全部由服务端按同一口径
    执行（task/result/uid/from	o），前端不缓存旧页结果，避免“看起来筛选了”。 */
-const ACT_TASK_LABEL = { checkin: '签到', activity: '活跃上报', travel: '猫猫旅行', keepalive: 'Token 保活', daily_chat: '国际版每日活跃' };
+const ACT_TASK_LABEL = { growth: '成长任务', streak: '连登与抽奖', checkin: '签到', activity: '活跃上报', travel: '猫猫旅行', keepalive: 'Token 保活', daily_chat: '国际版每日活跃' };
 const ACT_TRIGGER_LABEL = { schedule: '定时', manual: '手动', unknown: '未知' };
 function actRowKey(r) {
   r = r || {};
@@ -5240,8 +5239,9 @@ function actRowHtml(r) {
 function actEmptyHtml(d) {
   // 空态分两种：有历史但筛选无命中 vs 从未执行任务。后者给下一步动作，
   // 避免用户把「筛选条件太窄」误判成功能坏了。
-  const txt = d.total ? '没有符合筛选条件的记录，试试放宽时间或任务类型'
-    : '暂无活动记录；执行签到 / 活跃上报 / 保活后会在这里留下每次尝试';
+  const filtered = ['actTask', 'actResult', 'actUID', 'actQ'].some(id => { const el = $(id); return el && el.value; });
+  const txt = filtered ? '没有符合筛选条件的记录，试试放宽时间或任务类型'
+    : '当前时间范围暂无活动记录；可调整时间范围或前往任务与福利执行任务';
   return '<tr><td colspan="7" class="empty">' + txt + '</td></tr>';
 }
 function renderActivity(d, opts) {
@@ -5275,15 +5275,16 @@ function renderActivity(d, opts) {
   }
   if (note) note.textContent = actRows.length + ' 条' +
     (d.has_more ? ' / 共 ' + Number(d.total || 0) + ' 条' : '') +
-    (d.total ? '' : ' · 尚未执行任务');
+    (d.has_more && Number(d.limit || actLimit) >= 1000 ? ' · 仅显示最近 1000 条，请缩小时间范围' : '');
   const more = $('btnActMore');
   if (more) {
     more.disabled = false;
+    const capped = d.has_more && Number(d.limit || actLimit) >= 1000;
     more.textContent = d.has_more
       ? '加载更多（已显示 ' + actRows.length + ' / ' + Number(d.total || 0) + '）'
       : '已加载全部';
     const bar = more.parentElement;
-    if (bar) bar.hidden = !d.has_more;
+    if (bar) bar.hidden = !d.has_more || capped;
   }
 }
 async function loadActivity(more) {
@@ -5308,6 +5309,8 @@ async function loadActivity(more) {
   if (actCtrl) { try { actCtrl.abort(); } catch (e) { /* ignore */ } }
   actCtrl = typeof AbortController === 'function' ? new AbortController() : null;
   const req = { path, promise: null };
+  const moreButton = $('btnActMore');
+  if (moreButton) { moreButton.disabled = true; if (more === true) moreButton.textContent = '加载中…'; }
   req.promise = (async () => {
     try {
       const d = await api(path, actCtrl ? { signal: actCtrl.signal } : {});
@@ -5317,8 +5320,8 @@ async function loadActivity(more) {
       // 加载更多失败时回滚窗口：否则 200→400 失败后下一次重试直接变成
       // 401–600，永久跳过 201–400，连续失败最终卡死在 1000。回滚后重试
       // 仍是同一窗口请求。
-      if (more === true) actLimit = prevLimit;
       if (my !== actSeq || view !== 'activity') return;
+      if (more === true) actLimit = prevLimit;
       // 「加载更多」失败不能清掉已经看见的旧行；只在表底追加可重试提示。
       // 首次加载失败才用整表错误态。
       const body = $('actBody');
@@ -5392,10 +5395,11 @@ let benefitsBatchSeq = 0;
 // 完整 UID 始终留在服务端；空值表示由后端选择第一个可用国内号。
 let benefitsFocusRef = 'all';
 let benefitsTaskData = null;
-let benefitsRunSeq = 0;
+let benefitsSubmitting = false;
+let benefitsRuns = [];
+let benefitsLogSeq = 0;
 let benefitsLogFilter = { task: '', result: '', ref: '' };
 let benefitsTaskRows = [];
-let benefitsFocusLast = null;
 let benefitsBatchDoneSig = '';
 // 福利弹窗当前绑定的服务端短引用。任务动作仍允许 accept/claim/auto；这些
 // 请求改走 benefits/* 路由，完整 UID 始终留在服务端。
@@ -5415,7 +5419,7 @@ function benefitsVirtualWindow() {
   // 时窗口会被压成 0 行，页面显示空白。
   const rowH = Math.max(28, Number(benefitsRowH) || 56);
   const viewportH = Number(vp.clientHeight) || 0;
-  if (viewportH <= 0) {
+  if (viewportH <= 0 || (typeof window !== 'undefined' && window.matchMedia && window.matchMedia('(max-width: 700px)').matches)) {
     return { start: 0, end: rows.length, topPad: 0, bottomPad: 0 };
   }
   const first = Math.max(0, Math.floor(Number(vp.scrollTop || 0) / rowH) - 5);
@@ -5469,7 +5473,7 @@ function renderBenefitsAccounts(rows) {
       ? '<span class="tag mute">无签到体系</span>'
       : (a.enterprise ? '<span class="tag mute">企业号</span>'
         : (a.checkin_done ? '<span class="tag ok">已签到</span>' : '<span class="tag warn">待签到</span>'));
-    const pending = a.growth_pending ? a.growth_pending + ' 项' : (a.enterprise || a.realm === 'global' ? '—' : '0 项');
+    const pending = a.enterprise || a.realm === 'global' ? '—' : (a.growth_pending_known ? (a.growth_pending || 0) + ' 项' : '未知');
     const daily = a.realm === 'global' && !a.enterprise
       ? (a.daily_chat_today ? '<span class="tag ok">已活跃</span>' : '<span class="tag warn">待活跃</span>')
       : '<span class="tag mute">—</span>';
@@ -5503,16 +5507,16 @@ function renderBenefitsAccounts(rows) {
     }
     if (!acts) acts = '—';
     return '<tr>' +
-      '<td><div class="nm">' + who + '</div><div class="id">' + esc(a.uid || '') + '</div></td>' +
-      '<td><span class="realm-tag">' + esc(realm) + '</span></td>' +
-      '<td>' + checkin + '</td>' +
-      '<td>' + daily + '</td>' +
-      '<td class="num">' + esc(pending) + '</td>' +
-      '<td>' + growth + '</td>' +
-      '<td>' + cat + '</td>' +
-      '<td>' + (a.last_task ? '<div>' + esc(lastTask) + '</div><div class="note">' + esc(benefitsTime(a.last_at)) + '</div>' : '—') + '</td>' +
-      '<td>' + result + '</td>' +
-      '<td class="bf-acts">' + acts + '</td>' +
+      '<td data-label="账号"><div class="nm">' + who + '</div><div class="id">' + esc(a.uid || '') + '</div></td>' +
+      '<td data-label="区域"><span class="realm-tag">' + esc(realm) + '</span></td>' +
+      '<td data-label="今日签到">' + checkin + '</td>' +
+      '<td data-label="每日活跃">' + daily + '</td>' +
+      '<td data-label="成长待办" class="num">' + esc(pending) + '</td>' +
+      '<td data-label="连登福利">' + growth + '</td>' +
+      '<td data-label="猫猫状态">' + cat + '</td>' +
+      '<td data-label="最近活动">' + (a.last_task ? '<div>' + esc(lastTask) + '</div><div class="note">' + esc(benefitsTime(a.last_at)) + '</div>' : '—') + '</td>' +
+      '<td data-label="结果">' + result + '</td>' +
+      '<td data-label="操作" class="bf-acts">' + acts + '</td>' +
       '</tr>';
   });
   let bodyHtml = '';
@@ -5532,56 +5536,6 @@ function renderBenefitsAccounts(rows) {
     }
   }
   bindBenefitsVirtualScroll();
-}
-
-// renderBenefitFocus 渲染 Hub 式国内账号选择器与成长任务明细。账号选项的 value
-// 是服务端短引用，text 只显示昵称 + uid8；用户切换后按 focus 重新拉取快照。
-function renderBenefitFocus(d) {
-  const sel = $('bfGrowthAcct');
-  const accounts = Array.isArray(d && d.accounts) ? d.accounts.filter(a => a && a.realm === 'cn' && !a.enterprise && !a.disabled) : [];
-  benefitsFocusLast = d || null;
-  benefitsTaskData = d || null;
-  if (sel) {
-    let want = benefitsFocusRef || 'all';
-    if (want !== 'all' && !accounts.some(a => a.ref === want)) want = 'all';
-    benefitsFocusRef = want;
-    const opts = ['<option value="all">全部国内账号（批量）</option>'].concat(
-      accounts.map(a => '<option value="' + esc(a.ref || '') + '">' +
-        esc((a.nickname || '未命名') + ' · ' + String(a.uid || '').slice(0, 8)) + '</option>'));
-    const next = opts.join('');
-    if (sel.innerHTML !== next) sel.innerHTML = next;
-    sel.value = want;
-    sel.disabled = !accounts.length;
-  }
-  const summary = (d && d.summary) || {};
-  const cur = benefitsFocusRef === 'all' ? null : accounts.find(a => a.ref === benefitsFocusRef) || null;
-  const sum = $('bfFocusSummary');
-  if (sum) {
-    if (!cur) {
-      const bits = [
-        '范围 ' + (summary.accounts || accounts.length) + ' 个国内账号',
-        '今日签到 ' + (summary.checkin_done || 0) + ' / ' + ((summary.checkin_done || 0) + (summary.checkin_pending || 0)),
-        '待签到 ' + (summary.checkin_pending || 0),
-      ];
-      sum.innerHTML = bits.map(x => '<span class="bf-chip">' + esc(x) + '</span>').join('');
-    } else {
-      const bits = [
-        '连登 ' + (summary.streak_days || 0) + ' 天',
-        '补签卡 ' + (summary.makeup_cards || 0),
-        '抽奖 ' + (summary.lottery_chances || 0) + ' 次',
-        '能量 ' + fmtTok(summary.energy || 0),
-        '猫猫 ' + ((summary.cat_daily_done ? '今日已完成' : (summary.cat_reward ? '本轮 +' + summary.cat_reward : '待巡检'))),
-      ];
-      if (cur.growth_error) bits.push('查询：' + cur.growth_error);
-      sum.innerHTML = bits.map(x => '<span class="bf-chip">' + esc(x) + '</span>').join('');
-    }
-  }
-  renderBenefitTaskRows(cur ? (d && d.tasks) : [], cur, d && d.tasks_error);
-  const disabled = !benefitsFocusRef;
-  ['bfBtnFocusCheckin', 'bfBtnFocusRun', 'bfBtnFocusTravel', 'bfBtnFocusStreak'].forEach(id => {
-    const b = $(id);
-    if (b) b.disabled = disabled;
-  });
 }
 
 function benefitTaskStatus(t) {
@@ -5616,16 +5570,16 @@ function renderBenefitTaskRows(rows, account, err) {
     const desc = t.task_desc || t.description || '';
     const tip = [t.title, desc, t.jump_url ? '跳转：' + t.jump_url : ''].filter(Boolean).join('\n');
     return '<tr title="' + esc(tip) + '">' +
-      '<td><div class="nm">' + esc(t.title || code) + '</div><div class="id">' + esc(code) + (t.tag ? ' · ' + esc(t.tag) : '') + '</div></td>' +
-      '<td class="task-desc">' + esc(desc || '—') + '</td>' +
-      '<td class="task-prog">' + esc(prog) + '</td>' +
-      '<td>' + esc(reward || '—') + '</td>' +
-      '<td>' + benefitTaskStatus(t) + '</td></tr>';
+      '<td data-label="任务"><div class="nm">' + esc(t.title || code) + '</div><div class="id">' + esc(code) + (t.tag ? ' · ' + esc(t.tag) : '') + '</div></td>' +
+      '<td data-label="说明" class="task-desc">' + esc(desc || '—') + '</td>' +
+      '<td data-label="进度" class="task-prog">' + esc(prog) + '</td>' +
+      '<td data-label="奖励">' + esc(reward || '—') + '</td>' +
+      '<td data-label="状态">' + benefitTaskStatus(t) + '</td></tr>';
   }).join('');
 }
 
 function benefitTaskLabel(task) {
-  return ({checkin: '签到', activity: '活跃上报', travel: '猫猫旅行', keepalive: 'Token 保活', daily_chat: '每日活跃'})[task] || task || '—';
+  return ACT_TASK_LABEL[task] || task || '—';
 }
 
 function benefitsTime(v) {
@@ -5672,29 +5626,34 @@ function renderBenefitGrants(rows, summary) {
 const BENEFIT_BATCH_LABELS = {
   checkin: '全部签到', travel: '旅行巡检', activity: '活跃上报',
   keepalive: 'Token 保活', daily_chat: '国际版每日活跃', streak: '连登与抽奖',
+  tasks_checkin: '签到', tasks_tasks: '成长任务', tasks_travel: '猫猫旅行', tasks_streak: '连登与抽奖',
 };
 
 function renderBenefitBatches(runs) {
   const box = $('bfBatchList');
   if (!box) return;
   runs = Array.isArray(runs) ? runs : [];
+  benefitsRuns = runs;
+  syncTaskActionBusy();
   const note = $('bfBatchNote');
   if (note) note.textContent = runs.length ? '最近 ' + runs.length + ' 轮' : '—';
   if (!runs.length) {
     box.innerHTML = '<div class="empty">尚未执行批量动作</div>';
     return;
   }
+  const openKinds = new Set(Array.from(box.querySelectorAll('details[open][data-batch-kind]')).map(el => el.dataset.batchKind));
   box.innerHTML = runs.map(r => {
     const label = BENEFIT_BATCH_LABELS[r.kind] || r.kind || '批量动作';
     const status = r.running ? '<span class="tag warn">执行中</span>'
       : (r.note === '执行状态未知（可能已重启）' ? '<span class="tag mute">状态未知</span>'
         : (r.failed ? '<span class="tag bad">' + r.failed + ' 失败</span>' : '<span class="tag ok">完成</span>'));
-    const counts = r.done ? ('成功 ' + (r.ok || 0) + ' · 失败 ' + (r.failed || 0) + ' · 共 ' + (r.total || 0)) : '正在逐一执行';
+    const counts = r.done || r.total ? ('成功 ' + (r.ok || 0) + ' · 失败 ' + (r.failed || 0) + ' · 共 ' + (r.total || 0)) : '正在逐一执行';
     return '<div class="bf-batch-row">' +
       '<div><div class="bf-batch-k">' + esc(label) + '</div><div class="bf-batch-meta">' +
-      esc(benefitsTime(r.started_at)) + (r.note ? ' · ' + esc(r.note) : '') + '</div></div>' +
+      esc(benefitsTime(r.started_at)) + (r.scope ? ' · ' + esc(r.scope === 'all' ? '全部国内账号' : '单个国内账号') : '') + (r.note ? ' · ' + esc(r.note) : '') + '</div></div>' +
       '<div class="bf-batch-stat">' + status + '<div class="bf-batch-meta">' + esc(counts) + '</div></div>' +
-      '</div>';
+      '</div>' + (Array.isArray(r.results) && r.results.length ? '<details class="bf-run-results" data-batch-kind="' + esc(r.kind) + '"' + (openKinds.has(r.kind) ? ' open' : '') + '><summary>逐账号结果（' + r.results.length + '）</summary>' + r.results.map(item =>
+        '<div class="bf-log-row"><span class="n">' + esc(item.nickname || '未命名账号') + '</span><span class="m"><span class="tag ' + (item.ok ? 'ok' : 'bad') + '">' + (item.ok ? '成功' : '失败') + '</span> ' + esc(item.message || '—') + '</span></div>').join('') + '</details>' : '');
   }).join('');
 }
 
@@ -5702,7 +5661,7 @@ async function loadBenefitBatches() {
   const my = ++benefitsBatchSeq;
   try {
     const d = await api('benefits/batches');
-    if (my !== benefitsBatchSeq || view !== 'taskscenter') return;
+    if (my !== benefitsBatchSeq || view !== 'taskscenter' || document.visibilityState === 'hidden') return;
     const runs = (d && d.runs) || [];
     renderBenefitBatches(runs);
     if (runs.some(r => r && r.running)) {
@@ -5752,17 +5711,18 @@ function renderBenefitLog(rows) {
 }
 
 async function loadBenefitLog() {
+  const my = ++benefitsLogSeq;
   try {
     const qs = ['limit=40'];
     if (benefitsLogFilter.task) qs.push('task=' + encodeURIComponent(benefitsLogFilter.task));
     if (benefitsLogFilter.result) qs.push('result=' + encodeURIComponent(benefitsLogFilter.result));
     if (benefitsLogFilter.ref) qs.push('ref=' + encodeURIComponent(benefitsLogFilter.ref));
     const d = await api('benefits/log?' + qs.join('&'));
-    if (view !== 'taskscenter') return;
+    if (my !== benefitsLogSeq || view !== 'taskscenter') return;
     renderBenefitLog(d && d.rows);
   } catch (e) {
     const box = $('bfLogList');
-    if (box && view === 'taskscenter') box.innerHTML = '<div class="empty">读取执行流水失败：' + esc(e.message) + '</div>';
+    if (box && my === benefitsLogSeq && view === 'taskscenter') box.innerHTML = '<div class="empty">读取执行流水失败：' + esc(e.message) + '</div>';
   }
 }
 
@@ -5871,14 +5831,15 @@ async function loadBenefits(force, refresh) {
 // the lower overview section and only replaces the selector, summary, task
 // rows and execution log.
 function renderTaskWorkbench(d) {
-  const accounts = Array.isArray(d && d.accounts) ? d.accounts : [];
+  const accounts = Array.isArray(d && d.account_options) ? d.account_options : (Array.isArray(d && d.accounts) ? d.accounts : []);
   const sel = $('bfGrowthAcct');
   const logAcct = $('bfLogAcct');
   if (logAcct) {
     const prev = benefitsLogFilter.ref || '';
-    const opts = ['<option value="">全部账号</option>'].concat(accounts.map(a => '<option value="' + esc(a.ref || '') + '">' + esc((a.nickname || '未命名') + ' · ' + String(a.uid || '').slice(0, 8)) + '</option>')).join('');
+    const logAccounts = (lastBenefits && Array.isArray(lastBenefits.accounts)) ? lastBenefits.accounts : accounts;
+    const opts = ['<option value="">全部账号</option>'].concat(logAccounts.map(a => '<option value="' + esc(a.ref || '') + '">' + esc((a.nickname || '未命名') + ' · ' + String(a.uid || '').slice(0, 8)) + '</option>')).join('');
     if (logAcct.innerHTML !== opts) logAcct.innerHTML = opts;
-    logAcct.value = accounts.some(a => a.ref === prev) ? prev : '';
+    logAcct.value = logAccounts.some(a => a.ref === prev) ? prev : '';
     benefitsLogFilter.ref = logAcct.value;
   }
   if (sel) {
@@ -5890,6 +5851,7 @@ function renderTaskWorkbench(d) {
     if (sel.innerHTML !== next) sel.innerHTML = next;
     sel.value = accounts.some(a => a.ref === want) ? want : 'all';
     benefitsFocusRef = sel.value;
+    sel.disabled = !accounts.length;
   }
   const current = benefitsFocusRef === 'all' ? null : accounts.find(a => a.ref === benefitsFocusRef) || null;
   const summary = (d && d.summary) || {};
@@ -5910,44 +5872,45 @@ function renderTaskWorkbench(d) {
   }
   benefitsTaskData = d || null;
   renderBenefitTaskRows(current ? (d && d.tasks) : [], current, d && d.tasks_error);
+  syncTaskActionBusy();
+}
+
+function syncTaskActionBusy() {
+  const accounts = benefitsTaskData && (benefitsTaskData.account_options || benefitsTaskData.accounts) || [];
+  const busy = benefitsSubmitting || benefitsRuns.some(r => r && r.running && String(r.kind || '').startsWith('tasks_'));
   ['bfBtnFocusCheckin', 'bfBtnFocusRun', 'bfBtnFocusTravel', 'bfBtnFocusStreak'].forEach(id => {
     const b = $(id);
-    if (b) b.disabled = !benefitsFocusRef || !accounts.length;
+    if (b) b.disabled = busy || !accounts.length;
   });
 }
 
 async function runTaskAction(action, btn) {
+  if (benefitsSubmitting || (btn && btn.disabled)) return;
   const ref = benefitsFocusRef || 'all';
-  if (!ref) return;
-  const seq = ++benefitsRunSeq;
+  // 全部成长待办与定时成长排程共用同一后台队列和进度视图。
+  if (action === 'tasks' && ref === 'all') {
+    const advanced = $('bfAdvanced');
+    if (advanced) advanced.open = true;
+    const queueButton = $('btnRunQueue');
+    if (queueButton && queueButton.onclick) await queueButton.onclick();
+    return;
+  }
+  if (action === 'tasks' && !confirm('将执行该账号可自动完成的成长任务，包含真实对话。任务在后台执行，可切页查看其他内容。确认继续？')) return;
+  benefitsSubmitting = true;
+  syncTaskActionBusy();
   const label = btn ? btn.textContent : action;
-  if (btn) { btn.disabled = true; btn.textContent = '执行中…'; }
-  const box = $('bfBatchList');
-  if (box) box.innerHTML = '<div class="empty">正在执行 ' + esc(label) + '…</div>';
+  if (btn) btn.textContent = '提交中…';
   try {
-    const body = { scope: ref, action };
-    const r = await api('tasks/run', { method: 'POST', body: JSON.stringify(body) });
-    if (seq !== benefitsRunSeq) return;
-    const results = Array.isArray(r && r.results) ? r.results : [];
-    const logs = Array.isArray(r && r.logs) ? r.logs : [];
-    const ok = results.filter(x => x && x.ok).length;
-    const bad = results.length - ok;
-    if (box) {
-      box.innerHTML = '<div class="bf-batch-row"><div><div class="bf-batch-k">' + esc(label) + '</div>' +
-        '<div class="bf-batch-meta">' + esc(benefitsTime(new Date().toISOString())) + ' · 范围 ' + esc(ref === 'all' ? '全部国内账号' : ref.slice(0, 8)) + '</div></div>' +
-        '<div class="bf-batch-stat">' + (bad ? '<span class="tag bad">' + bad + ' 失败</span>' : '<span class="tag ok">完成</span>') +
-        '<div class="bf-batch-meta">成功 ' + ok + ' · 失败 ' + bad + ' · 共 ' + results.length + '</div></div></div>' +
-        (logs.length ? logs.map(x => '<div class="bf-log-row"><span class="t">' + esc(benefitsTime(new Date().toISOString())) + '</span><span class="n"></span><span class="m">' + esc(x) + '</span></div>').join('') : '');
-    }
-    toast((r && (r.message || (ok + ' 个账号成功' + (bad ? '，' + bad + ' 个失败' : '')))) || '执行完成', bad ? 'err' : 'ok');
+    const r = await api('tasks/run', { method: 'POST', body: JSON.stringify({ scope: ref, action, async: true }) });
+    toast(r.started ? '已提交 ' + r.accounts_count + ' 个账号，执行进度见下方' : '没有可执行的账号', r.started ? 'ok' : 'warn');
+    await loadBenefitBatches();
   } catch (e) {
-    if (box) box.innerHTML = '<div class="empty err">执行失败：' + esc(e && e.message ? e.message : String(e)) + '</div>';
     toast(e && e.message ? e.message : String(e), 'err');
+    loadBenefitBatches();
   } finally {
-    if (btn) { btn.disabled = false; btn.textContent = label; }
-    loadOverview(true);
-    await loadBenefits(true);
-    loadBenefitLog();
+    benefitsSubmitting = false;
+    if (btn) btn.textContent = label;
+    syncTaskActionBusy();
   }
 }
 
@@ -5970,8 +5933,9 @@ async function runBenefitAction(ref, act, label) {
   renderBenefitsAccounts((lastBenefits && lastBenefits.accounts) || []);
   try {
     if (act === 'tasks') {
-      benefitsTaskRef = ref;
+      const seq = ++tasksSeq;
       const d = await api('benefits/' + encodeURIComponent(ref) + '/tasks');
+      if (seq !== tasksSeq) return;
       openTasksForRef(ref, d && d.tasks, d && d.enterprise);
     } else {
       let path = '';
@@ -5993,9 +5957,9 @@ async function runBenefitAction(ref, act, label) {
   }
 }
 
-// openTasksForRef 用短引用打开成长任务弹窗。任务弹窗内部按完整 UID 调接口，
-// 因此后端先解析引用，前端只需要拿回任务列表并复用现有渲染。
+// openTasksForRef 用短引用打开成长任务弹窗；查询与动作均复用同一引用。
 function openTasksForRef(ref, tasks, enterprise) {
+  tasksSeq++;
   taskUID = null;
   benefitsTaskRef = ref || null;
   setText('taskWho', '福利账号 ' + String(ref || '').slice(0, 8));
@@ -6018,7 +5982,7 @@ function openTasksForRef(ref, tasks, enterprise) {
   if (st) st.hidden = true;
   if (tb) tb.hidden = false;
   if (body) body.innerHTML = taskRowsHTML(list);
-  if ($('btnTaskReload')) $('btnTaskReload').hidden = true;
+  if ($('btnTaskReload')) $('btnTaskReload').hidden = false;
 }
 
 // 福利弹窗内的任务动作：按短引用走同一福利路由，后端解析后复用账号动作。
@@ -6031,44 +5995,6 @@ if ($('bfGrowthAcct')) $('bfGrowthAcct').addEventListener('change', ev => {
   loadBenefits(true);
 });
 
-async function runFocusTask(kind, code, btn) {
-  const ref = benefitsFocusRef;
-  if (!ref) return;
-  if (kind === 'auto_all' && !confirm('确认对该账号执行全部可自动成长任务？会接取任务并进行真实对话，可能耗时数分钟。')) return;
-  if (btn) { btn.disabled = true; btn.textContent = '执行中…'; }
-  try {
-    const path = 'benefits/' + encodeURIComponent(ref) + '/tasks/' +
-      (kind === 'auto_all' ? 'auto_all' : kind);
-    const body = kind === 'auto' ? { task_code: code }
-      : kind === 'accept' ? { task_codes: [code] }
-      : kind === 'claim' ? { task_code: code } : undefined;
-    const r = await api(path, body === undefined
-      ? { method: 'POST' } : { method: 'POST', body: JSON.stringify(body) });
-    if (kind === 'auto_all') {
-      const results = Array.isArray(r && r.results) ? r.results : [];
-      const done = results.filter(x => x && x.status === 'done').length;
-      const bad = results.filter(x => x && (x.status === 'error' || x.claim_error)).length;
-      let msg = (r && r.message) || ('已执行 ' + done + ' 项任务');
-      if (bad) msg += '；' + bad + ' 项失败或领奖异常';
-      toast(msg, bad ? 'err' : 'ok');
-    } else if (kind === 'auto') {
-      let msg = (r && r.message) || '任务已执行';
-      if (r && r.progress_after) msg += '（进度 ' + r.progress_before + ' → ' + r.progress_after + '）';
-      if (r && r.claimed) msg += '，奖励已自动到账';
-      const advanced = !!r && !!r.progress_after && r.progress_after !== r.progress_before;
-      toast(msg, r && (r.claimed || advanced) && !r.claim_error ? 'ok' : 'err');
-    } else {
-      toast(kind === 'claim' ? '已领取奖励' : '已接受任务', 'ok');
-    }
-    loadOverview(true);
-  } catch (e) {
-    toast(e && e.message ? e.message : String(e), 'err');
-  } finally {
-    if (btn) { btn.disabled = false; btn.textContent = kind === 'claim' ? '领取' : (kind === 'auto' ? '一键完成' : '接受'); }
-    loadBenefits(true);
-  }
-}
-
 if ($('bfBtnFocusRun')) $('bfBtnFocusRun').onclick = () => runTaskAction('tasks', $('bfBtnFocusRun'));
 if ($('bfBtnFocusCheckin')) $('bfBtnFocusCheckin').onclick = () => runTaskAction('checkin', $('bfBtnFocusCheckin'));
 if ($('bfBtnFocusTravel')) $('bfBtnFocusTravel').onclick = () => runTaskAction('travel', $('bfBtnFocusTravel'));
@@ -6080,7 +6006,12 @@ if ($('bfAccountsBody')) $('bfAccountsBody').addEventListener('click', ev => {
   runBenefitAction(btn.dataset.bfRef, btn.dataset.bfAct, btn.textContent || '动作');
 });
 
-if ($('btnBenefitsRefresh')) $('btnBenefitsRefresh').onclick = () => { loadBenefits(true, true); loadOverview(true); toast('福利概览已刷新', 'ok'); };
+if ($('btnBenefitsRefresh')) $('btnBenefitsRefresh').onclick = async () => {
+  const b = $('btnBenefitsRefresh');
+  b.disabled = true; b.textContent = '刷新中…';
+  try { await loadBenefits(true, true); loadOverview(true); }
+  finally { b.disabled = false; b.textContent = '刷新概览'; }
+};
 if ($('bfBtnLogRefresh')) $('bfBtnLogRefresh').onclick = () => { loadBenefitLog(); loadBenefitBatches(); };
 ['bfLogTask', 'bfLogResult', 'bfLogAcct'].forEach(id => {
   const el = $(id);

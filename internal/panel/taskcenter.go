@@ -20,6 +20,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/linguo2625469/workbuddy2api-panel/internal/activity"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
@@ -1014,7 +1015,18 @@ func (p *Panel) acceptPendingTasks(a *auth.Auth) int {
 
 // runGrowthQueued 执行单个成长任务（动作 + 回读 + 自动领奖；与
 // accountTaskAuto 同语义，结果以文字返回）。
-func (p *Panel) runGrowthQueued(a *auth.Auth, code string) (string, error) {
+func (p *Panel) runGrowthQueued(a *auth.Auth, code string) (message string, resultErr error) {
+	defer func() {
+		if v := recover(); v != nil {
+			p.recordManualActivity(a, activity.TaskGrowth, false, code+"：执行异常，请查看运行日志")
+			panic(v)
+		}
+		text := code + "：" + message
+		if resultErr != nil {
+			text = code + "：" + resultErr.Error()
+		}
+		p.recordManualActivity(a, activity.TaskGrowth, resultErr == nil, text)
+	}()
 	if a == nil {
 		return "", fmt.Errorf("账号为空")
 	}
@@ -1033,19 +1045,31 @@ func (p *Panel) runGrowthQueued(a *auth.Auth, code string) (string, error) {
 	if before == nil {
 		return "该账号无此任务", nil
 	}
+	if before.Locked {
+		return "", fmt.Errorf("任务尚未解锁")
+	}
 	isMP := isMPTaskCode(code)
 	if before.Claimed {
 		return "已完成（已领取）", nil
 	}
-	msg, err := act.run(p, a)
-	if err != nil {
-		return "", err
-	}
-	var after *upstream.Task
-	if isMP {
-		after, _ = p.taskByCodeMP(a, code)
-	} else {
-		after, _ = p.taskByCodeWaiting(a, code)
+	msg := "任务已达标"
+	after := before
+	if !before.Claimable && !(before.Target > 0 && before.Current >= before.Target) {
+		msg, err = act.run(p, a)
+		if err != nil {
+			return "", err
+		}
+		if isMP {
+			after, err = p.taskByCodeMP(a, code)
+		} else {
+			after, err = p.taskByCodeWaiting(a, code)
+		}
+		if err != nil {
+			return "", err
+		}
+		if after == nil || (!after.Claimable && !after.Claimed && after.Current <= before.Current) {
+			return "", fmt.Errorf("上游进度未推进，请重新查询任务状态")
+		}
 	}
 	if after != nil && after.Claimable {
 		var credit, energy int64
@@ -1055,7 +1079,10 @@ func (p *Panel) runGrowthQueued(a *auth.Auth, code string) (string, error) {
 		} else {
 			credit, energy, cerr = p.cfg.Upstream.ClaimReward(a, code)
 		}
-		if cerr == nil && (credit > 0 || energy > 0) {
+		if cerr != nil {
+			return "", fmt.Errorf("达标但领奖失败：%w", cerr)
+		}
+		if credit > 0 || energy > 0 {
 			msg += fmt.Sprintf("；自动领奖 +%d 分 +%d 能", credit, energy)
 		}
 	}

@@ -8,6 +8,7 @@ package scheduler
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"time"
@@ -20,6 +21,10 @@ import (
 // RunStreakBonusNow 对所有可用账号执行连登兑换 + 抽奖（幂等：locked/无次数自动跳过）。
 // 由签到排程（RunCheckinNow）末尾调用；也可面板手动触发。
 func (s *Scheduler) RunStreakBonusNow() {
+	s.runStreakBonus(activity.TriggerManual)
+}
+
+func (s *Scheduler) runStreakBonus(trigger activity.Trigger) {
 	includeDisabled := s.includeDisabledInTasks()
 	for _, acct := range s.cfg.Pool.TaskAccounts(includeDisabled) {
 		// 与其余保号类任务（签到/活跃上报/保活/余额刷新）口径一致：默认跳过禁用号，
@@ -34,7 +39,7 @@ func (s *Scheduler) RunStreakBonusNow() {
 		if a.IsEnterprise() {
 			continue // 企业版门控：无成长体系（/activity/growth/streak 上游一律 403）
 		}
-		s.streakBonusAccount(a)
+		_ = s.RunStreakBonusFor(a, trigger)
 	}
 }
 
@@ -53,19 +58,18 @@ func (s *Scheduler) RunStreakBonusFor(a *auth.Auth, trigger activity.Trigger) er
 	if s.cfg.Upstream == nil {
 		return fmt.Errorf("upstream client unavailable")
 	}
-	s.streakBonusAccount(a)
-	if s.cfg.Activity != nil {
-		_ = s.cfg.Activity.Append(activity.Record{
-			UID: a.UID, Nickname: a.Nickname, Realm: a.Realm(),
-			Task: activity.TaskActivity, Trigger: trigger, OK: true,
-			Message: "连登兑换与抽奖检查完成",
-		})
+	err := s.streakBonusAccount(a)
+	message := "连登兑换与抽奖检查完成"
+	if err != nil {
+		message = err.Error()
 	}
-	return nil
+	s.recordActivity(a, activity.TaskStreak, trigger, err == nil, message)
+	return err
 }
 
 // streakBonusAccount 单账号：补签保连登 → 礼包/补偿 → 兑换所有已解锁档位 → 抽完所有 chances。
-func (s *Scheduler) streakBonusAccount(a *auth.Auth) {
+func (s *Scheduler) streakBonusAccount(a *auth.Auth) error {
+	var failures []error
 	// 0. 补签保连登：昨日漏签且有补签卡则补上（连续天数一断就要重攒 7 天）。
 	s.makeupYesterday(a)
 	// 0.5 礼包/补偿（每号一次，无则业务错误静默跳过）。
@@ -79,7 +83,7 @@ func (s *Scheduler) streakBonusAccount(a *auth.Auth) {
 	full, err := s.cfg.Upstream.GrowthStreakFull(a)
 	if err != nil {
 		log.Printf("streak-bonus %s: %v", logfmt.Label(a.UID, a.Nickname), err)
-		return
+		return errors.Join(append(failures, err)...)
 	}
 	statuses := map[string]string{
 		"7d":  full.RedemptionStatus.Tier7dStatus,
@@ -94,28 +98,30 @@ func (s *Scheduler) streakBonusAccount(a *auth.Auth) {
 		if err := s.cfg.Upstream.GrowthRedeemTier(a, tier.Tier); err != nil {
 			// 未解锁（403）属预期，静默；其余记日志。
 			log.Printf("streak-bonus %s: redeem %s: %v", logfmt.Label(a.UID, a.Nickname), tier.Tier, err)
+			failures = append(failures, fmt.Errorf("redeem %s: %w", tier.Tier, err))
 			continue
 		}
 		log.Printf("streak-bonus %s: ★ 兑换 %s 档（+%dc +%de 卡×%d 抽奖×%d）",
-			a.UID, tier.Tier, tier.Credit, tier.Energy, tier.Cards, tier.Chances)
+			logfmt.Label(a.UID, a.Nickname), tier.Tier, tier.Credit, tier.Energy, tier.Cards, tier.Chances)
 	}
 	// 抽奖：按当前 chances 全抽完（兑换刚发的次数已在服务端累加）。
 	chances, err := s.cfg.Upstream.LotteryChances(a)
 	if err != nil {
 		log.Printf("streak-bonus %s: lottery summary: %v", logfmt.Label(a.UID, a.Nickname), err)
-		return
+		return errors.Join(append(failures, err)...)
 	}
 	for i := 0; i < chances; i++ {
 		raw, err := s.cfg.Upstream.LotteryDraw(a)
 		if err != nil {
 			log.Printf("streak-bonus %s: draw: %v", logfmt.Label(a.UID, a.Nickname), err)
-			return
+			return errors.Join(append(failures, err)...)
 		}
 		log.Printf("streak-bonus %s: 🎲 第%d抽 %s", logfmt.Label(a.UID, a.Nickname), i+1, compactJSON(raw))
 	}
 	if chances > 0 {
 		log.Printf("streak-bonus %s: 抽奖完成 %d 次", logfmt.Label(a.UID, a.Nickname), chances)
 	}
+	return errors.Join(failures...)
 }
 
 // compactJSON 裁剪奖品载荷（日志单行可读）。

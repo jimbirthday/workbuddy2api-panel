@@ -33,6 +33,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/linguo2625469/workbuddy2api-panel/internal/activity"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
@@ -1160,8 +1161,23 @@ func runExpertBatch(p *Panel, a *auth.Auth, expertType string, count int) (strin
 //
 // 流程：先把所有未接受的任务批量 accept（规范状态机；上游脚本建议"先 accept"），
 // 再逐项执行行为链路。accept 不是进度产生的必要条件，但让后续状态流转规范。
-func (p *Panel) runAutoAll(a *auth.Auth) []map[string]any {
-	var out []map[string]any
+func (p *Panel) runAutoAll(a *auth.Auth) (out []map[string]any) {
+	defer func() {
+		if v := recover(); v != nil {
+			p.recordManualActivity(a, activity.TaskGrowth, false, "成长任务执行异常，请查看运行日志")
+			panic(v)
+		}
+		done, failed := 0, 0
+		for _, item := range out {
+			if item["status"] == "error" || item["claim_error"] != nil {
+				failed++
+			} else if item["status"] == "done" {
+				done++
+			}
+		}
+		p.recordManualActivity(a, activity.TaskGrowth, failed == 0,
+			fmt.Sprintf("成长任务：完成 %d 项，失败 %d 项", done, failed))
+	}()
 
 	// 阶段 0：批量接受尚未接受的任务（失败不阻塞——行为事件才是进度唯一判据）。
 	if tasks, err := p.cfg.Upstream.ListTasks(a); err == nil {
@@ -1185,6 +1201,8 @@ func (p *Panel) runAutoAll(a *auth.Auth) []map[string]any {
 				time.Sleep(reportGap)
 			}
 		}
+	} else {
+		out = append(out, map[string]any{"task_code": "(任务查询)", "status": "error", "message": err.Error()})
 	}
 
 	// 阶段 0b：小程序口径任务单独接受（默认列表不含 mp 码；失败不阻塞）。
@@ -1209,6 +1227,8 @@ func (p *Panel) runAutoAll(a *auth.Auth) []map[string]any {
 				time.Sleep(reportGap)
 			}
 		}
+	} else {
+		out = append(out, map[string]any{"task_code": "(任务查询-mp)", "status": "error", "message": err.Error()})
 	}
 
 	for _, act := range autoActions {
@@ -1226,24 +1246,34 @@ func (p *Panel) runAutoAll(a *auth.Auth) []map[string]any {
 			out = append(out, item)
 			continue
 		}
-		if before.Claimed || before.Current >= before.Target && before.Target > 0 {
+		if before.Claimed || before.Locked {
 			item["status"] = "skipped"
-			item["message"] = "已完成（" + taskProgressText(before) + "）"
+			item["message"] = "已领取（" + taskProgressText(before) + "）"
+			if before.Locked {
+				item["message"] = "未解锁"
+			}
 			out = append(out, item)
 			continue
 		}
-		msg, err := act.run(p, a)
+		msg := "任务已达标"
+		after := before
+		if !before.Claimable && !(before.Target > 0 && before.Current >= before.Target) {
+			msg, err = act.run(p, a)
+			if err == nil {
+				if isMPTaskCode(act.TaskCode) {
+					after, err = p.taskByCodeMP(a, act.TaskCode)
+				} else {
+					after, err = p.taskByCodeWaiting(a, act.TaskCode)
+				}
+			}
+			if err == nil && (after == nil || (!after.Claimable && !after.Claimed && after.Current <= before.Current)) {
+				err = fmt.Errorf("上游进度未推进，请重新查询任务状态")
+			}
+		}
 		if err != nil {
-			item["status"] = "error"
-			item["message"] = err.Error()
+			item["status"], item["message"] = "error", err.Error()
 			out = append(out, item)
 			continue
-		}
-		var after *upstream.Task
-		if isMPTaskCode(act.TaskCode) {
-			after, _ = p.taskByCodeMP(a, act.TaskCode)
-		} else {
-			after, _ = p.taskByCodeWaiting(a, act.TaskCode)
 		}
 		item["status"] = "done"
 		item["message"] = msg

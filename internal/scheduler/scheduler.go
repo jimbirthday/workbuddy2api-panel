@@ -608,7 +608,7 @@ func (s *Scheduler) runCheckin(trigger activity.Trigger) {
 		s.cfg.Pool.ReenableIfCredits(uid, remain, total)
 		s.cfg.Pool.SetCreditsDetailed(uid, remain, total, expiring, earliestAt, earliestRemaining)
 	}
-	s.RunStreakBonusNow()
+	s.runStreakBonus(trigger)
 }
 
 // RunActivityNow 立即对池内所有可用账号执行一次对话活跃上报。

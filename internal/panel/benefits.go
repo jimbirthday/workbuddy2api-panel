@@ -2,11 +2,13 @@ package panel
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/activity"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
@@ -90,24 +92,25 @@ func (p *Panel) benefitsOverview(w http.ResponseWriter, r *http.Request) {
 	}
 
 	type accountBenefit struct {
-		UID            string    `json:"uid"`
-		Ref            string    `json:"ref"`
-		Nickname       string    `json:"nickname,omitempty"`
-		Realm          string    `json:"realm"`
-		Enterprise     bool      `json:"enterprise"`
-		Disabled       bool      `json:"disabled,omitempty"`
-		Cooling        bool      `json:"cooling,omitempty"`
-		CheckinDone    bool      `json:"checkin_done"`
-		Credit         int64     `json:"credits"`
-		CreditTotal    int64     `json:"credits_total"`
-		LastTask       string    `json:"last_task,omitempty"`
-		LastOK         bool      `json:"last_ok,omitempty"`
-		LastMessage    string    `json:"last_message,omitempty"`
-		LastAt         time.Time `json:"last_at,omitempty"`
-		GrowthPending  int       `json:"growth_pending"`
-		DailyChatAt    time.Time `json:"daily_chat_at,omitempty"`
-		DailyChatOK    bool      `json:"daily_chat_ok,omitempty"`
-		DailyChatToday bool      `json:"daily_chat_today"`
+		UID                string    `json:"uid"`
+		Ref                string    `json:"ref"`
+		Nickname           string    `json:"nickname,omitempty"`
+		Realm              string    `json:"realm"`
+		Enterprise         bool      `json:"enterprise"`
+		Disabled           bool      `json:"disabled,omitempty"`
+		Cooling            bool      `json:"cooling,omitempty"`
+		CheckinDone        bool      `json:"checkin_done"`
+		Credit             int64     `json:"credits"`
+		CreditTotal        int64     `json:"credits_total"`
+		LastTask           string    `json:"last_task,omitempty"`
+		LastOK             bool      `json:"last_ok,omitempty"`
+		LastMessage        string    `json:"last_message,omitempty"`
+		LastAt             time.Time `json:"last_at,omitempty"`
+		GrowthPending      int       `json:"growth_pending"`
+		GrowthPendingKnown bool      `json:"growth_pending_known"`
+		DailyChatAt        time.Time `json:"daily_chat_at,omitempty"`
+		DailyChatOK        bool      `json:"daily_chat_ok,omitempty"`
+		DailyChatToday     bool      `json:"daily_chat_today"`
 		// 国内成长福利（Hub 任务与福利页同口径）。企业号/国际号不查询，
 		// 字段保持零值并由 available=false 让前端隐藏。
 		GrowthAvailable bool   `json:"growth_available,omitempty"`
@@ -171,25 +174,10 @@ func (p *Panel) benefitsOverview(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	pendingByUID := map[string]int{}
 	if st := p.scan(); st != nil {
 		st.mu.Lock()
-		running := st.running
-		pending, errors := st.pending, st.errors
-		for _, item := range st.items {
-			if item.UID == "" {
-				continue
-			}
-			n := 0
-			for _, task := range item.Growth {
-				if growthPending(task) {
-					n++
-				}
-			}
-			pendingByUID[item.UID] = n
-		}
+		running, errors := st.running, st.errors
 		st.mu.Unlock()
-		summary.GrowthPending = pending
 		summary.GrowthFailed = errors
 		if running {
 			summary.GrowthRunning = 1
@@ -256,17 +244,16 @@ func (p *Panel) benefitsOverview(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		row := accountBenefit{
-			UID:           uid8,
-			Ref:           benefitRefFor(st.UID),
-			Nickname:      st.Nickname,
-			Realm:         st.Realm,
-			Enterprise:    st.Enterprise,
-			Disabled:      st.Disabled,
-			Cooling:       st.Cooling,
-			CheckinDone:   st.CheckinDone,
-			Credit:        st.Credits,
-			CreditTotal:   st.CreditsTotal,
-			GrowthPending: pendingByUID[uid8],
+			UID:         uid8,
+			Ref:         benefitRefFor(st.UID),
+			Nickname:    st.Nickname,
+			Realm:       st.Realm,
+			Enterprise:  st.Enterprise,
+			Disabled:    st.Disabled,
+			Cooling:     st.Cooling,
+			CheckinDone: st.CheckinDone,
+			Credit:      st.Credits,
+			CreditTotal: st.CreditsTotal,
 		}
 		if rec, ok := lastByUID[uid8]; ok {
 			row.LastTask = string(rec.Task)
@@ -296,6 +283,15 @@ func (p *Panel) benefitsOverview(w http.ResponseWriter, r *http.Request) {
 			row.Tier14d = g.Tier14d
 			row.Tier28d = g.Tier28d
 			row.GrowthError = g.Err
+			row.GrowthPendingKnown = g.TasksErr == ""
+			if row.GrowthPendingKnown {
+				for _, task := range g.Tasks {
+					if growthPending(task) {
+						row.GrowthPending++
+					}
+				}
+				summary.GrowthPending += row.GrowthPending
+			}
 		}
 		out = append(out, row)
 	}
@@ -316,7 +312,7 @@ func (p *Panel) benefitsOverview(w http.ResponseWriter, r *http.Request) {
 			}
 			out[i].Focused = true
 			if g, ok := growthByUID[focusPoolUID]; ok {
-				taskRows = g.Tasks
+				taskRows = append(taskRows, g.Tasks...)
 				taskRowsErr = g.TasksErr
 				if g.TasksErr != "" && out[i].GrowthError == "" {
 					out[i].GrowthError = g.TasksErr
@@ -464,17 +460,17 @@ func isWelfareGrant(reason, name string) bool {
 // scheduler still owns single-flight; this record only says whether the
 // batch is done and how many activity rows it produced.
 type batchRun struct {
-	Kind      string    `json:"kind"`
-	StartedAt time.Time `json:"started_at"`
-	Running   bool      `json:"running"`
-	Done      bool      `json:"done"`
-	Total     int       `json:"total"`
-	OK        int       `json:"ok"`
-	Failed    int       `json:"failed"`
-	Note      string    `json:"note,omitempty"`
+	Kind      string           `json:"kind"`
+	StartedAt time.Time        `json:"started_at"`
+	Running   bool             `json:"running"`
+	Done      bool             `json:"done"`
+	Total     int              `json:"total"`
+	OK        int              `json:"ok"`
+	Failed    int              `json:"failed"`
+	Note      string           `json:"note,omitempty"`
+	Scope     string           `json:"scope,omitempty"`
+	Results   []tasksRunResult `json:"results,omitempty"`
 }
-
-const batchRunStaleAfter = 30 * time.Minute
 
 // startBenefitBatch starts one manual batch through the scheduler gate and
 // records its outcome. It returns false when another run of the same kind is
@@ -500,26 +496,24 @@ func (p *Panel) startBenefitBatch(kind string, fn func()) bool {
 // started. It deliberately uses the activity store (the durable outcome
 // source) instead of inventing per-account summaries inside the scheduler.
 func (p *Panel) finishBenefitBatch(kind string, started time.Time, done <-chan struct{}) {
-	select {
-	case <-done:
-	case <-time.After(batchRunStaleAfter):
-	}
+	<-done
+	finished := time.Now()
 	rec := batchRun{Kind: kind, StartedAt: started, Done: true}
 	if p.cfg.Activity == nil {
 		rec.Note = "活动记录未启用"
 	} else {
-		// Append is asynchronous and the persisted file is the durable source.
-		// Poll a bounded window so a batch does not appear complete before the
-		// final account's activity row has been flushed.
-		deadline := time.Now().Add(5 * time.Second)
-		for {
-			res, err := p.cfg.Activity.Query(activity.Filter{Since: started, Limit: 1000})
-			if err != nil {
-				rec.Note = "读取活动记录失败"
-				break
-			}
+		// Await all accepted rows, including the last account, before counting.
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		err := p.cfg.Activity.Flush(ctx)
+		cancel()
+		if err != nil {
+			rec.Note = "部分活动记录尚未落盘，统计可能不完整"
+		}
+		res, queryErr := p.cfg.Activity.Query(activity.Filter{Task: activity.Task(kind), Since: started, Until: finished, Limit: 1000})
+		if queryErr != nil {
+			rec.Note = "读取活动记录失败"
+		} else {
 			rec.Total = len(res.Records)
-			rec.OK, rec.Failed = 0, 0
 			for _, row := range res.Records {
 				if row.OK {
 					rec.OK++
@@ -527,17 +521,15 @@ func (p *Panel) finishBenefitBatch(kind string, started time.Time, done <-chan s
 					rec.Failed++
 				}
 			}
-			if rec.Total > 0 || time.Now().After(deadline) {
-				if res.Total > len(res.Records) {
-					rec.Note = "只统计最近 1000 条活动记录"
-				}
-				break
+			if res.Total > len(res.Records) {
+				rec.Note = "只统计最近 1000 条活动记录"
 			}
-			time.Sleep(100 * time.Millisecond)
 		}
 	}
 	p.batchMu.Lock()
-	p.batchRuns[kind] = &rec
+	if current := p.batchRuns[kind]; current != nil && current.StartedAt.Equal(started) {
+		p.batchRuns[kind] = &rec
+	}
 	p.batchMu.Unlock()
 	p.invalidateBenefitsGrowth()
 }
@@ -545,21 +537,14 @@ func (p *Panel) finishBenefitBatch(kind string, started time.Time, done <-chan s
 // benefitsBatches returns the latest manual batch state for the welfare page.
 // It never starts work or calls upstream.
 func (p *Panel) benefitsBatches(w http.ResponseWriter, r *http.Request) {
-	now := time.Now()
-	out := make([]batchRun, 0, 6)
+	out := make([]batchRun, 0, 10)
 	p.batchMu.Lock()
 	for _, rec := range p.batchRuns {
 		if rec == nil {
 			continue
 		}
 		cp := *rec
-		// A process killed mid-run can leave running=true forever; present it
-		// as a completed unknown result rather than a spinner that never stops.
-		if cp.Running && now.Sub(cp.StartedAt) > batchRunStaleAfter {
-			cp.Running = false
-			cp.Done = true
-			cp.Note = "执行状态未知（可能已重启）"
-		}
+		cp.Results = append([]tasksRunResult(nil), rec.Results...)
 		out = append(out, cp)
 	}
 	p.batchMu.Unlock()
@@ -585,7 +570,17 @@ func (p *Panel) benefitsLog(w http.ResponseWriter, r *http.Request) {
 	}
 	uid := strings.TrimSpace(q.Get("uid"))
 	if ref := strings.TrimSpace(q.Get("ref")); ref != "" {
-		uid = statusUID8(p.benefitUIDForRef(ref))
+		p.rememberBenefitRefs(p.cfg.Pool.List())
+		fullUID := p.benefitUIDForRef(ref)
+		if fullUID == "" {
+			writeErr(w, http.StatusBadRequest, "unknown account reference")
+			return
+		}
+		uid = statusUID8(fullUID)
+	}
+	if utf8.RuneCountInString(q.Get("q")) > 64 {
+		writeErr(w, http.StatusBadRequest, "q must be at most 64 characters")
+		return
 	}
 	res, err := p.cfg.Activity.Query(activity.Filter{
 		UID:    uid,
@@ -597,6 +592,10 @@ func (p *Panel) benefitsLog(w http.ResponseWriter, r *http.Request) {
 		Limit:  limit,
 	})
 	if err != nil {
+		if errors.Is(err, activity.ErrInvalidFilter) {
+			writeErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		writeErr(w, http.StatusInternalServerError, "read activity log failed")
 		return
 	}
@@ -703,7 +702,7 @@ func (p *Panel) growthResult(ctx context.Context, a *auth.Auth) benefitGrowth {
 	case r := <-done:
 		return r.g
 	case <-ctx.Done():
-		return benefitGrowth{Err: "growth query timed out"}
+		return benefitGrowth{Err: "growth query timed out", TasksErr: "growth query timed out"}
 	}
 }
 
@@ -818,7 +817,7 @@ func (p *Panel) benefitsGrowthSnapshot(statuses []pool.Status, force bool) map[s
 			p.benefitsGrowthMu.Unlock()
 			snap := make(map[string]benefitGrowth, len(jobs))
 			for _, j := range jobs {
-				snap[j.uid] = benefitGrowth{Err: "server shutting down"}
+				snap[j.uid] = benefitGrowth{Err: "server shutting down", TasksErr: "server shutting down"}
 			}
 			return snap
 		}
@@ -851,7 +850,7 @@ func partialGrowthSnapshot(snap map[string]benefitGrowth, snapKey, key string, u
 				continue
 			}
 		}
-		out[uid] = benefitGrowth{Err: "growth query timed out"}
+		out[uid] = benefitGrowth{Err: "growth query timed out", TasksErr: "growth query timed out"}
 	}
 	return out
 }

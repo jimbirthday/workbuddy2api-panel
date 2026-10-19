@@ -2,6 +2,7 @@ package activity
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"os"
@@ -806,5 +807,29 @@ func TestQueryCacheReusesCompleteShortWindow(t *testing.T) {
 	store.queryMu.Unlock()
 	if qerr != nil || len(all.Records) != 7 || all.Total != 7 || all.Limit != 200 {
 		t.Fatalf("all=%+v err=%v", all, qerr)
+	}
+}
+
+func TestAsyncFlushMakesAllAcceptedRowsVisibleWithoutClosing(t *testing.T) {
+	s := New(Config{Path: filepath.Join(t.TempDir(), FileName()), Async: true})
+	t.Cleanup(func() { _ = s.Close() })
+	for _, total := range []int{600, 1} {
+		for i := 0; i < total; i++ {
+			mustAppend(t, s, Record{UID: "u1", Task: TaskGrowth, OK: true})
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		err := s.Flush(ctx)
+		cancel()
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := s.Query(Filter{Limit: 1000})
+		want := 600
+		if total == 1 {
+			want = 601
+		}
+		if err != nil || got.Total != want {
+			t.Fatalf("after flush total=%d want=%d err=%v", got.Total, want, err)
+		}
 	}
 }

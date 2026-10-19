@@ -111,12 +111,13 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 
 ### 🧭 任务中心（面板新视图）
 
-「任务中心」视图把散落的任务能力收拢成一处：
+「任务与福利」视图统一查看国内个人账号的签到、成长任务、猫猫旅行和连登奖励：
 
-- **全账号任务扫描**：一键拉取每个账号的成长任务（未完成且可自动化的全部任务，含小程序口径的「校园日」与「小程序首对话」）+ 开学季待办，列表一目了然
-- **执行队列**：把待办按账号排队执行——账号内串行（与单任务/一键完成共用互斥锁），账号间可选并发（1-3）；执行进度实时更新到每个条目
-- **开学季独立状态卡**：每账号 5 任务（分享/桌面/对话×3/专家/学生认证）的状态矩阵 + 剩余抽奖次数，一键触发全账号闭环
-- **日志分频道**：运行日志按「任务 / 对话 / 系统」三个频道筛选——对话流量再大，任务结果也不会被冲掉；日志条目带频道徽标与时间
+- **范围选择**：默认全部国内账号，也可切换单个账号查看任务进度、奖励与状态；切换账号始终保留完整可选列表。国际账号的每日活跃入口保留在账号福利概览中。
+- **后台执行**：签到、旅行、连登与单账号成长任务提交后在后台运行，页面展示进度和逐账号结果；刷新或关闭浏览器不会中断。相同动作运行期间拒绝重复提交，账号内动作共用互斥锁。
+- **全部成长任务队列**：点击全部账号的「一键做任务」，复用扫描与队列流程；账号内串行，账号间可选并发 1–3，已达标未领取的任务直接领奖，执行后回读上游进度。
+- **结果追踪**：页面提供最近执行记录和完整「活动记录」入口，可按任务、账号、结果和时间筛选。队列及批次状态保存在内存中，服务重启会清空；已落盘的活动记录继续保留。
+- **历史活动**：开学季活动已经结束，历史券码仍可在队列区查询。
 
 <details>
 <summary><b>🎒 开学季活动（5/5 全自动）</b>——活动期至 2026-09-24，已结束；逆向成果存档，点击展开</summary>
@@ -553,7 +554,7 @@ WARN: [server] stream ...: saw M native tool call block(s) but repaired none (to
 
 如果采用「**一次只放开一个账号、用禁用做流量开关**」的轮换方式（同 IP 多号怕触发风控），闲置待命的号恰恰是最需要签到的——把它设为 `true`，禁用号仍会签到 / 保活 / 刷新余额，**但依旧不参与选号**（`pool` 选号侧的 disabled 过滤不受本开关影响）。
 
-> 该开关**只覆盖调度器的这四类任务**。猫猫旅行、夜猫子、连登管家（挂在签到末尾的 `RunStreakBonusNow`）与成长任务队列**仍按原样跳过禁用账号**——若也需要，请另行提出。
+> 该开关覆盖调度器的上述四类保号任务，连登管家也随签到使用该开关；猫猫旅行、夜猫子与成长任务队列仍跳过禁用账号。
 
 #### 暂停选号（账号级 `paused`，无需配置）
 
@@ -646,7 +647,8 @@ http://127.0.0.1:7863/panel/
 | **账号池** | 统计条（账号总数 / 可用 / 冷却中 / 已禁用 / 积分剩余·总额 / 粘性会话）+ 账号表：健康色条与状态标签（可用 / 限流冷却 / 积分冷却 / 熔断 / 连败降权 / 已禁用）、积分量条、成功·失败计数、在途、最近一次用量（次数 / token / 延迟 / 速率）、最近成功时间；单号操作 签到 / 余额 / 任务 / 设置（备注与调度权重）/ 解冻 / 禁用 / 移除；批量「全部启用」「全部禁用」「全部签到」「旅行巡检」「活跃上报」「全部保活」；支持按昵称 / uid / 备注搜索与按权重排序，缺少 accessToken 或 refreshToken 的账号标「凭证不全」。备注最多 200 字符、只做展示；权重 1 = 不干预，2-100 按比例优先接单，均随 auth 文件持久化。下方**模型锁池**表列出被上游按模型限流的模型（整池不可用 / 没号可用 / 部分限流）、可选与总数、锁定账号数、最早解锁与全池解锁倒计时、限流原因，无锁定时显示「所有模型均可选」 |
 | **用量** | 指标卡（请求数 / 总 token / prompt / completion / 失败尝试 / 平均延迟，含占比与吐字速率）+ **Token 时序图**（渐变堆叠柱、均值参考线、峰值标注、悬停看单桶明细）+ **今日剩余额度**（账号 / 模型两维，按本地自然日零点重置；限额 0 显示「未启用」，快照缺失显示「用量未知」，不伪造 0）+ **用量明细**（按账号 / 按模型 / 按域切换，可按合计 Token / 请求数 / 失败数 / 平均延迟排序，含 prompt·completion 占比条）+ **积分扣除历史**（按账号 / 按模型，折算「积分 / 1M Token」） |
 | **积分构成** | **积分到期分布**（按批次到期日聚合，颜色区分账号）+ **账号对比**（按来源归并的面额 / 余额 / 包数卡片与混合构成条）+ 逐包明细（按到期日排序，默认展开最近到期的 `panel.package_detail_limit` 个，其余与已用完的包折叠） |
-| **任务中心** | 成长任务队列：一键扫描全部账号待办 → 按账号排队执行（账号内串行，账号间可选并发 1-3），进度实时更新；另含开学季券码查询。详见 [任务中心](#-任务中心面板新视图) |
+| **任务与福利** | 按全部 / 单个国内账号执行签到、成长任务、旅行和连登，查看后台进度、逐账号结果、福利概览与成长任务队列。详见 [任务中心](#-任务中心面板新视图) |
+| **活动记录** | 查询签到、成长任务、连登、活跃、旅行和保活的持久化结果，支持任务、结果、昵称或说明、时间范围筛选；最多展示最近 1000 条，更多记录需缩小范围 |
 | **模型与档位** | 实时查询上游：每模型的积分倍率（含限时免费 / 夜间折扣等**生效价**与划线牌价）、默认思考档、支持的档位（含「off（可关）」）、上下文长度与最大输出；存在探测数据时最大输出列显示**实测上限与钳制告警**（见「探测模型真实输出上限」）。支持**按条件查询**：关键词（ID / 名称 / 描述 / 厂商 / 标签，空格分词 AND）、域（CN / Global）、能力（工具 / 视觉 / 思考 / 默认）、思考档位、价格（折扣 / 限时免费 / 打折），以及按倍率 / 上下文 / 最大输出 / ID 排序 |
 | **配置** | 在线编辑 config.json：服务（监听地址 / 管理密钥 / 单账号明细条数）、**客户端 API 密钥**（多 Key 的 ID / 名称 / 域 / 模型白名单 / 启停，密钥留空保持原值）、定时任务（签到 / 保活 / 旅行 / 活跃 / 成长任务五类时点与开关 + 余额刷新间隔）、账号池与流量治理、上游与高级（超时 / 出站 UA / 提示词模式 / 指纹脱敏 / 粘性路由）、日志（调用来源记录开关）；顶部支持按字段名 / 提示文案快速查找并标亮，保存栏实时提示未保存修改、已立即生效或仍需重启的字段 |
 | **运行日志** | **请求记录表**（时间 / 结果 / **Key ID** / 模型 / 账号 / **来源 IP** / **User-Agent** / 耗时 / Token / 积分 / 请求 ID），支持按 Key·IP·UA·模型·账号·请求 ID 与结果筛选、读取条数、时间范围；下方 **运行日志** 按「任务 / 对话 / 系统」分频道，可开关自动滚动 |
@@ -681,18 +683,18 @@ http://127.0.0.1:7863/panel/
 
 | 分组 | 端点 |
 |---|---|
-| 只读 | `GET overview` · `GET usage`（`hours` 或 `from`/`to`）· `GET usage/remaining`（本地自然日账号/模型额度）· `GET connect`（接入地址与脱敏示例）· `GET packages` · `GET credits/history`（扣减聚合）· `GET credits/grants`（积分包只读快照）· `GET models` · `GET model_probes` · `GET logs` · `GET request_metrics` · `GET request_logs`（`limit` / `outcome` / `account` / `model` / `client_ip` / `user_agent` / `from` / `to`）· `GET activity/history`（`uid` / `task` / `result` / `q` / `from` / `to` / `limit`）· `GET config` · `GET tasks/queue` · `GET school/vouchers` |
+| 只读 | `GET overview` · `GET usage`（`hours` 或 `from`/`to`）· `GET usage/remaining`（本地自然日账号/模型额度）· `GET connect`（接入地址与脱敏示例）· `GET packages` · `GET credits/history`（扣减聚合）· `GET credits/grants`（积分包只读快照）· `GET models` · `GET model_probes` · `GET logs` · `GET request_metrics` · `GET request_logs`（`limit` / `outcome` / `account` / `model` / `client_ip` / `user_agent` / `from` / `to`）· `GET activity/history`（`uid` / `task` / `result` / `q` / `from` / `to` / `limit`）· `GET config` · `GET tasks`（`focus` 短引用；含完整 `account_options` 与范围内汇总）· `GET benefits` · `GET benefits/batches` · `GET benefits/log` · `GET tasks/queue` · `GET school/vouchers` |
 | 账号运维 | `POST accounts/{uid}/checkin` · `balance` · `revive` · `disable` · `remove` · `profile`（`{weight:1-100,note}`，两个字段可只传其一）；`POST accounts/set_all`（`{enabled:true|false,uids:[...]}`，必须显式给出 UID，批量启用/禁用只作用于所选账号）；`POST checkin_all` · `travel_all` · `activity_all` · `keepalive_all` · `balance_all`；`GET accounts/export`（脱敏 CSV） |
-| 任务 | `GET accounts/{uid}/tasks`；`POST accounts/{uid}/tasks/accept` · `accept_all` · `claim` · `auto` · `auto_all`；`POST tasks/scan_all` · `tasks/run_queue` |
+| 任务 | `GET accounts/{uid}/tasks`；`POST accounts/{uid}/tasks/accept` · `accept_all` · `claim` · `auto` · `auto_all`；`POST tasks/scan_all` · `tasks/run_queue`；`POST tasks/run`（`{scope:"all",action:"checkin",async:true}` 返回 202；`scope` 可换为账号短引用，`action` 支持 checkin、tasks、travel、streak，使用 `GET benefits/batches` 轮询；省略 `async` 保持同步兼容） |
 | 添加账号 | `POST login/start` · `GET login/poll` · `GET login/regions` · `POST import/cockpit` |
 | 写入 | `POST config`（校验 → 落盘 → 热应用，返回需重启字段清单）· `POST usage/save`（立即把内存用量落盘） |
 
 账号运维操作均落到池既有入口（`Revive`/`Disable`/`Remove` 等），与 `/status` 观测口径一致。
 
-**活动记录**：签到、活跃、旅行、保活每次真实执行都会写入 `data/activity_history.jsonl`
+**活动记录**：签到、成长任务、连登、活跃、旅行、保活与国际每日活跃的执行结果写入 `data/activity_history.jsonl`
 （与 `state.json` 同目录），面板「活动记录」页可查看。文件默认保留 90 个自然日、上限
 16 MiB；只记录时间、账号标签、域、任务、触发来源、成功/失败和脱敏截断后的说明，
-不写 token、Cookie、API Key 或提示词。写失败只影响该条记录，不影响任务本身。
+不写 token、Cookie、API Key 或提示词。成长任务队列逐项记录，单账号一键执行记录汇总；已领取或未解锁的任务跳过。查询最多返回最近 1000 条命中记录，达到上限时请缩小时间范围。写失败只影响该条记录，不影响任务本身。
 
 **积分获取历史**：`GET credits/grants` 只读「积分构成」最近一次成功查询留下的内存快照，
 不会为了打开发放记录而逐账号回源；快照为空时返回 200 空数组并提示先刷新积分包。

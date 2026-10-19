@@ -2273,7 +2273,8 @@ const calls = [];
 const ctx = {
   document: {visibilityState: 'visible'},
   loginTimer: null, loginState: null,
-  queueTimer: 7, scanTimer: 9,
+  queueTimer: 7, scanTimer: 9, benefitsBatchTimer: 5, benefitsBatchSeq: 0,
+  clearTimeout: () => {},
   refreshVisible: () => calls.push('refresh'),
   stopQueuePolling: v => { calls.push('stopQueue:' + String(v)); ctx.queueTimer = null; },
   stopScanPolling: () => { calls.push('stopScan'); ctx.scanTimer = null; },
@@ -2828,7 +2829,7 @@ func TestAppJSBenefitsVirtualWindow(t *testing.T) {
 const vm = require('vm');
 const src = fs.readFileSync(process.argv[2], 'utf8');
 const start = src.indexOf('function benefitRealmLabel');
-const end = src.indexOf('function renderBenefitFocus', start);
+const end = src.indexOf('function benefitTaskStatus', start);
 if (start < 0 || end < 0 || end < start) throw new Error('benefits virtual region not found');
 const sink = id => ({ id, innerHTML: '', textContent: '', scrollTop: 0, clientHeight: 420, addEventListener() {}, querySelector() { return null; } });
 const nodes = {};
@@ -2892,6 +2893,7 @@ const make = focus => {
   const $ = id => nodes[id] || mk(id);
   const c = {
     $, esc: s => String(s == null ? '' : s), fmtTok: v => String(v == null ? 0 : v),
+    lastBenefits: null, benefitsSubmitting: false, benefitsRuns: [],
     benefitsFocusRef: focus, benefitsTaskRows: [], benefitsTaskData: null, benefitsLogFilter: {task: '', result: '', ref: ''},
     benefitTaskStatus: () => '', AUTO_TASKS: {},
   };
@@ -2952,6 +2954,7 @@ const $ = id => nodes[id] || mk(id);
 const ctx = {
   $, esc: s => String(s == null ? '' : s),
   benefitsTime: v => String(v || '').slice(0, 16),
+  ACT_TASK_LABEL: {checkin: '签到', travel: '猫猫旅行'},
 };
 vm.createContext(ctx);
 vm.runInContext(src.slice(start, end) + '\nthis.renderBenefitLog=renderBenefitLog;', ctx);
@@ -2998,7 +3001,7 @@ const start = src.indexOf('function benefitsVirtualWindow');
 const end = src.indexOf('async function loadBenefits', start);
 if (start < 0 || end < 0 || end < start) throw new Error('benefits render region not found');
 const nodes = {};
-const mk = id => (nodes[id] = { id, innerHTML: '', textContent: '', hidden: false, scrollTop: 0, clientHeight: 420, addEventListener() {}, querySelector() { return null; } });
+const mk = id => (nodes[id] = { id, innerHTML: '', textContent: '', hidden: false, scrollTop: 0, clientHeight: 420, addEventListener() {}, querySelector() { return null; }, querySelectorAll() { return []; } });
 const missing = [];
 const ctx = {
   $: id => nodes[id] || null,
@@ -3006,7 +3009,8 @@ const ctx = {
   setText: (id, v) => { if (!nodes[id]) { missing.push(id); return false; } nodes[id].textContent = v; return true; },
   noteUsageDomMismatch: id => missing.push(id),
   benefitsBusy: new Set(), benefitsRows: [], benefitsRowH: 56,
-  benefitsVirtualBound: true, benefitsBatchSeq: 0, benefitsBatchTimer: null,
+  benefitsVirtualBound: true, benefitsBatchSeq: 0, benefitsBatchTimer: null, benefitsLogSeq: 0,
+  document: {visibilityState: 'visible'}, benefitsRuns: [], syncTaskActionBusy() {},
   api: () => Promise.resolve({runs: []}), view: 'taskscenter', setTimeout,
   benefitsFocusRef: '', benefitsTaskRows: [], benefitsFocusLast: null,
   benefitsBatchDoneSig: '', AUTO_TASKS: {},
@@ -3062,13 +3066,14 @@ const start = src.indexOf('function benefitsVirtualWindow');
 const end = src.indexOf('async function loadBenefits', start);
 if (start < 0 || end < 0 || end < start) throw new Error('benefits render region not found');
 const nodes = {};
-const mk = id => (nodes[id] = { id, innerHTML: '', textContent: '', hidden: false, scrollTop: 0, clientHeight: 420, addEventListener() {}, querySelector() { return null; } });
+const mk = id => (nodes[id] = { id, innerHTML: '', textContent: '', hidden: false, scrollTop: 0, clientHeight: 420, addEventListener() {}, querySelector() { return null; }, querySelectorAll() { return []; } });
 const $ = id => nodes[id] || mk(id);
 const ctx = {
   $, esc: s => String(s == null ? '' : s), fmtTok: v => String(v == null ? 0 : v),
   setText: (id, v) => { $(id).textContent = v; }, benefitsBusy: new Set(),
   benefitsRows: [], benefitsRowH: 56, benefitsVirtualBound: false,
-  benefitsBatchSeq: 0, benefitsBatchTimer: null,
+  benefitsBatchSeq: 0, benefitsBatchTimer: null, benefitsLogSeq: 0,
+  document: {visibilityState: 'visible'}, benefitsRuns: [], syncTaskActionBusy() {},
   api: () => Promise.resolve({runs: []}), view: 'taskscenter', setTimeout,
   benefitsFocusRef: '', benefitsTaskRows: [], benefitsFocusLast: null,
   benefitsBatchDoneSig: '', AUTO_TASKS: {},
@@ -3207,9 +3212,10 @@ const start = src.indexOf('function renderBenefitBatches');
 const end = src.indexOf('async function loadBenefitBatches', start);
 if (start < 0 || end < 0 || end < start) throw new Error('benefit batch region not found');
 const nodes = {};
-const mk = id => (nodes[id] = { id, innerHTML: '', textContent: '' });
+const mk = id => (nodes[id] = { id, innerHTML: '', textContent: '', querySelectorAll: () => [] });
 const $ = id => nodes[id] || mk(id);
 const ctx = {
+  syncTaskActionBusy() {}, benefitsRuns: [],
   $, esc: s => String(s == null ? '' : s), benefitsTime: v => String(v == null ? '' : v),
   Math, Number, String, Array, Object, BENEFIT_BATCH_LABELS: {checkin: '全部签到', streak: '连登与抽奖'},
 };

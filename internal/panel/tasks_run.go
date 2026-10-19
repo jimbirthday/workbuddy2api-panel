@@ -3,11 +3,13 @@ package panel
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
+	"log"
 	"net/http"
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/activity"
@@ -84,23 +86,31 @@ func (p *Panel) tasksOverview(w http.ResponseWriter, r *http.Request) {
 	}
 
 	accounts := make([]tasksAccount, 0, len(statuses))
+	options := make([]tasksAccount, 0, len(statuses))
 	for _, st := range statuses {
 		if st.Enterprise || st.Disabled || st.Realm != "cn" {
 			continue
 		}
-		if !all && st.UID != focusUID {
-			continue
-		}
-		accounts = append(accounts, tasksAccount{
+		account := tasksAccount{
 			UID: statusUID8(st.UID), Ref: benefitRefFor(st.UID),
 			Nickname: st.Nickname, Realm: st.Realm,
-		})
+		}
+		options = append(options, account)
+		if all || st.UID == focusUID {
+			accounts = append(accounts, account)
+		}
 	}
 	sort.SliceStable(accounts, func(i, j int) bool {
 		if accounts[i].Nickname != accounts[j].Nickname {
 			return accounts[i].Nickname < accounts[j].Nickname
 		}
 		return accounts[i].UID < accounts[j].UID
+	})
+	sort.SliceStable(options, func(i, j int) bool {
+		if options[i].Nickname != options[j].Nickname {
+			return options[i].Nickname < options[j].Nickname
+		}
+		return options[i].UID < options[j].UID
 	})
 
 	taskRows := []upstream.Task{}
@@ -118,7 +128,7 @@ func (p *Panel) tasksOverview(w http.ResponseWriter, r *http.Request) {
 			} else {
 				growth = p.growthResult(r.Context(), a)
 			}
-			taskRows = growth.Tasks
+			taskRows = append(taskRows, growth.Tasks...)
 			taskErr = growth.TasksErr
 		}
 	}
@@ -126,6 +136,9 @@ func (p *Panel) tasksOverview(w http.ResponseWriter, r *http.Request) {
 	summary := tasksSummary{Accounts: len(accounts)}
 	for _, st := range statuses {
 		if st.Realm != "cn" || st.Enterprise || st.Disabled {
+			continue
+		}
+		if !all && st.UID != focusUID {
 			continue
 		}
 		if st.CheckinDone {
@@ -155,6 +168,7 @@ func (p *Panel) tasksOverview(w http.ResponseWriter, r *http.Request) {
 		"ok":              true,
 		"focus":           focus,
 		"accounts":        accounts,
+		"account_options": options,
 		"summary":         summary,
 		"tasks":           taskRows,
 		"tasks_error":     taskErr,
@@ -171,6 +185,7 @@ type tasksRunRequest struct {
 	Ref         string `json:"ref"`
 	Action      string `json:"action"`
 	Concurrency int    `json:"concurrency"`
+	Async       bool   `json:"async"`
 }
 
 // tasksRun is the Hub-shaped synchronous action endpoint. One request can run
@@ -183,7 +198,11 @@ func (p *Panel) tasksRun(w http.ResponseWriter, r *http.Request) {
 	}
 	var req tasksRunRequest
 	if r.Body != nil {
-		_ = json.NewDecoder(r.Body).Decode(&req)
+		decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
+		if err := decoder.Decode(&req); err != nil || decoder.Decode(&struct{}{}) != io.EOF {
+			writeErr(w, http.StatusBadRequest, "invalid task request")
+			return
+		}
 	}
 	selector := strings.TrimSpace(req.Ref)
 	if selector == "" {
@@ -212,6 +231,10 @@ func (p *Panel) tasksRun(w http.ResponseWriter, r *http.Request) {
 			"ok": true, "action": action, "accounts_count": 0,
 			"results": []tasksRunResult{}, "logs": []string{"没有可执行的账号"},
 		})
+		return
+	}
+	if req.Async {
+		p.startTaskRun(w, targets, action, selector, req.Concurrency)
 		return
 	}
 
@@ -283,33 +306,92 @@ func (p *Panel) taskTargets(selector string) ([]*auth.Auth, string) {
 }
 
 func (p *Panel) runTaskTargets(ctx context.Context, targets []*auth.Auth, action string, concurrency int) []tasksRunResult {
+	return p.runTaskTargetsProgress(ctx, targets, action, concurrency, nil)
+}
+
+func (p *Panel) runTaskTargetsProgress(ctx context.Context, targets []*auth.Auth, action string, concurrency int, progress func(tasksRunResult)) []tasksRunResult {
 	if concurrency < 1 {
 		concurrency = 1
 	}
 	if concurrency > 4 {
 		concurrency = 4
 	}
-	sem := make(chan struct{}, concurrency)
-	var wg sync.WaitGroup
 	results := make([]tasksRunResult, len(targets))
-	for i, a := range targets {
-		wg.Add(1)
-		go func(idx int, acct *auth.Auth) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-			results[idx] = p.runTaskTarget(ctx, acct, action)
-		}(i, a)
-	}
-	wg.Wait()
+	runBounded(concurrency, len(targets), func(i int) {
+		results[i] = p.runTaskTarget(ctx, targets[i], action)
+		if progress != nil {
+			progress(results[i])
+		}
+	})
 	return results
 }
 
-func (p *Panel) runTaskTarget(ctx context.Context, a *auth.Auth, action string) tasksRunResult {
-	out := tasksRunResult{
+// startTaskRun returns immediately and publishes account outcomes through the
+// existing batch endpoint. A browser disconnect never cancels accepted work.
+func (p *Panel) startTaskRun(w http.ResponseWriter, targets []*auth.Auth, action, scope string, concurrency int) {
+	if scope == "" || strings.EqualFold(scope, "all") {
+		scope = "all"
+	} else {
+		scope = benefitRefFor(targets[0].UID)
+	}
+	kind := "tasks_" + action
+	run := &batchRun{Kind: kind, StartedAt: time.Now(), Running: true, Total: len(targets), Scope: scope}
+	p.batchMu.Lock()
+	if current := p.batchRuns[kind]; current != nil && current.Running {
+		p.batchMu.Unlock()
+		writeErr(w, http.StatusConflict, "该动作正在执行，请查看执行进度")
+		return
+	}
+	if p.batchRuns == nil {
+		p.batchRuns = make(map[string]*batchRun)
+	}
+	p.batchRuns[kind] = run
+	p.batchMu.Unlock()
+	if !p.GoBackground(func() {
+		defer func() {
+			p.batchMu.Lock()
+			if v := recover(); v != nil {
+				log.Printf("panel: 后台任务执行异常: %v", v)
+				run.Note = "执行异常，请查看运行日志"
+			}
+			run.Running, run.Done = false, true
+			p.batchMu.Unlock()
+			p.invalidateBenefitsGrowth()
+			p.invalidateOverview()
+		}()
+		p.runTaskTargetsProgress(context.Background(), targets, action, concurrency, func(result tasksRunResult) {
+			p.batchMu.Lock()
+			run.Results = append(run.Results, result)
+			if result.OK {
+				run.OK++
+			} else {
+				run.Failed++
+			}
+			p.batchMu.Unlock()
+		})
+	}) {
+		p.batchMu.Lock()
+		delete(p.batchRuns, kind)
+		p.batchMu.Unlock()
+		writeErr(w, http.StatusServiceUnavailable, "server shutting down")
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{"ok": true, "started": true, "kind": kind, "accounts_count": len(targets)})
+}
+
+func (p *Panel) runTaskTarget(ctx context.Context, a *auth.Auth, action string) (out tasksRunResult) {
+	out = tasksRunResult{
 		Ref: benefitRefFor(a.UID), UID: statusUID8(a.UID),
 		Nickname: a.Nickname, Realm: a.Realm(), Action: action,
 	}
+	defer func() {
+		if v := recover(); v != nil {
+			log.Printf("panel: 任务执行异常: %v", v)
+			out.OK, out.Message = false, "执行异常，请查看运行日志"
+		}
+		p.invalidateBenefitsGrowth()
+		p.invalidateOverview()
+	}()
 	if ctx.Err() != nil {
 		out.Message = "已取消"
 		return out
@@ -320,34 +402,15 @@ func (p *Panel) runTaskTarget(ctx context.Context, a *auth.Auth, action string) 
 	}
 	defer p.unlockAccount(a.UID)
 	// The task page's execution log is backed by the durable activity store.
-	// Record the three actions that already have activity task types; growth
-	// tasks stay in the per-account result log because adding a new persisted
-	// task enum would break old readers.
+	// Scheduler actions write their own detailed history; never append a second
+	// synthetic success that could hide their actual outcome.
 	record := func(task activity.Task, ok bool, message string) {
-		if p.cfg.Activity == nil {
-			return
-		}
-		_ = p.cfg.Activity.Append(activity.Record{
-			UID: a.UID, Nickname: a.Nickname, Realm: a.Realm(),
-			Task: task, Trigger: activity.TriggerManual, OK: ok, Message: message,
-		})
+		p.recordManualActivity(a, task, ok, message)
 	}
 
 	switch action {
 	case "checkin":
-		if err := p.cfg.Upstream.DailyCheckin(a); err != nil {
-			if upstream.IsAlreadyCheckin(err) {
-				p.cfg.Pool.NoteCheckinDone(a.UID)
-				out.OK, out.Message = true, "今天已签到"
-			} else {
-				out.Message = err.Error()
-			}
-			record(activity.TaskCheckin, out.OK, out.Message)
-			return out
-		}
-		p.cfg.Pool.NoteCheckinDone(a.UID)
-		out.OK, out.Message = true, "签到成功"
-		record(activity.TaskCheckin, true, out.Message)
+		out.OK, out.Message = p.checkinAccount(a)
 	case "travel":
 		if p.cfg.Scheduler == nil {
 			out.Message = "scheduler unavailable"
@@ -356,31 +419,39 @@ func (p *Panel) runTaskTarget(ctx context.Context, a *auth.Auth, action string) 
 		}
 		if err := p.cfg.Scheduler.RunTravelFor(a); err != nil {
 			out.Message = err.Error()
-			record(activity.TaskTravel, false, out.Message)
 			return out
 		}
 		out.OK, out.Message = true, "旅行巡检完成"
-		record(activity.TaskTravel, true, out.Message)
 	case "streak":
 		if p.cfg.Scheduler == nil {
 			out.Message = "scheduler unavailable"
-			record(activity.TaskActivity, false, out.Message)
+			record(activity.TaskStreak, false, out.Message)
 			return out
 		}
 		if err := p.cfg.Scheduler.RunStreakBonusFor(a, activity.TriggerManual); err != nil {
 			out.Message = err.Error()
-			record(activity.TaskActivity, false, out.Message)
 			return out
 		}
 		out.OK, out.Message = true, "连登兑换与抽奖完成"
-		record(activity.TaskActivity, true, out.Message)
 	default:
 		items := p.runAutoAll(a)
 		okCount, failCount := 0, 0
+		firstError := ""
 		for _, item := range items {
+			if firstError == "" {
+				if err, ok := item["claim_error"]; ok {
+					firstError = fmt.Sprint(item["task_code"], "：", err)
+				} else if item["status"] == "error" {
+					firstError = fmt.Sprint(item["task_code"], "：", item["message"])
+				}
+			}
 			switch item["status"] {
 			case "done":
-				okCount++
+				if item["claim_error"] != nil {
+					failCount++
+				} else {
+					okCount++
+				}
 			case "error":
 				failCount++
 			}
@@ -388,8 +459,25 @@ func (p *Panel) runTaskTarget(ctx context.Context, a *auth.Auth, action string) 
 		out.OK = failCount == 0
 		out.Message = "完成 " + strconv.Itoa(okCount) + " 项"
 		if failCount > 0 {
-			out.Message += "，失败 " + strconv.Itoa(failCount) + " 项"
+			out.Message += "，失败 " + strconv.Itoa(failCount) + " 项；" + firstError
 		}
 	}
 	return out
+}
+
+// checkinAccount is shared by both panel entry points so their pool state and
+// activity outcome cannot disagree. Balance refresh remains the caller's choice.
+func (p *Panel) checkinAccount(a *auth.Auth) (bool, string) {
+	err := p.cfg.Upstream.DailyCheckin(a)
+	ok, message := true, "签到成功"
+	if upstream.IsAlreadyCheckin(err) {
+		message = "今天已签到"
+	} else if err != nil {
+		ok, message = false, err.Error()
+	}
+	if ok {
+		p.cfg.Pool.NoteCheckinDone(a.UID)
+	}
+	p.recordManualActivity(a, activity.TaskCheckin, ok, message)
+	return ok, message
 }

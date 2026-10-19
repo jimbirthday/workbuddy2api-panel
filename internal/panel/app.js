@@ -5721,27 +5721,52 @@ async function loadBenefitLog() {
   }
 }
 
+
+// renderWelfareSummary puts the welfare totals into the current Hub-style
+// task page. The old summary cards are gone, so their ids must not be probed
+// as if the page were stale.
+function renderWelfareSummary(s) {
+  const note = $('bfActionNote');
+  if (!note) return;
+  const bits = [
+    '账号 ' + (s.accounts || 0),
+    '今日签到 ' + (s.checkin_done || 0) + ' / ' + ((s.checkin_done || 0) + (s.checkin_pending || 0)),
+  ];
+  if (s.welfare_grants_available) {
+    bits.push('福利积分 +' + fmtTok(s.welfare_credits_total || 0));
+    bits.push((s.welfare_grant_count || 0) + ' 笔发放');
+  } else {
+    bits.push('福利积分未刷新');
+  }
+  note.textContent = bits.join(' · ');
+}
+
 function renderBenefits(d) {
   lastBenefits = d || {};
   const s = (d && d.summary) || {};
-  // These ids are absent on the Hub-style task page, but older embedded
-  // frontends still call renderBenefits with the summary cards. setText is a
-  // no-op when the node is missing; keep the contract for compatibility.
-  setText('bfAccounts', String(s.accounts || 0));
-  setText('bfAccountsSub', '国内 ' + (s.cn || 0) + ' / 国际 ' + (s.global || 0) + (s.enterprise ? ' · 企业 ' + s.enterprise : ''));
-  setText('bfCheckinDone', String(s.checkin_done || 0));
-  setText('bfCheckinSub', '待签到 ' + (s.checkin_pending || 0));
-  setText('bfDailyChatDone', String(s.daily_chat_done || 0));
-  setText('bfDailyChatSub', '待活跃 ' + (s.daily_chat_pending || 0));
-  setText('bfGrowthPending', String(s.growth_pending || 0));
-  setText('bfGrowthSub', s.growth_running ? '队列执行中' : (s.growth_done || s.growth_failed ? '完成 ' + (s.growth_done || 0) + ' · 失败 ' + (s.growth_failed || 0) : '扫描后更新'));
-  setText('bfTodayFailed', String(s.today_failed || 0));
-  setText('bfLastActivity', s.last_activity_at ? '最近 ' + benefitsTime(s.last_activity_at) : '最近活动 —');
-  setText('bfWelfareCredits', s.welfare_grants_available ? '+' + fmtTok(s.welfare_credits_total || 0) : '-');
-  setText('bfWelfareSub', s.welfare_grants_available
-    ? (s.welfare_grant_count || 0) + ' 笔福利发放'
-    : '先刷新积分包快照');
+  // The Hub-style task page no longer has the old summary cards. Only update
+  // them when an older embedded skeleton actually provides them; calling
+  // setText unconditionally makes a correct new page report a stale-version
+  // error for every removed card.
+  const legacyCards = {
+    bfAccounts: String(s.accounts || 0),
+    bfAccountsSub: '国内 ' + (s.cn || 0) + ' / 国际 ' + (s.global || 0) + (s.enterprise ? ' · 企业 ' + s.enterprise : ''),
+    bfCheckinDone: String(s.checkin_done || 0),
+    bfCheckinSub: '待签到 ' + (s.checkin_pending || 0),
+    bfDailyChatDone: String(s.daily_chat_done || 0),
+    bfDailyChatSub: '待活跃 ' + (s.daily_chat_pending || 0),
+    bfGrowthPending: String(s.growth_pending || 0),
+    bfGrowthSub: s.growth_running ? '队列执行中' : (s.growth_done || s.growth_failed ? '完成 ' + (s.growth_done || 0) + ' · 失败 ' + (s.growth_failed || 0) : '扫描后更新'),
+    bfTodayFailed: String(s.today_failed || 0),
+    bfLastActivity: s.last_activity_at ? '最近 ' + benefitsTime(s.last_activity_at) : '最近活动 —',
+    bfWelfareCredits: s.welfare_grants_available ? '+' + fmtTok(s.welfare_credits_total || 0) : '-',
+    bfWelfareSub: s.welfare_grants_available ? (s.welfare_grant_count || 0) + ' 笔福利发放' : '先刷新积分包快照',
+  };
+  Object.keys(legacyCards).forEach(id => {
+    if ($(id)) setText(id, legacyCards[id]);
+  });
   renderBenefitGrants(d && d.recent_grants, s);
+  renderWelfareSummary(s);
   // The task page is served by /tasks; keep the legacy renderer only for the
   // account welfare table so its virtual-window state remains compatible.
   renderBenefitsAccounts(d && d.accounts);

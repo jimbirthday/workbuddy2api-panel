@@ -2881,6 +2881,71 @@ process.stdout.write(JSON.stringify({
 	}
 }
 
+// TestAppJSBenefitsDoesNotProbeRemovedSummaryCards 新版 Hub 式任务页已经删掉
+// 旧统计卡。renderBenefits 不能在正确的新页面上探测这些 id，否则会误报
+// “页面版本与脚本不一致”；旧骨架存在时仍应兼容更新。
+func TestAppJSBenefitsDoesNotProbeRemovedSummaryCards(t *testing.T) {
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('function benefitsVirtualWindow');
+const end = src.indexOf('async function loadBenefits', start);
+if (start < 0 || end < 0 || end < start) throw new Error('benefits render region not found');
+const nodes = {};
+const mk = id => (nodes[id] = { id, innerHTML: '', textContent: '', hidden: false, scrollTop: 0, clientHeight: 420, addEventListener() {}, querySelector() { return null; } });
+const missing = [];
+const ctx = {
+  $: id => nodes[id] || null,
+  esc: s => String(s == null ? '' : s), fmtTok: v => String(v == null ? 0 : v),
+  setText: (id, v) => { if (!nodes[id]) { missing.push(id); return false; } nodes[id].textContent = v; return true; },
+  noteUsageDomMismatch: id => missing.push(id),
+  benefitsBusy: new Set(), benefitsRows: [], benefitsRowH: 56,
+  benefitsVirtualBound: true, benefitsBatchSeq: 0, benefitsBatchTimer: null,
+  api: () => Promise.resolve({runs: []}), view: 'taskscenter', setTimeout,
+  benefitsFocusRef: '', benefitsTaskRows: [], benefitsFocusLast: null,
+  benefitsBatchDoneSig: '', AUTO_TASKS: {},
+  window: { matchMedia: () => ({ matches: false }) },
+  Math, Number, String, Array, Object, Date, isNaN,
+};
+mk('bfActionNote'); mk('bfGrantsBody');
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, end) + '\nthis.renderBenefits=renderBenefits;', ctx);
+ctx.renderBenefits({
+  summary: {accounts: 3, checkin_done: 2, checkin_pending: 1, welfare_grants_available: true, welfare_credits_total: 80, welfare_grant_count: 2},
+  accounts: [], recent_grants: [],
+});
+const current = { note: nodes.bfActionNote.textContent, missing: missing.slice() };
+mk('bfAccounts'); mk('bfWelfareCredits'); mk('bfWelfareSub');
+ctx.renderBenefits({summary: {accounts: 1, welfare_grants_available: true, welfare_credits_total: 80, welfare_grant_count: 2}, accounts: [], recent_grants: []});
+process.stdout.write(JSON.stringify({
+  current,
+  legacy: { total: nodes.bfWelfareCredits.textContent, sub: nodes.bfWelfareSub.textContent },
+}));`
+	out := runNodeScript(t, "benefits-removed-cards", script, appJSPath(t))
+	var got struct {
+		Current struct {
+			Note    string   `json:"note"`
+			Missing []string `json:"missing"`
+		} `json:"current"`
+		Legacy struct {
+			Total string `json:"total"`
+			Sub   string `json:"sub"`
+		} `json:"legacy"`
+	}
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("decode: %v (%s)", err, out)
+	}
+	if len(got.Current.Missing) != 0 {
+		t.Fatalf("new task page must not probe removed cards: %v", got.Current.Missing)
+	}
+	if !strings.Contains(got.Current.Note, "福利积分 +80") {
+		t.Fatalf("current page summary=%q", got.Current.Note)
+	}
+	if got.Legacy.Total != "+80" || got.Legacy.Sub != "2 笔福利发放" {
+		t.Fatalf("legacy card fallback=%+v", got.Legacy)
+	}
+}
+
 // TestAppJSBenefitsWelfareSummary 福利总积分/发放记录必须用 summary 的可用标记
 // 区分“尚未刷新快照”和“确实为 0”，并把最近记录按时间展示。
 func TestAppJSBenefitsWelfareSummary(t *testing.T) {

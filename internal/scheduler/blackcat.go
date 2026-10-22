@@ -3,6 +3,7 @@
 package scheduler
 
 import (
+	"context"
 	"log"
 	"time"
 
@@ -20,6 +21,13 @@ var nowForNightWindow = time.Now
 // RunBlackcatNow 对所有可用账号执行夜猫子对话补足（窗口外跳过）。
 // 由 blackcat_hours 排程（默认 [23]）触发；执行前二次校验 InNightWindow。
 func (s *Scheduler) RunBlackcatNow() {
+	s.runBlackcat(context.Background())
+}
+
+// runBlackcat 是 RunBlackcatNow 的 ctx 版本：夜猫子逐号跑真实模型对话（每条间隔
+// 4s），470 号的全量轮次可达数十分钟。此前账号间用 time.Sleep，停机时要等整轮
+// 限速睡完；现在 ctx 取消即放弃剩余账号（已完成的对话不受影响，任务按天幂等）。
+func (s *Scheduler) runBlackcat(ctx context.Context) {
 	if !upstream.InNightWindow(nowForNightWindow()) {
 		log.Printf("blackcat: 当前不在 23:00–08:00 计数窗口，跳过")
 		return
@@ -43,7 +51,7 @@ func (s *Scheduler) RunBlackcatNow() {
 		}
 		need, err := s.cfg.Upstream.BlackcatNeed(a)
 		if err != nil {
-			log.Printf("blackcat %s: %v", logfmt.Label(a.UID, a.Nickname), err)
+			log.Printf("blackcat %s: %v", logfmt.Label(a.UID, a.NicknameValue()), err)
 			continue
 		}
 		if need <= 0 {
@@ -51,10 +59,12 @@ func (s *Scheduler) RunBlackcatNow() {
 		}
 		ok, err := s.cfg.Upstream.RunNightChats(a, int(need))
 		if err != nil {
-			log.Printf("blackcat %s: %d/%d 完成，中断: %v", logfmt.Label(a.UID, a.Nickname), ok, need, err)
+			log.Printf("blackcat %s: %d/%d 完成，中断: %v", logfmt.Label(a.UID, a.NicknameValue()), ok, need, err)
 			continue
 		}
-		log.Printf("blackcat %s: 完成 %d 次夜间对话", logfmt.Label(a.UID, a.Nickname), ok)
-		time.Sleep(activityAccountDelay)
+		log.Printf("blackcat %s: 完成 %d 次夜间对话", logfmt.Label(a.UID, a.NicknameValue()), ok)
+		if !sleepCtx(ctx, activityAccountDelay) {
+			return // 优雅停机
+		}
 	}
 }

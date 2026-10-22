@@ -449,3 +449,64 @@ func TestExtractKeyFromObjectMatchesBody(t *testing.T) {
 		}
 	}
 }
+
+// TestExtractKeyRejectsOversizedSessionKey 钉住会话键长度上限：MB 级
+// conversation_id / prompt_cache_key 曾经会原样成为内存 map key 与 Redis key
+// （单条绑定占数 MB，且哈希与镜像在全局锁/写队列里放大）。超限必须视为
+// 「无会话键」回落轮换，而不是截断——截断会让不同超长键碰撞到同一粘性槽位。
+func TestExtractKeyRejectsOversizedSessionKey(t *testing.T) {
+	huge := strings.Repeat("x", 4<<20) // 4 MiB，与 issue 报告的量级一致
+	justOver := strings.Repeat("y", MaxSessionKeyBytes+1)
+	atLimit := strings.Repeat("z", MaxSessionKeyBytes)
+
+	cases := []struct {
+		name string
+		body string
+		want string
+	}{
+		{"顶层 conversation_id 超限", `{"conversation_id":"` + huge + `"}`, ""},
+		{"metadata.conversation_id 超限", `{"metadata":{"conversation_id":"` + huge + `"}}`, ""},
+		{"prompt_cache_key 超限", `{"prompt_cache_key":"` + huge + `"}`, ""},
+		{"超限一字节即丢弃", `{"conversation_id":"` + justOver + `"}`, ""},
+		// 边界：正好等于上限仍可用（真实会话 id 远小于此）。
+		{"正好等于上限", `{"conversation_id":"` + atLimit + `"}`, atLimit},
+		// 超长键被丢弃后必须继续尝试下一个候选，而不是直接返回空。
+		{"超长 metadata 键回落到合法顶层键", `{"metadata":{"conversation_id":"` + huge + `"},"conversation_id":"ok"}`, "ok"},
+	}
+	for _, c := range cases {
+		if got := ExtractKey([]byte(c.body)); got != c.want {
+			if c.want == "" {
+				t.Errorf("%s: ExtractKey returned %d bytes, want empty", c.name, len(got))
+				continue
+			}
+			t.Errorf("%s: ExtractKey mismatch", c.name)
+		}
+	}
+}
+
+// TestExtractKeyOversizedDoesNotCreateEntry 超长键不得进入路由表、也不得产生
+// Redis 镜像写：handler 的契约是「ExtractKey 返回空串 → 走普通 Pick，不调
+// Resolve」，所以这里直接断言 extract 结果为空且零 Store 调用。
+// 若将来有人把 clamp 去掉（改成原样返回 4 MiB），本测试会先报长度而非等 OOM。
+func TestExtractKeyOversizedDoesNotCreateEntry(t *testing.T) {
+	st := newCountingStore()
+	r := routerWith(st, []string{"a1"}, time.Hour)
+	key := ExtractKey([]byte(`{"conversation_id":"` + strings.Repeat("q", 8<<20) + `"}`))
+	if key != "" {
+		t.Fatalf("oversized key not rejected: %d bytes", len(key))
+	}
+	// 契约：空键 = 不粘性。handler 见空串直接走普通 Pick，不会调 Resolve；
+	// 这里据此断言「没有因为这条超长键产生任何绑定/镜像」。
+	st.mu.Lock()
+	setBinds := st.setBinds
+	st.mu.Unlock()
+	if setBinds != 0 {
+		t.Fatalf("setBinds=%d want 0 (oversized key must not be mirrored)", setBinds)
+	}
+	r.mu.Lock()
+	n := len(r.entries)
+	r.mu.Unlock()
+	if n != 0 {
+		t.Fatalf("entries=%d want 0", n)
+	}
+}

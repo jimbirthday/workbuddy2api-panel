@@ -99,7 +99,7 @@ func (s *Scheduler) dailyChatOne(a *auth.Auth, trigger activity.Trigger) (bool, 
 		if len(respBody) > 0 {
 			msg = strings.TrimSpace(string(respBody))
 		}
-		log.Printf("daily-chat %s: desktop leg failed: %v", logfmt.Label(a.UID, a.Nickname), err)
+		log.Printf("daily-chat %s: desktop leg failed: %v", logfmt.Label(a.UID, a.NicknameValue()), err)
 		msg = "桌面通道失败：" + msg + webNote
 		s.recordActivity(a, activity.TaskDailyChat, trigger, false, msg)
 		return false, msg
@@ -114,18 +114,18 @@ func (s *Scheduler) dailyChatOne(a *auth.Auth, trigger activity.Trigger) (bool, 
 		if msg == "" {
 			msg = fmt.Sprintf("upstream HTTP %d", status)
 		}
-		log.Printf("daily-chat %s: desktop leg HTTP %d", logfmt.Label(a.UID, a.Nickname), status)
+		log.Printf("daily-chat %s: desktop leg HTTP %d", logfmt.Label(a.UID, a.NicknameValue()), status)
 		msg = "桌面通道失败：" + msg + webNote
 		s.recordActivity(a, activity.TaskDailyChat, trigger, false, msg)
 		return false, msg
 	}
 	if !web.OK {
-		log.Printf("daily-chat %s: web leg failed: %s", logfmt.Label(a.UID, a.Nickname), web.Error)
+		log.Printf("daily-chat %s: web leg failed: %s", logfmt.Label(a.UID, a.NicknameValue()), web.Error)
 		msg := "每日活跃未完成" + webNote
 		s.recordActivity(a, activity.TaskDailyChat, trigger, false, msg)
 		return false, msg
 	}
-	log.Printf("daily-chat %s: ok (desktop+web)", logfmt.Label(a.UID, a.Nickname))
+	log.Printf("daily-chat %s: ok (desktop+web)", logfmt.Label(a.UID, a.NicknameValue()))
 	msg := "每日活跃完成" + webNote
 	s.recordActivity(a, activity.TaskDailyChat, trigger, true, msg)
 	return true, msg

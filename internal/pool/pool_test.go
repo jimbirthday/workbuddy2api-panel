@@ -2139,3 +2139,48 @@ func TestResumeIdempotent(t *testing.T) {
 		t.Errorf("Paused 应仍为 false: %+v", st)
 	}
 }
+
+// TestUpsertKeepsRefreshedTokenOverStaleExport 同一 UID 被一份更旧的导出文件
+// 重新 upsert 时，不能把运行期 refresh 出来的新 token 覆盖回旧 token。
+// 旧行为是无条件 e.a = a：下次请求直接 401，而旧 refresh token 通常已被
+// rotate 失效，只能重新登录。
+func TestUpsertKeepsRefreshedTokenOverStaleExport(t *testing.T) {
+	p := New("")
+	now := time.Now().Unix()
+	fresh := &auth.Auth{UID: "u1", AccessToken: "fresh-at", RefreshToken: "fresh-rt", ExpiresAt: now + 3600}
+	p.Add(fresh)
+
+	stale := &auth.Auth{UID: "u1", AccessToken: "stale-at", RefreshToken: "stale-rt", ExpiresAt: now - 86400}
+	p.Add(stale)
+
+	got := p.AuthByUID("u1")
+	if got == nil {
+		t.Fatal("account disappeared")
+	}
+	if at := got.AccessTokenValue(); at != "fresh-at" {
+		t.Fatalf("accessToken=%q want fresh-at（较旧的导出不得覆盖已刷新的凭证）", at)
+	}
+	if rt := got.RefreshTokenValue(); rt != "fresh-rt" {
+		t.Fatalf("refreshToken=%q want fresh-rt", rt)
+	}
+}
+
+// TestUpsertAcceptsNewerCredentials 正常换凭证（新导出/重新登录）必须生效：
+// 守卫只在「新对象更旧」时生效，不能把用户显式换号挡在外面。
+func TestUpsertAcceptsNewerCredentials(t *testing.T) {
+	p := New("")
+	now := time.Now().Unix()
+	p.Add(&auth.Auth{UID: "u1", AccessToken: "old-at", RefreshToken: "old-rt", ExpiresAt: now + 60})
+	p.Add(&auth.Auth{UID: "u1", AccessToken: "new-at", RefreshToken: "new-rt", ExpiresAt: now + 7200})
+	if got := p.AuthByUID("u1"); got == nil || got.AccessTokenValue() != "new-at" {
+		t.Fatalf("newer credentials not applied: %+v", got)
+	}
+	// 池内已验证过期（例如上次刷新失败）时，更旧的导出也应当被接受——
+	// 否则账号会被钉死在一个已失效的 token 上，永远等不到新凭证。
+	p2 := New("")
+	p2.Add(&auth.Auth{UID: "u2", AccessToken: "dead-at", RefreshToken: "dead-rt", ExpiresAt: now - 10})
+	p2.Add(&auth.Auth{UID: "u2", AccessToken: "older-at", RefreshToken: "older-rt", ExpiresAt: now - 3600})
+	if got := p2.AuthByUID("u2"); got == nil || got.AccessTokenValue() != "older-at" {
+		t.Fatalf("expired pool token must be replaceable: %+v", got)
+	}
+}

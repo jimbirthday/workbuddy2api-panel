@@ -86,6 +86,53 @@ func (a *Auth) AccessTokenValue() string {
 	return a.AccessToken
 }
 
+// ExpiresAtValue 加锁读取 token 过期时刻（Unix 秒）。池侧的「凭证新鲜度」
+// 判定（见 pool.upsertLocked）需要它：refresh 在锁内改写 ExpiresAt，直读是竞争。
+func (a *Auth) ExpiresAtValue() int64 {
+	if a == nil {
+		return 0
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.ExpiresAt
+}
+
+// SupersededBy 报告 other 是否携带比 a **更新**的凭证。
+//
+// 用途：同一个 UID 被再次 upsert 进池时（导入 cockpit 导出、重复登录），新对象
+// 可能来自一份更旧的导出文件。若无条件用新对象替换池内对象，会把运行期已经
+// refresh 出来的新 token 覆盖回旧 token——下一次请求直接 401，且旧 refresh token
+// 可能已被 rotate 失效。这里只做纯比较，不修改任何状态（调用方仍持池锁：
+// 两把锁的嵌套顺序恒为 pool.mu → auth.mu，与其它路径一致）。
+//
+// 判据（保守，只在证据充分时判定「新对象更旧」）：
+//   - 两者 token 相同 → 无差别，返回 false；
+//   - other 的过期时间严格早于 a，且 a 已过期时间晚于现在（a 的 token 还活着）
+//     → other 是旧凭证，返回 true。
+const credentialClockSkew int64 = 60 // 秒
+
+func (a *Auth) SupersededBy(other *Auth) bool {
+	if a == nil || other == nil {
+		return false
+	}
+	// 固定加锁顺序避免 ABBA：先取两边的快照值，再比较。
+	a.mu.Lock()
+	aAT, aExp := a.AccessToken, a.ExpiresAt
+	a.mu.Unlock()
+	other.mu.Lock()
+	bAT, bExp := other.AccessToken, other.ExpiresAt
+	other.mu.Unlock()
+	if aAT == "" || bAT == "" || aAT == bAT {
+		return false
+	}
+	if aExp <= 0 || bExp <= 0 {
+		return false
+	}
+	// 留 1 分钟余量：同一批导出的 token 之间可能有秒级差异，不值得判成旧凭证；
+	// 真正「更旧的导出」通常差数小时到数天。
+	return bExp+credentialClockSkew < aExp && aExp > time.Now().Unix()
+}
+
 // DomainValue 加锁读取 Domain（同 AccessTokenValue：RefreshToken 在锁内改写它）。
 func (a *Auth) DomainValue() string {
 	if a == nil {
@@ -275,6 +322,46 @@ func (a *Auth) BackfillRealm() (bool, string) {
 	return true, r
 }
 
+// SaveRealmPatch 只把 realm 键补进现有文件，保留插件写入的其余字段
+// （version / account.email / account.avatar / extra 等）。
+//
+// 为什么不能复用 SaveAtomic：saveLocked 用白名单重建 auth/account/device_token
+// 三个对象，任何未知键都会被永久删除，扁平形文件还会被整体改成嵌套形。存量
+// 迁移（realm 是后加字段，老文件普遍缺失）如果走白名单重建，等于在升级时静默
+// 丢数据。这里改为「解码成 map → 只写 realm → 原子写回」。
+func (a *Auth) SaveRealmPatch() error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.FilePath == "" {
+		return fmt.Errorf("no FilePath set")
+	}
+	raw, err := os.ReadFile(a.FilePath)
+	if err != nil {
+		return err
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return fmt.Errorf("parse %s: %w", a.FilePath, err)
+	}
+	// 嵌套形（插件输出）：写 auth.realm；扁平形：写顶层 realm。两种形态都写时
+	// 以嵌套形为准（解析端同口径）。
+	if authObj, ok := doc["auth"].(map[string]any); ok {
+		authObj["realm"] = a.realm
+		doc["auth"] = authObj
+	} else {
+		doc["realm"] = a.realm
+	}
+	out, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := a.FilePath + ".tmp"
+	if err := os.WriteFile(tmp, out, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, a.FilePath)
+}
+
 // RealmStored 直读持久化的 realm 标识（可能为空 = 未 backfill 的旧文件，Realm() 会 fallback）。
 func (a *Auth) RealmStored() string {
 	a.mu.Lock()
@@ -332,6 +419,16 @@ func (a *Auth) SetWeight(weight int) { a.Weight = normalizeWeight(weight) }
 
 // SetNote 设置账号备注（纯展示，截断到 200 字符）。
 func (a *Auth) SetNote(note string) { a.Note = normalizeNote(note) }
+
+// NicknameValue 加锁读取昵称。池侧的状态投影（Status/Nicknames/UsageRows/
+// RealmLabels 及日志标签）都在持池锁的情况下读昵称，而 SetNickname 在 a.mu
+// 内改写它——不加锁直读是真实的数据竞争（Go 字符串是两个字的非原子写，
+// 读到半写值会得到错乱字符串，go test -race 可稳定复现）。
+func (a *Auth) NicknameValue() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.Nickname
+}
 
 // ProfileSnapshot 返回面板展示需要的账号资料快照（weight/note + 持久化标签）。
 // 读取 weight/note 也走 a.mu：SetProfile 会在锁内改写它们，避免数据竞争。
@@ -594,7 +691,9 @@ func LoadDir(dir string) ([]*Auth, error) {
 		seenUID[a.UID] = f
 		if a.RealmStored() == "" {
 			if changed, r := a.BackfillRealm(); changed {
-				if err := a.SaveAtomic(); err != nil {
+				// 用 patch 写回而不是 SaveAtomic：后者按白名单重建整份文件，
+				// 会把插件写入的未知字段（version/email/extra…）静默删掉。
+				if err := a.SaveRealmPatch(); err != nil {
 					log.Printf("WARN: auth %s realm backfill save: %v", logfmt.Label(a.UID, a.Nickname), err)
 				} else if r == "global" {
 					log.Printf("auth %s 存量迁移: 补 realm=global（domain=%s）", logfmt.Label(a.UID, a.Nickname), a.Domain)

@@ -3,12 +3,15 @@
 package pool
 
 import (
+	"log"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
 )
 
 type Pool struct {
@@ -19,6 +22,8 @@ type Pool struct {
 	// saveMu 串行化本地 state.json 落盘（tmp 写入 + rename + fsync 全在锁外做）。
 	// 不得与 p.mu 形成固定嵌套顺序获取：saveMu 只包住写盘本身，绝不跨 p.mu 持有。
 	saveMu sync.Mutex
+	// flusherDone 在 startFlusher 时登记；Close 通过它 join 落盘 goroutine。
+	flusherDone chan struct{}
 	// persistSeq 快照采集序号（持 p.mu 自增）；persistWritten 已落盘的最高序号
 	// （持 saveMu 读写）。用于丢弃「更晚采集、更早落盘」的乱序覆盖。
 	persistSeq     uint64
@@ -160,6 +165,11 @@ func (p *Pool) Close() {
 	p.closeOnce.Do(func() {
 		close(p.stopCh)
 	})
+	// 等 flusher 真正退出（它可能正处于一轮落盘中间），再由 Flush 做最后一次
+	// 同步落盘；否则两者会并发写同一个 tmp 文件或互相覆盖。
+	if p.flusherDone != nil {
+		<-p.flusherDone
+	}
 	p.Flush()
 }
 
@@ -392,11 +402,22 @@ func (p *Pool) SyncToDir(auths []*auth.Auth) {
 		p.upsertLocked(a)
 	}
 	changed := false
-	for uid := range p.byUID {
-		if !seen[uid] {
-			delete(p.byUID, uid)
-			changed = true
+	for uid, e := range p.byUID {
+		if seen[uid] {
+			continue
 		}
+		// 文件仍在磁盘上却没被本次扫描收录 → 该文件解析失败（半写/权限抖动/
+		// NFS 瞬断），不是「用户删了账号」。此时绝不能删条目：删除会被立即
+		// 持久化，重启后该账号的 credits/冷却/熔断/用量全部丢失且无法自动找回。
+		if e != nil && e.a != nil && e.a.FilePath != "" {
+			if _, statErr := os.Stat(e.a.FilePath); statErr == nil {
+				log.Printf("WARN: [pool] auth 文件存在但解析失败，保留账号运行态 uid=%s file=%s",
+					logfmt.UID8(uid), e.a.FilePath)
+				continue
+			}
+		}
+		delete(p.byUID, uid)
+		changed = true
 	}
 	var sf stateFile
 	var seq uint64
@@ -430,12 +451,72 @@ func (p *Pool) Remove(uid string) *auth.Auth {
 	return e.a
 }
 
+// RemoveMany 批量移除账号，返回实际移除的 UID 与不存在的 UID。
+//
+// 为什么需要单独的批量入口而不再循环调 Remove：Remove 每次都
+// snapshotLocked + saveSnapshot，而 saveSnapshot 要整份 state 序列化、fsync、
+// rename 并镜像一份到 Redis。470 个号循环 = 470 次全量写盘（O(n²) 字节 + 470
+// 次 fsync + 470 次 Redis 镜像），必然超过面板 API 的 15s 超时。这里只在全部
+// 删除完成后采集一次快照、落盘一次。
+//
+// 语义与 Remove 保持一致：删除必须立即落盘（否则已删账号会在下次启动被 load()
+// 复活）；在途请求的 Release 对已删条目是 no-op，无需等待。调用方若需 auth
+// 文件路径，必须在调用前用 AuthByUID 取：条目删除后不可再查。
+func (p *Pool) RemoveMany(uids []string) (removed []string, missing []string) {
+	if len(uids) == 0 {
+		return nil, nil
+	}
+	p.mu.Lock()
+	seen := make(map[string]bool, len(uids))
+	for _, uid := range uids {
+		if uid == "" || seen[uid] {
+			continue
+		}
+		seen[uid] = true
+		if _, ok := p.byUID[uid]; !ok {
+			missing = append(missing, uid)
+			continue
+		}
+		delete(p.byUID, uid)
+		removed = append(removed, uid)
+	}
+	if len(removed) == 0 {
+		p.mu.Unlock()
+		return removed, missing
+	}
+	p.dirty.Store(true)
+	sf, seq := p.snapshotLocked()
+	p.mu.Unlock()
+	// 写盘在锁外做（序列化 + fsync 耗时可观，不得持全池写锁）。
+	p.saveSnapshot(sf, seq)
+	return removed, missing
+}
+
 // upsertLocked 更新或插入单个账号；已存在则只换凭证、保留 credits/cooling 状态。
 // 调用方必须已持有 p.mu；Add 与 SyncToDir 共用此 upsert 逻辑。
 func (p *Pool) upsertLocked(a *auth.Auth) {
 	weight, note, _, _ := a.ProfileSnapshot()
 	if e, ok := p.byUID[a.UID]; ok {
 		hasFile := a.FilePath != ""
+		// 凭证新鲜度守卫：同一个 UID 可能被一份**更旧的**导出文件重新 upsert
+		// （批量导入 cockpit 导出、重复登录拿到旧快照）。无条件 e.a = a 会把
+		// 运行期 refresh 出来的新 token 覆盖回旧 token——下一次请求 401，且旧
+		// refresh token 往往已被 rotate 失效，只能重新登录。
+		//
+		// 只有「新对象 token 不同、且过期时间更早、且池内 token 仍有效」这一
+		// 证据充分的情形才拒绝替换；其余（新号、同 token、池内已过期）照常
+		// 覆盖，保持既有语义与「用户显式换凭证」的能力。
+		if e.a != nil && e.a.SupersededBy(a) {
+			log.Printf("WARN: [pool] 忽略较旧的凭证 upsert uid=%s（保留运行期已刷新的 token）",
+				logfmt.UID8(a.UID))
+			// 资料仍按新对象同步（weight/note 是面板可编辑的显式意图），
+			// 但不碰 e.a 的 token 字段。
+			if hasFile {
+				e.weight = weight
+				e.note = note
+			}
+			return
+		}
 		e.a = a // 保留 credits/cooling 状态
 		// state.json / Redis 快照恢复出的资料镜像在 auth 重新加载前仍是唯一来源；
 		// 来自 state 的 placeholder（FilePath 为空）不能把资料清空。真实 auth

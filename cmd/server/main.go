@@ -488,7 +488,7 @@ func panelListenPath(listen string) string {
 //   - schedule.* → scheduler.Reconfigure/SetBalanceInterval/SetExpiringSoonWindow
 //
 // 需重启（涉及监听地址、HTTP client 超时、auth_dir 等装配期依赖）：
-//   - listen / auth_dir / state_file / upstream.* / upstash.* / session_sticky.*（TTL 类）
+//   - listen / auth_dir / state_file / upstream.* / upstash.* / session_sticky.*（含 enabled）
 //
 // 落盘用"先写 tmp 再 rename"原子替换，且优先保留磁盘上的原始 JSON 结构（只改
 // 面板表单覆盖到的键），避免把用户手写的注释性字段/未知键洗掉——这里直接整体
@@ -609,7 +609,10 @@ func restartRequiredFields(c *Config) []string {
 	if c.Upstash.URL != "" || c.Upstash.Token != "" {
 		out = append(out, "upstash")
 	}
-	out = append(out, "session_sticky.ttl", "session_sticky.gc_interval")
+	// enabled 决定是否装配 Router（main.go 装配期判空后塞进 handler），运行期没有任何
+	// 读取点，因此关/开都必须重启才生效。此前只列 TTL/gc_interval，用户把 enabled
+	// 从 false 改 true 后面板显示「已保存」但粘性依旧不生效（静默失效）。
+	out = append(out, "session_sticky.enabled", "session_sticky.ttl", "session_sticky.gc_interval")
 	out = append(out, "logging.request_archive_enabled", "logging.request_retention_days", "logging.request_archive_max_mb")
 	out = append(out, "server.read_timeout")
 	return out

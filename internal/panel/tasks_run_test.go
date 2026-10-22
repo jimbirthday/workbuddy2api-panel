@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
@@ -129,5 +130,55 @@ func TestTasksRunSingleAndBatchResults(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestTasksOverviewFocusDoesNotSweepWholePool 聚焦单账号时不得对整池做成长扫描。
+// 旧实现把整池 statuses 传进 benefitsGrowthSnapshot，切一个账号就给 470 号各打
+// 2 个端点（并与并行加载的 /benefits 完全重复）。这里用「每个账号的任务列表
+// 端点只允许被访问一次」的探针钉住：聚焦 A 时不碰 B。
+func TestTasksOverviewFocusDoesNotSweepWholePool(t *testing.T) {
+	pl := pool.New("")
+	target := &auth.Auth{UID: "13800138000", Nickname: "秋叶", AccessToken: "at1"}
+	other := &auth.Auth{UID: "13900139000", Nickname: "冬雪", AccessToken: "at2"}
+	pl.Add(target)
+	pl.Add(other)
+
+	var targetCalls, otherCalls atomic.Int64
+	up := upstream.New()
+	up.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		// 用 access token 区分「为哪个账号发的请求」。
+		if r.Header.Get("Authorization") == "Bearer at2" {
+			otherCalls.Add(1)
+		} else {
+			targetCalls.Add(1)
+		}
+		body := `{"code":0,"msg":"ok","data":{"tasks":[]}}`
+		switch {
+		case strings.Contains(r.URL.Path, "/activity/growth/streak"):
+			body = `{"code":0,"msg":"ok","data":{"streak":{"days":1}}}`
+		case strings.Contains(r.URL.Path, "/activity/growth/lottery/summary"):
+			body = `{"code":0,"msg":"ok","data":{"chances":0}}`
+		case strings.Contains(r.URL.Path, "/activity/growth/energy"):
+			body = `{"code":0,"msg":"ok","data":{"balance":0}}`
+		case strings.Contains(r.URL.Path, "/buddy/travel/status"):
+			body = `{"code":0,"msg":"ok","data":{"state":"home"}}`
+		}
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(body))}, nil
+	})}
+	p := New(Config{Version: "test", APIKey: "k", Pool: pl, Upstream: up})
+
+	req := httptest.NewRequest(http.MethodGet, "/panel/api/tasks?focus="+benefitRefFor(target.UID), nil)
+	req.Header.Set("Authorization", "Bearer k")
+	rr := httptest.NewRecorder()
+	p.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if targetCalls.Load() == 0 {
+		t.Fatal("聚焦账号的成长明细未查询（应至少打一次上游）")
+	}
+	if n := otherCalls.Load(); n != 0 {
+		t.Fatalf("聚焦 A 却对账号 B 打了 %d 次上游（单焦点触发全池扫描）", n)
 	}
 }

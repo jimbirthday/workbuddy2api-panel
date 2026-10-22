@@ -12,6 +12,7 @@ package panel
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -244,7 +245,7 @@ func (p *Panel) runScan(seq int) {
 		p.scanCurrent(seq, fixedUID)
 		a := jobs[k].a
 		it := &items[i]
-		it.Nickname = a.Nickname
+		it.Nickname = a.NicknameValue()
 		// 单账号总 deadline：默认与 mp 两路并行，且共享一个 35s 上限。
 		// 上游偶发 hang 时只把本账号标失败并继续下一号；不能因为一个坏请求
 		// 让整轮扫描停在 HTTP 客户端 120s 超时上（用户看到的就是“扫描卡住”）。
@@ -416,7 +417,12 @@ func (p *Panel) tasksRunQueue(w http.ResponseWriter, r *http.Request) {
 		Growth      bool `json:"growth"`
 	}
 	// 限读 1 MiB（同 config.go 口径）：请求体是小结构体，加闸防超大 JSON 内存放大。
-	_ = json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body)
+	// 解析错误必须 400：此前忽略错误并按默认值启动，一个截断/写错字段名的请求
+	// 会静默触发 470 个账号的全池预扫 + 执行，代价极高且无法取消。
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+		writeErr(w, http.StatusBadRequest, "invalid queue request")
+		return
+	}
 	if !body.Growth {
 		body.Growth = true
 	}
@@ -523,7 +529,7 @@ func (p *Panel) reuseFreshScan(accounts []pool.TaskAccount) ([]queueAccount, []q
 		accts = append(accts, queueAccount{a: a, uid: a.UID, grow: grow})
 		for _, t := range grow {
 			items = append(items, queueItem{
-				UID: a.UID, Nickname: a.Nickname, Kind: "growth", Code: t.TaskCode,
+				UID: a.UID, Nickname: a.NicknameValue(), Kind: "growth", Code: t.TaskCode,
 				Progress: taskProgressText(&t), Status: "pending",
 			})
 		}
@@ -779,7 +785,7 @@ func (p *Panel) runGrowthQueueStart(concurrency int, growth bool) (started bool,
 	for _, one := range accts {
 		for _, t := range one.grow {
 			items = append(items, queueItem{
-				UID: one.a.UID, Nickname: one.a.Nickname, Kind: "growth", Code: t.TaskCode,
+				UID: one.a.UID, Nickname: one.a.NicknameValue(), Kind: "growth", Code: t.TaskCode,
 				Progress: taskProgressText(&t), Status: "pending",
 			})
 		}
@@ -875,6 +881,15 @@ func (p *Panel) runQueueItems(accts []queueAccount, items []queueItem, concurren
 			return
 		}
 		q.mu.Lock()
+		// 停机中断：可取消等待会让 worker 提前 return，剩余条目仍是 pending。
+		// 必须显式标成 skipped——否则前端会一直显示「排队」且队列看起来像卡住，
+		// 用户不知道这批是没跑完而不是在跑。
+		for i := range q.items {
+			if q.items[i].Status == "pending" || q.items[i].Status == "running" {
+				q.items[i].Status = "skipped"
+				q.items[i].Message = "停机中断，可重新启动队列"
+			}
+		}
 		q.running = false
 		q.phase = ""
 		q.mu.Unlock()
@@ -927,7 +942,9 @@ func (p *Panel) runQueueItems(accts []queueAccount, items []queueItem, concurren
 			// 面板「一键完成」一直有这步，队列路径此前漏了（表现为上报 200 但进度
 			// 一直 not_accepted、无法领奖）。失败不阻塞（行为事件才是进度判据）。
 			if accepted := p.acceptPendingTasks(one.a); accepted > 0 {
-				time.Sleep(reportGap) // 给上游状态流转留时间
+				if !p.wait(reportGap) { // 给上游状态流转留时间（停机可中断）
+					return
+				}
 			}
 			// 只遍历本账号的条目：队列启动后条目固定，q.byUID 是启动时建好的
 			// 索引；旧实现每个账号都遍历全部条目，账号/待办多时是 O(n×m)。
@@ -948,7 +965,9 @@ func (p *Panel) runQueueItems(accts []queueAccount, items []queueItem, concurren
 				} else {
 					p.queueMarkAt(i, "done", msg)
 				}
-				time.Sleep(reportGap) // 项间节流
+				if !p.wait(reportGap) { // 项间节流（停机可中断，剩余项保持 pending）
+					return
+				}
 			}
 		}()
 	})

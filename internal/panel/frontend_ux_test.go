@@ -365,6 +365,57 @@ const pending = ctx.withExportBusy(btn, () => new Promise(resolve => { release =
 	}
 }
 
+// 导出必须带 Authorization 头：浏览器直接打开 <a href> 不会复用页面请求头，
+// 当年「导出账号失败 {"error":"invalid_api_key"}」就是这条路径。这里锁定
+// downloadAuthedURL 的行为：带鉴权 fetch、按 Content-Disposition 命名保存。
+func TestAppJSExportSendsAuthorization(t *testing.T) {
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('function exportFilenameFrom');
+const end = src.indexOf('function exportURL');
+if (start < 0 || end < 0 || end < start) throw new Error('export download region not found');
+const seen = [];
+const saved = [];
+let unauthorized = 0;
+const ctx = {
+  memKey: 'admin-key',
+  authHeaders() { return this.memKey ? { Authorization: 'Bearer ' + this.memKey } : {}; },
+  rejectUnauthorized() { unauthorized++; const e = new Error('密钥无效或未填写'); e.status = 401; throw e; },
+  URL: { createObjectURL: () => 'blob:fake', revokeObjectURL() {} },
+  setTimeout: fn => { fn(); },
+  document: {
+    createElement: () => ({ style: {}, click() { saved.push(this.download); }, remove() {} }),
+    body: { appendChild() {} },
+  },
+};
+ctx.fetch = url => Promise.resolve({
+  status: 200, ok: true,
+  headers: { get: k => k === 'Content-Disposition' ? 'attachment; filename="accounts-x.csv"' : '' },
+  blob: async () => 'BLOB',
+});
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, end) + '\nthis.downloadAuthedURL=downloadAuthedURL;', ctx);
+ctx.fetch = url => { seen.push(url); return Promise.resolve({
+  status: 200, ok: true,
+  headers: { get: k => k === 'Content-Disposition' ? 'attachment; filename="accounts-x.csv"' : '' },
+  blob: async () => 'BLOB',
+}); };
+(async () => {
+  await ctx.downloadAuthedURL('/panel/api/accounts/export');
+  const authed = seen.length === 1 && seen[0] === '/panel/api/accounts/export' && ctx.authHeaders().Authorization === 'Bearer admin-key';
+  let err = '';
+  ctx.fetch = () => Promise.resolve({ status: 401, ok: false, headers: { get: () => '' }, blob: async () => '' });
+  try { await ctx.downloadAuthedURL('/panel/api/accounts/export'); } catch (e) { err = e.message; }
+  process.stdout.write(JSON.stringify({ authed, saved, unauthorized, err }));
+})().catch(e => { process.stdout.write('ERR ' + (e && e.stack || e)); process.exitCode = 1; });`
+	out := runNodeScript(t, "export-auth", script, appJSPath(t))
+	const want = `{"authed":true,"saved":["accounts-x.csv"],"unauthorized":1,"err":"密钥无效或未填写"}`
+	if out != want {
+		t.Fatalf("export auth=%s want %s", out, want)
+	}
+}
+
 // 弹窗 Tab 焦点循环：Tab 在末项回首项，Shift+Tab 在首项回末项；焦点不在弹窗内不拦截。
 func TestAppJSModalFocusTrap(t *testing.T) {
 	script := `const fs = require('fs');
@@ -526,7 +577,6 @@ func TestPanelIndexUXMarkup(t *testing.T) {
 		`id="view-activity"`,
 		`id="actRange"`,
 		`<a href="#activity" data-view="activity">`,
-		`搜索仅影响列表，导出不含搜索词`,
 		`@media (max-width: 700px)`,
 		`<header class="topbar"`,
 		// 日志行必须是 flex 列：后置的 display:block 会把时间/级别/频道/正文
@@ -941,7 +991,6 @@ func TestPanelCreditHistoryMarkup(t *testing.T) {
 		`data-kind="spend"`,
 		`id="usCreditHistTable"`,
 		`<th>粒度</th>`,
-		`每行是一个时间桶（小时或日）内的聚合扣减，不是逐请求账单`,
 		`<details class="us-fold" id="usCreditAgg">`,
 		`<ul class="main-nav">`,
 		`.us-credit-hist .acc td::before { content: attr(data-label);`,
@@ -1390,7 +1439,7 @@ func TestAppJSHiddenTabSkipsPolling(t *testing.T) {
 const vm = require('vm');
 const src = fs.readFileSync(process.argv[2], 'utf8');
 const start = src.indexOf('function refreshVisible');
-const end = src.indexOf('/* ── 积分任务', start);
+const end = src.indexOf('/* ── 成长任务（账号弹窗）', start);
 if (start < 0 || end < 0) throw new Error('polling region not found');
   let overview = 0, logs = 0, queue = 0;
 const ctx = {
@@ -1968,19 +2017,23 @@ func TestPanelConnectAndRemainingMarkup(t *testing.T) {
 		`id="remEmpty"`, `id="remTable"`, `id="remBody"`,
 		`.page-sidebar { position: fixed;`,
 		`@media (max-width: 860px)`,
-		`限额为 0 表示该维度未启用`,
 	} {
 		if !strings.Contains(html, needle) {
 			t.Errorf("index.html missing %q", needle)
 		}
 	}
-	for _, view := range []string{"accounts", "taskscenter", "models", "activity", "packages", "usage", "connect", "config", "logs"} {
+	for _, view := range []string{"accounts", "taskscenter", "models", "activity", "usage", "connect", "config", "logs"} {
 		if !strings.Contains(html, `id="view-`+view+`"`) {
 			t.Errorf("missing view %s", view)
 		}
 		if !strings.Contains(html, `data-view="`+view+`"`) {
 			t.Errorf("missing nav item %s", view)
 		}
+	}
+	// 积分构成页已下架（用户要求）：导航与视图都不应再出现，但后端 /packages
+	// 接口与 PK_* 渲染函数保留（前端测试仍直接求值它们）。
+	if strings.Contains(html, `data-view="packages"`) || strings.Contains(html, `id="view-packages"`) {
+		t.Error("packages view must stay removed from the panel shell")
 	}
 	// index.html 是 go:embed 源文件，版本查询串由 index.go 在服务端注入；
 	// 源文件必须保持无内联脚本的外链形态，否则 CSP 与 ETag 用例会失效。
@@ -2275,7 +2328,16 @@ func TestAppJSQueuePreScanWarnVisible(t *testing.T) {
 const vm = require('vm');
 const src = fs.readFileSync(process.argv[2], 'utf8');
 const out = {};
-const el = id => (out[id] = out[id] || {hidden: true, textContent: '', style: {}, innerHTML: '', dataset: {}});
+// 真实浏览器的 dataset 是只读 getter：严格模式下给它赋值直接抛 TypeError。
+// 这里把桩做成与浏览器一致的形状（setAttribute/removeAttribute），避免测试
+// 用可变普通对象掩盖该缺陷。
+const attrs = {};
+const el = id => (out[id] = out[id] || {
+  hidden: true, textContent: '', style: {}, innerHTML: '',
+  get dataset() { return attrs[id] || (attrs[id] = {}); },
+  setAttribute(k, v) { (attrs[id] = attrs[id] || {})[k.replace(/^data-/, '').replace(/-([a-z])/g, (m, c) => c.toUpperCase())] = String(v); },
+  removeAttribute(k) { const d = attrs[id] || (attrs[id] = {}); delete d[k.replace(/^data-/, '').replace(/-([a-z])/g, (m, c) => c.toUpperCase())]; },
+});
 const empty = {style: {}};
 const ctx = {
   esc: s => String(s == null ? '' : s),
@@ -2290,9 +2352,14 @@ const rqe = src.indexOf('// setQueueRunBusy', rq);
 if (start < 0 || end < 0 || rq < 0 || rqe < 0) throw new Error('queue helpers not found');
 vm.runInContext(src.slice(rq, rqe) + src.slice(start, end) + '\nthis.updateProgress=updateProgress;', ctx);
 ctx.updateProgress({running: true, pre_warn: '2 个账号任务查询失败，本轮可能漏扫；可稍后重试', items: [{status: 'done'}, {status: 'pending'}]});
-process.stdout.write(JSON.stringify({text: el('qProgText').textContent, warn: el('qProgText').dataset.warn}));`
+const warnSet = (attrs.qProgText || {}).warn;
+const firstText = el('qProgText').textContent;
+// 预扫警告消失后必须清掉标记，否则下轮正常队列仍显示警告样式。
+ctx.updateProgress({running: false, pre_warn: '', items: [{status: 'done'}, {status: 'done'}]});
+const warnCleared = (attrs.qProgText || {}).warn === undefined;
+process.stdout.write(JSON.stringify({text: firstText, later: el('qProgText').textContent, warn: warnSet, cleared: warnCleared}));`
 	out := runNodeScript(t, "queue-prescan-warn", script, appJSPath(t))
-	if !strings.Contains(out, `"warn":"1"`) || !strings.Contains(out, "2 个账号任务查询失败") || !strings.Contains(out, "执行中 1 / 2") {
+	if !strings.Contains(out, `"warn":"1"`) || !strings.Contains(out, `"cleared":true`) || !strings.Contains(out, "2 个账号任务查询失败") || !strings.Contains(out, `"later":"已结束 2 / 2"`) {
 		t.Fatalf("pre-scan warn=%s", out)
 	}
 }
@@ -2685,7 +2752,7 @@ func TestIndexHasHubCapsuleNav(t *testing.T) {
 			t.Errorf("index.html missing Hub nav rule %q", needle)
 		}
 	}
-	for _, view := range []string{"accounts", "taskscenter", "models", "activity", "packages", "usage", "connect", "config", "logs"} {
+	for _, view := range []string{"accounts", "taskscenter", "models", "activity", "usage", "connect", "config", "logs"} {
 		if !strings.Contains(html, `data-view="`+view+`"`) {
 			t.Errorf("missing nav item %s", view)
 		}
@@ -2700,7 +2767,7 @@ func TestIndexHasHubViewHeads(t *testing.T) {
 		t.Fatal(err)
 	}
 	html := string(raw)
-	for _, view := range []string{"accounts", "taskscenter", "activity", "models", "packages", "usage", "connect", "config", "logs"} {
+	for _, view := range []string{"accounts", "taskscenter", "activity", "models", "usage", "connect", "config", "logs"} {
 		section := `<section class="view" id="view-` + view + `"`
 		i := strings.Index(html, section)
 		if i < 0 {
@@ -3313,5 +3380,202 @@ process.stdout.write(JSON.stringify({
 	const want = `{"note":"最近 2 轮","checkin":true,"streak":true,"done":true,"running":true,"failedTag":true}`
 	if out != want {
 		t.Fatalf("benefit batches=%s\nwant %s", out, want)
+	}
+}
+
+// TestAppJSBulkRemoveSendsConfirmAndDropsRemoved 批量移除必须：
+//  1. 二次确认（一次确认 + 一次「不可恢复」确认），任一次取消都不发请求；
+//  2. 单请求 remove_all，body 带显式 uids 与 confirm=数量（后端两者都校验）；
+//  3. 成功后只把真正删掉的 UID 从选择集移除，失败/跳过的保持选中供重试。
+func TestAppJSBulkRemoveSendsConfirmAndDropsRemoved(t *testing.T) {
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('async function accSelectedAction');
+const end = src.indexOf("if ($('btnSelEnable'))", start);
+if (start < 0 || end < 0) throw new Error('accSelectedAction not found');
+let confirms = 0, calls = [];
+const makeRun = (answer) => {
+  const btn = {textContent: '移除选中', disabled: false};
+  const ctx = {
+    accSelected: new Set(['u1', 'u2', 'u3']), toast: () => {},
+    confirm: () => { confirms++; return answer(confirms); },
+    api: (path, opt) => { calls.push({path, opt}); return Promise.resolve({ok: true, removed: 2, failed: 1, skipped: 0, removed_uids: ['u1', 'u2']}); },
+    $: id => id === 'btnSelRemove' ? btn : null,
+    invalidatePackagesCache: () => {}, loadOverview: () => {},
+    accShownRows: () => [], accPageSize: 100,
+    syncAccSelectionUI: () => {}, syncAccSelectionRows: () => {},
+    console: {warn() {}},
+    Promise, Array, Set, Object, String, Number, Error, JSON,
+  };
+  vm.createContext(ctx);
+  vm.runInContext(src.slice(start, end) + '\nthis.run=accSelectedAction;', ctx);
+  return {ctx, btn};
+};
+(async () => {
+  // 第一次确认取消 → 不发请求
+  const a = makeRun(() => false);
+  await a.ctx.run('remove');
+  const afterFirstCancel = calls.length;
+  // 第二次确认取消 → 也不发请求
+  const b = makeRun(n => n < 2);
+  await b.ctx.run('remove');
+  const afterSecondCancel = calls.length;
+  // 两次都确认 → 发一次 remove_all
+  const c = makeRun(() => true);
+  await c.ctx.run('remove');
+  process.stdout.write(JSON.stringify({
+    afterFirstCancel, afterSecondCancel,
+    calls: calls.map(x => ({path: x.path, body: x.opt && x.opt.body, timeout: x.opt && x.opt.timeoutMs})),
+    left: Array.from(c.ctx.accSelected),
+  }));
+})();`
+	out := runNodeScript(t, "bulk-remove", script, appJSPath(t))
+	if !strings.Contains(out, `"afterFirstCancel":0`) || !strings.Contains(out, `"afterSecondCancel":0`) {
+		t.Fatalf("removal must require both confirmations: %s", out)
+	}
+	if !strings.Contains(out, `"path":"accounts/remove_all"`) {
+		t.Fatalf("removal must use the batch endpoint: %s", out)
+	}
+	if !strings.Contains(out, `"body":"{\"uids\":[\"u1\",\"u2\",\"u3\"],\"confirm\":3}"`) {
+		t.Fatalf("removal body must carry uids + confirm: %s", out)
+	}
+	if !strings.Contains(out, `"timeout":60000`) {
+		t.Fatalf("removal should extend the API deadline: %s", out)
+	}
+	// u1/u2 已删除；u3 失败仍留在选择集里（可直接重试）。
+	if !strings.Contains(out, `"left":["u3"]`) {
+		t.Fatalf("only removed uids should leave the selection: %s", out)
+	}
+}
+
+// TestIndexHasBulkRemoveButton 移除按钮必须存在、初始禁用，且参与选择联动
+// （漏加进 syncAccSelectionUI 的数组会表现为「0 选中时也能点」）。
+func TestIndexHasBulkRemoveButton(t *testing.T) {
+	raw, err := os.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(raw)
+	if !strings.Contains(html, `id="btnSelRemove"`) {
+		t.Fatal("index.html missing #btnSelRemove")
+	}
+	if !strings.Contains(html, `id="btnSelRemove" disabled`) {
+		t.Error("bulk remove button must start disabled")
+	}
+	src, err := os.ReadFile("app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(src), `'btnSelDisable', 'btnSelRemove'`) {
+		t.Error("syncAccSelectionUI must toggle btnSelRemove with the other selection buttons")
+	}
+}
+
+// TestIndexNoLongerExposesPackagesView 积分构成页已下架：导航、视图、路由表都
+// 不能再出现；同时后端 /packages 与 PK_* 渲染函数必须保留（用户要求只下架前端）。
+func TestIndexNoLongerExposesPackagesView(t *testing.T) {
+	raw, err := os.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(raw)
+	for _, needle := range []string{`data-view="packages"`, `id="view-packages"`, `<h2>积分构成</h2>`} {
+		if strings.Contains(html, needle) {
+			t.Errorf("index.html still exposes %q", needle)
+		}
+	}
+	src, err := os.ReadFile("app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	js := string(src)
+	// TITLES 里留着 packages 会让 #packages 深链进入"隐藏全部视图"的白屏分支。
+	if strings.Contains(js, "packages: '积分构成'") {
+		t.Error("TITLES must not route to the removed packages view")
+	}
+	if !strings.Contains(js, "function renderPackages") || !strings.Contains(js, "function pkDetailGroups") {
+		t.Error("PK_* renderers must stay (backend contract + existing tests depend on them)")
+	}
+	if !strings.Contains(js, "loadPackagesData") {
+		t.Error("shared packages cache must stay (expiry card + refresh button depend on it)")
+	}
+}
+
+// TestIndexUnifiedTaskEntries 批量动作统一在「任务与福利」页，账号池头部只保留
+// 一个跳转按钮；两页不能再各自维护一套「全部…」入口。
+func TestIndexUnifiedTaskEntries(t *testing.T) {
+	raw, err := os.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(raw)
+	// 账号池头部：旧四个批量按钮已移走。
+	for _, gone := range []string{`id="btnCheckinAll"`, `id="btnTravelAll"`, `id="btnActivityAll"`, `id="btnKeepaliveAll"`} {
+		if strings.Contains(html, gone) {
+			t.Errorf("account page still has its own bulk entry %q", gone)
+		}
+	}
+	if !strings.Contains(html, `id="btnGoTasks"`) {
+		t.Error("account page header should link to the task page")
+	}
+	// 任务页：六种批量动作都有入口，且 streak_all 不再不可达。
+	for _, id := range []string{
+		`id="bfBtnAllCheckin"`, `id="bfBtnAllTravel"`, `id="bfBtnAllActivity"`,
+		`id="bfBtnAllKeepalive"`, `id="bfBtnAllStreak"`, `id="btnBfDailyChatAll"`,
+		`id="bfBtnAllTasks"`,
+	} {
+		if !strings.Contains(html, id) {
+			t.Errorf("task page missing bulk entry %s", id)
+		}
+	}
+	// 命名统一：旧的「旅行巡检 / Buddy 签到 / 一键做任务」不再出现在 UI 文案里。
+	for _, gone := range []string{"旅行巡检", "Buddy 签到", "一键做任务", "全部保活（", ">旅行巡检<"} {
+		if strings.Contains(html, gone) {
+			t.Errorf("legacy label %q should be unified", gone)
+		}
+	}
+	// 成长任务队列是常驻区块（不是折叠的 details），否则主路径藏起来。
+	if strings.Contains(html, `<details class="box" id="bfAdvanced">`) {
+		t.Error("growth queue must not stay collapsed behind <details>")
+	}
+}
+
+// TestIndexHintNoiseRemoved 用户点名的提示词必须消失；同时确认只删提示、
+// 没误删承载数据的节点。
+func TestIndexHintNoiseRemoved(t *testing.T) {
+	raw, err := os.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(raw)
+	for _, gone := range []string{
+		"限额为 0 表示该维度未启用",
+		"用量未知」表示本地尚无当日快照",
+		"不是逐请求账单",
+		"不是逐笔账本",
+		"不能把未知当作额度充足",
+		"哪些模型不能用、还要锁多久",
+		"搜索仅影响列表，导出不含搜索词",
+		"来自最近一次刷新积分的快照",
+		"每次真实尝试，含失败原因",
+		"max_tokens bug已修复",
+		"调用来源：IP 取 X-Forwarded-For 首段",
+		"查询上游任务进度；「接受」为报名",
+		"示例只使用",
+		"禁用只关选号：打开后已禁用的账号仍会",
+	} {
+		if strings.Contains(html, gone) {
+			t.Errorf("hint text %q should be removed", gone)
+		}
+	}
+	// 提示删除后的关键数据节点仍必须存在（不能顺手删掉表格/卡片）。
+	for _, keep := range []string{
+		`id="remTable"`, `id="remBody"`, `id="usChart"`, `id="usStats"`,
+		`id="usCreditStats"`, `id="usDimBody"`, `id="bfGrantsBody"`,
+	} {
+		if !strings.Contains(html, keep) {
+			t.Errorf("removing hints must not delete %s", keep)
+		}
 	}
 }

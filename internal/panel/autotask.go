@@ -28,7 +28,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math/rand/v2"
 	"net/http"
 	"strings"
 	"time"
@@ -221,19 +220,20 @@ func isMPTaskCode(code string) bool { return mpTaskCodes[code] }
 // 双口径：mp 专属任务在默认列表查不到，自动回落 mp 列表（仅对已登记的 mp 码，
 // 未知码不多打一次上游）。
 func (p *Panel) taskByCode(a *auth.Auth, code string) (*upstream.Task, error) {
-	tasks, err := p.cfg.Upstream.ListTasks(a)
+	tasks, err := p.taskList(a, false)
 	if err != nil {
 		return nil, err
 	}
-	for i := range tasks {
-		if tasks[i].TaskCode == code {
-			return &tasks[i], nil
-		}
+	return taskFromList(tasks, code), nil
+}
+
+// taskByCodeFresh 强制绕过快照读取（写操作后的回读必须看到最新进度）。
+func (p *Panel) taskByCodeFresh(a *auth.Auth, code string) (*upstream.Task, error) {
+	tasks, err := p.taskList(a, true)
+	if err != nil {
+		return nil, err
 	}
-	if isMPTaskCode(code) {
-		return p.taskByCodeMP(a, code)
-	}
-	return nil, nil
+	return taskFromList(tasks, code), nil
 }
 
 // claimPollAttempts / claimPollGap 达标回读的有界轮询参数。
@@ -241,26 +241,54 @@ func (p *Panel) taskByCode(a *auth.Auth, code string) (*upstream.Task, error) {
 // 对话完成后立即回读仍是 0/1，约 5-8 秒后才变 1/1）。一次性回读会误判"未达标"，
 // 从而跳过自动领奖。这里最多轮询 N 次、每次间隔 gap，总预算约 12 秒。
 var (
-	claimPollAttempts = 4
+	claimPollAttempts = 5
 	claimPollGap      = 3 * time.Second
 )
+
+// claimPollBackoff 第 i 次（从 1 开始）探测前的等待：0.5s / 1s / 2s / 3s。
+// 上限不超过原来的固定 3s，总预算 6.5s < 原先的 9s，且首个命中点提前。
+func claimPollBackoff(i int) time.Duration {
+	switch i {
+	case 1:
+		return 500 * time.Millisecond
+	case 2:
+		return time.Second
+	case 3:
+		return 2 * time.Second
+	default:
+		return claimPollGap
+	}
+}
 
 // taskByCodeWaiting 回读任务，若未达标则在有界预算内轮询等待（上游异步计分）。
 // 已达标（claimable）立即返回；预算耗尽返回最后一次结果（可能仍未达标）。
 func (p *Panel) taskByCodeWaiting(a *auth.Auth, code string) (*upstream.Task, error) {
-	t, err := p.taskByCode(a, code)
+	// 强制绕过快照：本函数只在写操作之后调用，缓存里的进度必然过旧。
+	t, err := p.taskByCodeFresh(a, code)
 	if err != nil || t == nil {
 		return t, err
 	}
 	if t.Claimable || t.Claimed {
 		return t, nil
 	}
+	// 按 0.5s→1s→2s 退避（总预算与原先的 3×3s 相当，但最早一次探测提前 2.5s），
+	// 实测上游异步计分多在 1~4 秒内落账，命中即提前返回——每个已完成任务省 2~7s。
+	//
+	// 轮询期间的查询失败不能一路吞掉：此前任何一次 err2 都直接 return t,nil，
+	// 调用方拿到的仍是动作前的旧进度，只能报「上游进度未推进」——把网络故障
+	// 说成业务失败，用户重试也看不到真实原因。这里单次失败继续退避重试，
+	// 全部失败时把查询错误抛给调用方（动作本身可能已成功，但结论不可知）。
+	var lastErr error
 	for i := 1; i < claimPollAttempts; i++ {
-		time.Sleep(claimPollGap)
-		t2, err2 := p.taskByCode(a, code)
-		if err2 != nil {
-			return t, nil // 轮询期间的查询失败不覆盖已拿到的结果
+		if !sleepCtx(context.Background(), claimPollBackoff(i)) {
+			return t, nil
 		}
+		t2, err2 := p.taskByCodeFresh(a, code)
+		if err2 != nil {
+			lastErr = err2
+			continue
+		}
+		lastErr = nil
 		if t2 != nil {
 			t = t2
 			if t.Claimable || t.Claimed {
@@ -268,22 +296,18 @@ func (p *Panel) taskByCodeWaiting(a *auth.Auth, code string) (*upstream.Task, er
 			}
 		}
 	}
+	if lastErr != nil {
+		return t, fmt.Errorf("回读任务进度失败（动作可能已生效，请稍后查询）: %w", lastErr)
+	}
 	return t, nil
 }
 
 // taskByCodeMP 以小程序口径拉取任务列表并定位单个任务；未找到返回 nil。
 // 小程序限定任务（school_season / Sequential_Tasks_1）在默认口径列表不出现。
 func (p *Panel) taskByCodeMP(a *auth.Auth, code string) (*upstream.Task, error) {
-	tasks, err := p.cfg.Upstream.ListTasksMP(a)
-	if err != nil {
-		return nil, err
-	}
-	for i := range tasks {
-		if tasks[i].TaskCode == code {
-			return &tasks[i], nil
-		}
-	}
-	return nil, nil
+	// 合并快照已包含 mp 专属码（fetchTaskList 并行拉两路口径并按 code 去重），
+	// 这里复用同一份数据，避免每个 mp 动作都额外打一遍 mp 列表。
+	return p.taskByCode(a, code)
 }
 
 // acceptWithVerifyMP accept 并回读验证登记生效：上游存在 200+OK 但 accept 未真正
@@ -292,15 +316,17 @@ func (p *Panel) taskByCodeMP(a *auth.Auth, code string) (*upstream.Task, error) 
 func (p *Panel) acceptWithVerifyMP(a *auth.Auth, code string) bool {
 	for attempt := 1; attempt <= 2; attempt++ {
 		if err := p.cfg.Upstream.AcceptTasksMP(a, []string{code}); err != nil {
-			log.Printf("autotask %s %s: accept 尝试%d: %v", logfmt.Label(a.UID, a.Nickname), code, attempt, err)
+			log.Printf("autotask %s %s: accept 尝试%d: %v", logfmt.Label(a.UID, a.NicknameValue()), code, attempt, err)
 			continue
 		}
-		time.Sleep(mpActionGap)
-		t, err := p.taskByCodeMP(a, code)
+		// accept 是写操作，快照必须失效，否则回读会把 old 状态当结果。
+		p.invalidateTaskSnap(a.UID)
+		sleepCtx(context.Background(), mpActionGap)
+		t, err := p.taskByCodeFresh(a, code)
 		if err == nil && t != nil && t.AcceptStatus != "not_accepted" && t.AcceptStatus != "" {
 			return true
 		}
-		log.Printf("autotask %s %s: accept 尝试%d 未登记生效（回读=%q）", logfmt.Label(a.UID, a.Nickname), code, attempt, acceptStatusOr(t))
+		log.Printf("autotask %s %s: accept 尝试%d 未登记生效（回读=%q）", logfmt.Label(a.UID, a.NicknameValue()), code, attempt, acceptStatusOr(t))
 	}
 	return false
 }
@@ -365,45 +391,19 @@ func (p *Panel) runMPMiniChatTask(a *auth.Auth, code string, withActivityId bool
 		}
 		return fmt.Sprintf("已领取奖励（+%dc +%de）", credit, energy), nil
 	}
-	// 判据上报：按差额补 mini chat 事件。每条前 sleep mpChatEventGap+抖动——
-	// 连发会被上游反作弊判无效（见 mpChatEventGap 注释），宁可慢不可白报。
+	// 判据上报：按差额逐条补 mini chat 事件。**不再在本调用栈里 sleep**——
+	// 45s/条的真人节奏是反作弊硬要求（见 mpChatEventGap 注释），但把它塞在请求
+	// 或队列 worker 里会让单账号「一键做任务」必然超过 5 分钟 HTTP 上限、期间
+	// 账号锁与 worker 全被占住。改为登记到 mp 节奏调度器：本函数立即返回，调度器
+	// 每次只发一条、达标即领奖，面板通过任务列表/活动记录看到进度。
 	need := target - t.Current
-	for i := int64(0); i < need; i++ {
-		time.Sleep(mpChatEventGap + time.Duration(rand.Int64N(int64(10*time.Second))))
-		conv := fmt.Sprintf("wb2api-mp-%d-%d", time.Now().UnixMilli(), i)
-		var ev map[string]any
-		if withActivityId {
-			ev = upstream.SchoolSeasonChatEvent(conv)
-		} else {
-			ev = upstream.SchoolChatTimesEvents(conv)
+	if need > 0 {
+		if !p.enqueueMPPace(a, code, withActivityId) {
+			return "", fmt.Errorf("任务队列繁忙，请稍后重试")
 		}
-		if err := p.cfg.Upstream.ReportMPEvent(a, ev); err != nil {
-			return fmt.Sprintf("完成 %d/%d 次上报后中断: %v", i, need, err), nil
-		}
+		return fmt.Sprintf("已排入节奏队列：剩余 %d 条对话事件将按真人节奏（约 45 秒/条）后台自动上报，达标后自动领奖；可离开本页", need), nil
 	}
-	// 回读（异步计分，有界轮询复用 claimPoll 预算的紧凑版：两轮各隔 3s）。
-	for i := 0; i < 2; i++ {
-		time.Sleep(claimPollGap)
-		t2, err2 := p.taskByCodeMP(a, code)
-		if err2 != nil || t2 == nil {
-			continue
-		}
-		t = t2
-		if t.Claimable || t.Claimed || t.Current >= target {
-			break
-		}
-	}
-	if t.Claimed {
-		return "本轮已入账（claimed）", nil
-	}
-	if t.Current < target {
-		return fmt.Sprintf("已上报 %d 次但进度未达 %d/%d（异步计分未归账，下次重试）", need, t.Current, target), nil
-	}
-	credit, energy, err := p.cfg.Upstream.ClaimRewardMP(a, code)
-	if err != nil {
-		return "", err
-	}
-	return fmt.Sprintf("任务点亮并领取奖励（+%dc +%de）", credit, energy), nil
+	return "进度无需补报", nil
 }
 
 // runSchoolSeason 完成 school_season「校园日」（growth 域小程序限定）。
@@ -473,7 +473,7 @@ func (p *Panel) runSequentialEventTask(a *auth.Auth, code string, primary, fallb
 	}
 	// 回读（两轮各隔 3s）；未点亮且有 fallback 时补报一轮再读。
 	for round := 0; round < 2; round++ {
-		time.Sleep(claimPollGap)
+		sleepCtx(context.Background(), claimPollGap)
 		t2, err2 := p.taskByCodeMP(a, code)
 		if err2 != nil || t2 == nil {
 			continue
@@ -594,7 +594,7 @@ func runMiniExpert(p *Panel, a *auth.Auth) (string, error) {
 	}
 	// 回读（异步计分，两轮各隔 3s——与 runMPMiniChatTask 同预算）。
 	for i := 0; i < 2; i++ {
-		time.Sleep(claimPollGap)
+		sleepCtx(context.Background(), claimPollGap)
 		t2, err2 := p.taskByCodeMP(a, code)
 		if err2 != nil || t2 == nil {
 			continue
@@ -616,6 +616,9 @@ func runMiniExpert(p *Panel, a *auth.Auth) (string, error) {
 	}
 	return fmt.Sprintf("任务点亮并领取奖励（+%dc +%de）", credit, energy), nil
 }
+
+// errTaskSnapNoUpstream 任务快照缺少上游客户端（面板降级装配）。
+var errTaskSnapNoUpstream = errors.New("upstream client unavailable")
 
 // errAccountNoTask 哨兵错误：让异步流水线把"任务不存在"与其它上游/执行错误区分开，
 // 以便 handler 侧保留原有的 404 分类（其余错误回 502）。
@@ -814,7 +817,7 @@ func runChat5(p *Panel, a *auth.Auth) (string, error) {
 			return fmt.Sprintf("上报第 %d/%d 条失败: %v", i+1, need, err), nil
 		}
 		if i < need-1 {
-			time.Sleep(reportGap)
+			sleepCtx(context.Background(), reportGap)
 		}
 	}
 	return fmt.Sprintf("已补报 %d 条对话事件", need), nil
@@ -825,7 +828,7 @@ func runFirstBuddy(p *Panel, a *auth.Auth) (string, error) {
 	if err := p.cfg.Upstream.ReportChatActivity(a, fmt.Sprintf("wb2api-adopt-%d", time.Now().UnixMilli()), ""); err != nil {
 		return "", fmt.Errorf("前置上报: %w", err)
 	}
-	time.Sleep(reportGap) // 给上游事件处理留时间（脚本实测口径）
+	sleepCtx(context.Background(), reportGap) // 给上游事件处理留时间（脚本实测口径）
 	if err := p.cfg.Upstream.BuddyAgreement(a); err != nil {
 		return "", fmt.Errorf("同意协议: %w", err)
 	}
@@ -845,7 +848,7 @@ func runModelChat(p *Panel, a *auth.Auth) (string, error) {
 	if err := p.cfg.Upstream.AcceptTasks(a, []string{code}); err != nil {
 		log.Printf("panel: accept %s: %v（继续走行为链路）", code, err)
 	}
-	time.Sleep(reportGap)
+	sleepCtx(context.Background(), reportGap)
 	// 2. 真实对话一次（判据的最直接证据）
 	body, _ := json.Marshal(map[string]any{
 		"model": modelID,
@@ -865,7 +868,7 @@ func runModelChat(p *Panel, a *auth.Auth) (string, error) {
 	// 读干 SSE（网关对上游强制 flow：不读完会残留连接）
 	_, _ = io.Copy(io.Discard, io.LimitReader(rc, 1<<20))
 	rc.Close()
-	time.Sleep(reportGap)
+	sleepCtx(context.Background(), reportGap)
 	// 3. 对齐模型的上报（触发进度）
 	if err := p.cfg.Upstream.ReportChatActivityModel(a, fmt.Sprintf("wb2api-glm52-%d", time.Now().UnixMilli()), "", modelID, modelName); err != nil {
 		return "对话已完成，但进度上报失败：" + err.Error(), nil
@@ -1040,7 +1043,7 @@ func runAppearance(p *Panel, a *auth.Auth) (string, error) {
 	if err := p.cfg.Upstream.SetAppearanceTheme(a, themeKey); err != nil {
 		return "", fmt.Errorf("设置主题: %w", err)
 	}
-	time.Sleep(2 * time.Second)
+	sleepCtx(context.Background(), 2*time.Second)
 	if err := p.cfg.Upstream.ReportDesktopEvent(a, upstream.DesktopEvent{
 		"eventCode": "appearance_skin_apply", "action": "apply", "source": "settings_close",
 		"id": themeKey, "vipLevel": 0, "series": "", "type": "unknown",
@@ -1063,7 +1066,7 @@ func runTemplateUse(p *Panel, a *auth.Auth) (string, error) {
 		if err := p.cfg.Upstream.ReportDesktopEvent(a, events...); err != nil {
 			return fmt.Sprintf("第 %d 组模板事件上报失败: %v", i+1, err), nil
 		}
-		time.Sleep(300 * time.Millisecond)
+		sleepCtx(context.Background(), 300*time.Millisecond)
 	}
 	return "已上报 template_used ×5", nil
 }
@@ -1145,11 +1148,20 @@ func runExpertBatch(p *Panel, a *auth.Auth, expertType string, count int) (strin
 		}
 		ok++
 		if i < len(experts)-1 {
-			time.Sleep(expertSummonGap)
+			sleepCtx(context.Background(), expertSummonGap)
 		}
 	}
-	_ = fail
-	return fmt.Sprintf("已对 %d 位真实专家完成召唤+使用链（类型 %s）", ok, expertType), nil
+	// 全失败必须报错：此前无论 ok 是多少都返回 nil，调用方据此记「任务已完成」，
+	// 用户看到成功但任务进度不动（上游判据是真实专家使用链，一条都没成时不可能
+	// 达标）。部分成功仍按成功返回，文案里带上失败数便于排查。
+	if ok == 0 {
+		return "", fmt.Errorf("专家使用链全部失败（%d 次尝试，类型 %s），请检查专家市场与上游可用性", fail, expertType)
+	}
+	msg := fmt.Sprintf("已对 %d 位真实专家完成召唤+使用链（类型 %s）", ok, expertType)
+	if fail > 0 {
+		msg += fmt.Sprintf("，%d 次尝试失败", fail)
+	}
+	return msg, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -1194,11 +1206,12 @@ func (p *Panel) runAutoAll(a *auth.Auth) (out []map[string]any) {
 					"message": "接受任务失败（不阻塞后续）: " + err.Error(),
 				})
 			} else {
+				p.invalidateTaskSnap(a.UID)
 				out = append(out, map[string]any{
 					"task_code": "(批量接受)", "status": "done",
 					"message": fmt.Sprintf("已接受 %d 个任务", len(codes)),
 				})
-				time.Sleep(reportGap)
+				sleepCtx(context.Background(), reportGap)
 			}
 		}
 	} else {
@@ -1220,11 +1233,12 @@ func (p *Panel) runAutoAll(a *auth.Auth) (out []map[string]any) {
 					"message": "接受小程序任务失败（不阻塞后续）: " + err.Error(),
 				})
 			} else {
+				p.invalidateTaskSnap(a.UID)
 				out = append(out, map[string]any{
 					"task_code": "(批量接受-mp)", "status": "done",
 					"message": fmt.Sprintf("已接受 %d 个小程序任务", len(mpCodes)),
 				})
-				time.Sleep(reportGap)
+				sleepCtx(context.Background(), reportGap)
 			}
 		}
 	} else {
@@ -1260,11 +1274,12 @@ func (p *Panel) runAutoAll(a *auth.Auth) (out []map[string]any) {
 		if !before.Claimable && !(before.Target > 0 && before.Current >= before.Target) {
 			msg, err = act.run(p, a)
 			if err == nil {
-				if isMPTaskCode(act.TaskCode) {
-					after, err = p.taskByCodeMP(a, act.TaskCode)
-				} else {
-					after, err = p.taskByCodeWaiting(a, act.TaskCode)
-				}
+				// 动作已完成（含事件上报/接受/领奖）：快照必然过旧，先失效再回读。
+				p.invalidateTaskSnap(a.UID)
+				// mp 与非 mp 用同一套有界轮询：上游计分是异步的，只读一次会把
+				// 「刚上报、还没落账」误判成「进度未推进」，进而误报失败并让
+				// 用户重跑整条链路（重复消耗风控额度）。
+				after, err = p.taskByCodeWaiting(a, act.TaskCode)
 			}
 			if err == nil && (after == nil || (!after.Claimable && !after.Claimed && after.Current <= before.Current)) {
 				err = fmt.Errorf("上游进度未推进，请重新查询任务状态")
@@ -1304,7 +1319,9 @@ func (p *Panel) runAutoAll(a *auth.Auth) (out []map[string]any) {
 			}
 		}
 		out = append(out, item)
-		time.Sleep(reportGap) // 项间节流
+		if !sleepCtx(context.Background(), reportGap) { // 项间节流（可被停机取消）
+			break
+		}
 	}
 	return out
 }

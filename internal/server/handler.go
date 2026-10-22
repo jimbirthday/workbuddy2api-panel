@@ -1647,16 +1647,28 @@ func promptTooLongMessage(body string) string {
 }
 
 // usageCreditTotal 从聚合响应取 usage.credit 与 total_tokens（成本台账非流式入口）。
-// 任一字段缺失/非法 → ok=false（不记录）。
+//
+// 判据是「usage.credit 键存在且为数值」，不是 total_tokens>0：此前把两者绑在
+// 一起，上游偶尔只回 credit 不回 total 时整笔积分观测被丢弃——用量页少记一次
+// 扣减，「积分 / 1M Token」的分母也跟着缺样本。token 为 0 时返回 0，由调用方
+// （NoteModelCost）自行跳过单价归一，不影响 credit 入账。
 func usageCreditTotal(resp map[string]any) (credit float64, total int, ok bool) {
 	usage, _ := resp["usage"].(map[string]any)
 	if usage == nil {
 		return 0, 0, false
 	}
-	c, _ := usage["credit"].(float64)
-	t, _ := usage["total_tokens"].(float64)
-	if t <= 0 {
+	raw, exists := usage["credit"]
+	if !exists {
 		return 0, 0, false
+	}
+	c, isNum := raw.(float64)
+	if !isNum {
+		// credit 可能是 null（上游没给）或字符串（不可信）：都不入账。
+		return 0, 0, false
+	}
+	t, _ := usage["total_tokens"].(float64)
+	if t < 0 {
+		t = 0
 	}
 	return c, int(t), true
 }

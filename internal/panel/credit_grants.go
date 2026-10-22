@@ -141,7 +141,7 @@ func (p *Panel) creditGrants(w http.ResponseWriter, r *http.Request) {
 			"total_size":   int64(0),
 			"total_remain": int64(0),
 			"total_used":   int64(0),
-			"note":         "尚未刷新积分包：请先在积分构成页执行一次刷新",
+			"note":         "尚未刷新积分包：请先在任务与福利页点「刷新积分」",
 		})
 		return
 	}

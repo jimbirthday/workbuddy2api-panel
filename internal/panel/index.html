@@ -1086,7 +1086,6 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <li><a href="#accounts" data-view="accounts" class="on">账号池</a></li>
       <li><a href="#activity" data-view="activity">活动记录</a></li>
       <li><a href="#usage" data-view="usage">用量</a></li>
-      <li><a href="#packages" data-view="packages">积分构成</a></li>
       <li><a href="#taskscenter" data-view="taskscenter">任务与福利</a></li>
       <li><a href="#connect" data-view="connect">接入</a></li>
       <li><a href="#models" data-view="models">模型与档位</a></li>
@@ -1167,10 +1166,10 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
            （数据来自 state.json，不经上游），「检查」按钮改为拉取逐包明细的增强入口。 -->
       <div class="box" id="expBox">
         <header>
-          <h3>积分到期提醒<span class="hint" title="上游按失效时刻先后自动优先扣减（FEFO）；日均需耗 = 批次剩余 ÷ 距到期天数">近 7 天</span></h3>
+          <h3>积分到期提醒 <span class="hint">近 7 天</span></h3>
           <span class="grow"></span>
           <span class="note" id="expNote"></span>
-          <button class="xs ghost" id="btnExpTasks" title="到任务中心查看并执行成长任务">去任务</button>
+          <button class="xs ghost" id="btnExpTasks" title="到任务与福利页执行成长任务">去任务</button>
           <button class="xs" id="btnExp" title="实时查询每个账号的逐包到期明细">实时检查</button>
           <button class="xs ghost" id="btnExpToggle" aria-expanded="false" aria-controls="expList">展开明细</button>
         </header>
@@ -1188,10 +1187,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <button class="xs ghost" id="btnAllEnable" title="解冻全部账号：清除人工禁用、冷却与熔断">全部启用</button>
           <button class="xs ghost danger" id="btnAllDisable" title="禁用全部账号：保号任务与选号都跳过，需手动解冻">全部禁用</button>
           <button class="xs" id="btnAccountsExport">导出账号</button>
-          <button class="xs" id="btnCheckinAll">全部签到</button>
-          <button class="xs" id="btnTravelAll">旅行巡检</button>
-          <button class="xs" id="btnActivityAll">活跃上报</button>
-          <button class="xs" id="btnKeepaliveAll">全部保活</button>
+          <button class="xs primary" id="btnGoTasks" title="签到、成长任务、猫猫旅行、连登抽奖、活跃上报、保活都在同一页">批量任务</button>
         </header>
         <!-- 账号表筛选（照抄模型页 #mdFilter 的做法）：账号数据来自 /overview，
              筛选与排序全在前端完成，改条件零延迟、不额外打上游。 -->
@@ -1234,6 +1230,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <button type="button" class="xs ghost" id="btnSelEnable" disabled title="仅解冻选中账号">启用选中</button>
           <button type="button" class="xs ghost" id="btnSelPause" disabled title="仅暂停选中账号的选号">暂停选中</button>
           <button type="button" class="xs ghost danger" id="btnSelDisable" disabled title="仅禁用选中账号">禁用选中</button>
+          <button type="button" class="xs ghost danger" id="btnSelRemove" disabled title="移除选中账号及其凭证文件，不可恢复">移除选中</button>
           <span class="note" id="accSelNote" hidden></span>
           <span class="grow"></span>
           <span class="note" id="accCount"></span>
@@ -1253,7 +1250,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 
       <div class="box">
         <header>
-          <h3>模型锁池 <span class="hint">哪些模型不能用、还要锁多久</span></h3>
+          <h3>模型锁池</h3>
           <span class="grow"></span>
           <span class="note" id="mlNote"></span>
         </header>
@@ -1274,7 +1271,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <div class="view-head">
         <div>
           <h2>任务与福利</h2>
-          <p>选择账号执行签到、成长任务、旅行或连登抽奖。任务在后台运行，可在下方查看进度与逐账号结果。</p>
+          <p>选择账号执行签到、成长任务、猫猫旅行或连登抽奖；任务在后台运行，进度与逐账号结果都在本页。</p>
         </div>
         <div class="view-acts">
           <button class="xs ghost" id="btnBenefitsRefresh">刷新概览</button>
@@ -1282,43 +1279,60 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         </div>
       </div>
 
-      <div class="box benefits-actions">
-        <header>
-          <h3>国际版每日活跃 <span class="hint">只作用于国际版个人账号；桌面 + 网页两条通道</span></h3>
-          <span class="grow"></span>
-          <span class="note" id="bfActionNote"></span>
-          <button class="xs primary" id="btnBfDailyChatAll">全部每日活跃</button>
-        </header>
-      </div>
-
       <div class="box benefits-focus">
         <header>
-          <h3>国内版任务与福利 <span class="hint">选择全部时批量执行，选择单号时只作用于该账号</span></h3>
+          <h3>任务与福利</h3>
           <span class="grow"></span>
-          <label class="sel-note">账号
-            <select id="bfGrowthAcct" aria-label="选择国内版任务范围"></select>
+          <label class="sel-note">范围
+            <select id="bfGrowthAcct" aria-label="选择任务范围"></select>
           </label>
         </header>
         <div class="pad bf-grid">
           <div class="bf-group">
-            <div class="bf-k">Buddy 签到</div>
-            <div class="bf-d">每日签到；范围仅包含已启用的国内个人账号。</div>
-            <button class="xs" id="bfBtnFocusCheckin" data-task-action="checkin" disabled>Buddy 签到</button>
+            <div class="bf-k">签到 <span class="bf-scope">国内个人号</span></div>
+            <div class="bf-row">
+              <button class="xs" id="bfBtnFocusCheckin" data-task-action="checkin" disabled>签到</button>
+              <button class="xs ghost" id="bfBtnAllCheckin">全部签到</button>
+            </div>
           </div>
           <div class="bf-group">
-            <div class="bf-k">成长任务</div>
-            <div class="bf-d">单号执行可自动任务；全部账号使用下方队列，支持扫描与并发。</div>
-            <button class="xs primary" id="bfBtnFocusRun" data-task-action="tasks" disabled>一键做任务</button>
+            <div class="bf-k">成长任务 <span class="bf-scope">国内个人号</span></div>
+            <div class="bf-row">
+              <button class="xs" id="bfBtnFocusRun" data-task-action="tasks" disabled>做任务</button>
+              <button class="xs ghost" id="bfBtnAllTasks">全部成长任务</button>
+            </div>
           </div>
           <div class="bf-group">
-            <div class="bf-k">猫猫旅行</div>
-            <div class="bf-d">领养、派出或领取旅行奖励；一次巡检只推进一步。</div>
-            <button class="xs" id="bfBtnFocusTravel" data-task-action="travel" disabled>猫猫旅行</button>
+            <div class="bf-k">猫猫旅行 <span class="bf-scope">国内个人号</span></div>
+            <div class="bf-row">
+              <button class="xs" id="bfBtnFocusTravel" data-task-action="travel" disabled>猫猫旅行</button>
+              <button class="xs ghost" id="bfBtnAllTravel">全部猫猫旅行</button>
+            </div>
           </div>
           <div class="bf-group">
-            <div class="bf-k">连登与抽奖</div>
-            <div class="bf-d">兑换已解锁连登档位，并抽完当前可用次数。</div>
-            <button class="xs" id="bfBtnFocusStreak" data-task-action="streak" disabled>连登与抽奖</button>
+            <div class="bf-k">连登与抽奖 <span class="bf-scope">国内个人号</span></div>
+            <div class="bf-row">
+              <button class="xs" id="bfBtnFocusStreak" data-task-action="streak" disabled>连登与抽奖</button>
+              <button class="xs ghost" id="bfBtnAllStreak">全部连登与抽奖</button>
+            </div>
+          </div>
+          <div class="bf-group">
+            <div class="bf-k">活跃上报 <span class="bf-scope">全池</span></div>
+            <div class="bf-row">
+              <button class="xs ghost" id="bfBtnAllActivity">全部活跃上报</button>
+            </div>
+          </div>
+          <div class="bf-group">
+            <div class="bf-k">Token 保活 <span class="bf-scope">全池</span></div>
+            <div class="bf-row">
+              <button class="xs ghost" id="bfBtnAllKeepalive">全部 Token 保活</button>
+            </div>
+          </div>
+          <div class="bf-group">
+            <div class="bf-k">国际版每日活跃 <span class="bf-scope">全池·国际</span></div>
+            <div class="bf-row">
+              <button class="xs ghost" id="btnBfDailyChatAll">全部国际版每日活跃</button>
+            </div>
           </div>
         </div>
         <div class="pad bf-focus-summary" id="bfFocusSummary"></div>
@@ -1330,9 +1344,38 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         </div>
       </div>
 
+      <div class="box" id="bfAdvanced">
+        <header>
+          <h3>成长任务队列</h3>
+          <span class="grow"></span>
+          <span class="note" id="qcSummary"></span>
+          <button class="xs" id="btnSchoolVouchers" title="开学季抽奖券码">查询券码</button>
+          <label class="sel-note">并发
+            <select id="qcConc"><option value="1">1</option><option value="2">2</option><option value="3" selected>3</option></select>
+          </label>
+          <button class="xs" id="btnScanAll">扫描待办</button>
+          <button class="xs primary" id="btnRunQueue">执行全部待办</button>
+        </header>
+        <div class="qprog" id="qProg" hidden>
+          <div class="qbar"><i id="qBarFill"></i></div>
+          <span class="note" id="qProgText"></span>
+        </div>
+        <div class="hint" id="qcScanFail" role="alert" hidden style="padding: 8px 16px 0; color: var(--bad)"></div>
+        <div class="tc-empty" id="tcEmpty">
+          <svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+            <rect x="8" y="6" width="24" height="36" rx="3"/>
+            <path d="M14 16h12M14 24h12M14 32h7" opacity=".45"/>
+            <circle cx="35" cy="33" r="8"/><path d="m40 38 5 5"/>
+          </svg>
+          <div class="t">还没有扫描过</div>
+          <div class="d">扫描已启用的国内个人账号，查看可自动完成的成长任务，再按队列执行。</div>
+        </div>
+        <div id="qcList"></div>
+      </div>
+
       <div class="box benefits-batches">
         <header>
-          <h3>执行日志 <span class="hint">最近执行进度与结果；详细历史见活动记录</span></h3>
+          <h3>本次执行</h3>
           <span class="grow"></span>
           <span class="note" id="bfBatchNote" role="status" aria-live="polite">—</span>
           <button class="xs" id="bfBtnLogRefresh" title="重新读取最近活动记录">刷新日志</button>
@@ -1367,7 +1410,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 
       <div class="box">
         <header>
-          <h3>账号福利概览 <span class="hint">今日签到、最近活动与成长待办</span></h3>
+          <h3>账号福利概览</h3>
           <span class="grow"></span>
           <span class="note" id="bfAcctNote"></span>
         </header>
@@ -1379,41 +1422,10 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         </div>
       </div>
 
-      <details class="box" id="bfAdvanced">
-        <summary class="pad" style="cursor:pointer;font-weight:650">全部成长任务队列</summary>
-        <header>
-          <h3>成长任务队列 <span class="hint" id="qcSummary"></span></h3>
-          <span class="grow"></span>
-          <button class="xs" id="btnSchoolVouchers" title="开学季抽奖抽中的第三方券码（活动已结束，历史券码仍可查）">查询券码</button>
-          <label class="sel-note">并发
-            <select id="qcConc"><option value="1" selected>1</option><option value="2">2</option><option value="3">3</option></select>
-          </label>
-          <button class="xs" id="btnScanAll">扫描待办</button>
-          <button class="xs primary" id="btnRunQueue">执行全部待办</button>
-        </header>
-        <div class="qprog" id="qProg" hidden>
-          <div class="qbar"><i id="qBarFill"></i></div>
-          <span class="note" id="qProgText"></span>
-        </div>
-        <div class="hint" id="qcHelp" role="note" style="padding: 10px 16px 0">
-          扫描只读取上游任务，不会执行；执行队列含真实对话，耗时较长。失败原因可悬停或聚焦查看完整内容。
-        </div>
-        <div class="hint" id="qcScanFail" role="alert" hidden style="padding: 8px 16px 0; color: var(--bad)"></div>
-        <div class="tc-empty" id="tcEmpty">
-          <svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
-            <rect x="8" y="6" width="24" height="36" rx="3"/>
-            <path d="M14 16h12M14 24h12M14 32h7" opacity=".45"/>
-            <circle cx="35" cy="33" r="8"/><path d="m40 38 5 5"/>
-          </svg>
-          <div class="t">还没有扫描过</div>
-          <div class="d">扫描已启用的国内个人账号，查看可自动完成的成长任务，再按队列执行。</div>
-        </div>
-        <div id="qcList"></div>
-      </details>
       <details class="box benefits-grants">
         <summary class="pad" style="cursor:pointer;font-weight:650">积分发放快照</summary>
         <header>
-          <h3>积分发放记录 <span class="hint">来自最近一次刷新积分的快照，不是逐笔账本</span></h3>
+          <h3>积分发放记录</h3>
           <span class="grow"></span>
           <span class="note" id="bfGrantNote"></span>
           <button class="xs" id="bfBtnRefreshGrants" title="逐账号实时查询积分包，用于更新总积分与发放记录">刷新积分</button>
@@ -1427,17 +1439,17 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       </details>
     </section>
 
-    <!-- 活动记录：签到 / 每日活跃 / 活跃上报 / 旅行 / 保活的每次真实尝试 -->
+    <!-- 活动记录：签到 / 每日活跃 / 活跃上报 / 猫猫旅行 / 保活的每次真实尝试 -->
     <section class="view" id="view-activity" hidden>
       <div class="view-head">
         <div>
           <h2>活动记录</h2>
-          <p>查看签到、成长任务、活跃、旅行、连登与保活的执行历史，按账号、结果和时间筛选。</p>
+          <p>查看签到、成长任务、活跃上报、猫猫旅行、连登与保活的执行历史。</p>
         </div>
       </div>
       <div class="box">
         <header>
-          <h3>账号活动记录 <span class="hint">每次真实尝试，含失败原因</span></h3>
+          <h3>账号活动记录</h3>
           <span class="grow"></span>
           <span class="note" id="actNote" role="status" aria-live="polite">—</span>
           <button class="xs" id="btnActivityReload">刷新</button>
@@ -1483,8 +1495,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       </div>
       <div class="box">
         <header>
-          <h3>模型能力 <span class="hint">max_tokens bug已修复目前可以正常透传最大输出,但是官方返回的最大输出仅为参考，不保证完全正确
-          </span></h3>
+          <h3>模型能力</h3>
           <span class="grow"></span>
           <span class="note" id="mdNote">实时查询上游</span>
           <button class="xs" id="btnModels">重新获取</button>
@@ -1538,51 +1549,6 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       </div>
     </section>
 
-    <!-- 积分构成 -->
-    <section class="view" id="view-packages" hidden>
-      <div class="view-head">
-        <div>
-          <h2>积分构成</h2>
-          <p>按来源、到期时间与账号拆分积分包；明细默认只展开最早到期的一小组。</p>
-        </div>
-      </div>
-      <div class="box">
-        <header>
-          <h3>积分到期分布</h3>
-          <span class="grow"></span>
-          <span class="note">按批次到期日聚合，颜色区分账号</span>
-        </header>
-        <div class="pad"><div id="pkExpiry"></div></div>
-      </div>
-
-      <div class="box">
-        <header>
-          <h3>账号对比</h3>
-          <span class="grow"></span>
-          <span class="note" id="pkNote">—</span>
-        </header>
-        <div class="fbar">
-          <input id="pkQ" type="search" placeholder="搜索账号" aria-label="筛选积分账号">
-          <select id="pkSort" title="逐包明细的排序规则">
-            <option value="end_asc" selected>按到期时间</option>
-            <option value="size_desc">按面额大小</option>
-          </select>
-          <span class="grow"></span>
-          <button class="xs" id="btnPk">刷新</button>
-        </div>
-        <div class="pad"><div class="pk-grid" id="pkSummary"></div></div>
-      </div>
-      <div class="box" id="pkDetailBox">
-        <header>
-          <h3>逐包明细 <span class="hint" id="pkDetailCount">—</span></h3>
-          <span class="grow"></span>
-          <span class="note">每账号默认只展开最早到期的一小组，其余包按账号懒加载</span>
-          <button class="xs" id="btnPkDetailToggle" aria-expanded="false">展开全部账号</button>
-        </header>
-        <div id="pkDetail"></div>
-      </div>
-    </section>
-
     <!-- 用量 -->
     <section class="view" id="view-usage" hidden>
       <div class="view-head">
@@ -1604,10 +1570,14 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <div class="pad">
           <div class="uschart">
             <div class="uschart-hd">
-              <span class="lb">Token 时序</span>
+              <span class="lb" id="usChartTitle">Token 时序</span>
+              <span class="vtabs" id="usChartTabs">
+                <button type="button" data-metric="tokens" class="on" aria-pressed="true">Token</button>
+                <button type="button" data-metric="credits" aria-pressed="false">积分</button>
+              </span>
               <span class="note" id="usChartNote">—</span>
               <span class="grow"></span>
-              <span class="legend">
+              <span class="legend" id="usChartLegend">
                 <i class="sw sw-p"></i>prompt<i class="sw sw-c"></i>completion
                 <span class="sep"></span><i class="sw sw-t"></i>均值
               </span>
@@ -1633,6 +1603,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <label class="sel-note">排序
             <select id="usSort">
               <option value="total">合计 Token</option>
+              <option value="credits">扣除积分</option>
               <option value="requests">请求数</option>
               <option value="errors">失败数</option>
               <option value="latency">平均延迟</option>
@@ -1646,8 +1617,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <span class="note" id="usDimPage"></span>
           <button type="button" class="xs ghost" id="btnUsDimNext">下一页</button>
         </header>
-        <div class="hint" style="padding:0 17px 10px">搜索仅影响列表，导出不含搜索词；导出仍遵循当前时间窗。</div>
-        <div class="tbl-wrap">
+                <div class="tbl-wrap">
           <table class="acc zebra cardify" id="usDimTable">
             <thead id="usDimHead"></thead>
             <tbody id="usDimBody"></tbody>
@@ -1657,15 +1627,14 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 
       <div class="box" id="remBox">
         <header>
-          <h3>剩余额度 <span class="hint">账号 / 模型两维，按本地自然日零点重置</span></h3>
+          <h3>剩余额度</h3>
           <span class="vtabs" id="remTabs"></span>
           <span class="grow"></span>
           <span class="note" id="remSummary">—</span>
           <input id="remQ" type="search" class="xs" placeholder="搜索账号 / 模型 / 域" aria-label="筛选剩余额度">
           <button class="xs" id="btnRemReload">刷新</button>
         </header>
-        <div class="hint" style="padding:0 17px 10px">限额为 0 表示该维度未启用；「用量未知」表示本地尚无当日快照，不能把未知当作额度充足。</div>
-        <div class="tbl-wrap">
+                <div class="tbl-wrap">
           <table class="acc zebra cardify" id="remTable">
             <thead id="remHead"></thead>
             <tbody id="remBody"></tbody>
@@ -1676,13 +1645,12 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 
       <div class="box" id="usPerfBox">
         <header>
-          <h3>性能分位 <span class="hint">TTFT / 总耗时 / 吐字速率，按模型</span></h3>
+          <h3>性能分位</h3>
           <span class="grow"></span>
           <span class="note" id="usPerfNote">—</span>
           <button class="xs" id="btnPerfReload">刷新分位</button>
         </header>
-        <div class="hint" style="padding:0 17px 10px">分位直接读取请求归档（不受列表 1000 条上限影响）；样本不足时会明确说明。</div>
-        <div class="tbl-wrap">
+                <div class="tbl-wrap">
           <table class="acc zebra cardify" id="usPerfTable">
             <thead><tr><th>模型</th><th class="num">请求</th><th class="num">耗时 p50</th><th class="num">耗时 p90</th><th class="num">耗时 p99</th><th class="num">TTFT p50</th><th class="num">TTFT p99</th><th class="num">吐字 p50</th></tr></thead>
             <tbody id="usPerfBody"></tbody>
@@ -1693,7 +1661,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 
       <div class="box">
         <header>
-            <h3>积分流水 <span class="hint">扣减按时间桶聚合；获取为最近一次积分包快照</span></h3>
+            <h3>积分流水</h3>
           <span class="vtabs" id="usCreditKindTabs">
             <button data-kind="spend" class="on" title="按小时/日聚合的扣减">扣减</button>
             <button data-kind="grant" title="本地用量桶无法还原领取流水">获取</button>
@@ -1707,8 +1675,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <div class="kpis" id="usCreditStats"></div>
         <details class="us-fold" id="usCreditAgg">
           <summary>聚合说明与维度汇总</summary>
-          <div class="hint" style="padding:2px 12px 10px">每行是一个时间桶（小时或日）内的聚合扣减，不是逐请求账单。获取档展示账号最近一次积分包快照（发放时间、来源、剩余/到期与关联任务），快照不是逐笔领取账本，也不含密钥或完整 UID。</div>
-        </details>
+                  </details>
         <div class="tbl-wrap us-credit-hist">
           <table class="acc zebra" id="usCreditHistTable">
             <thead id="usCreditHistHead"><tr><th>时间</th><th>粒度</th><th>账号</th><th>模型</th><th class="num">请求</th><th class="num">扣减积分</th><th class="num">Token</th></tr></thead>
@@ -1717,12 +1684,14 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         </div>
         <div class="empty" id="usCreditHistEmpty" hidden></div>
         <details class="us-fold" id="usCreditDetail">
-          <summary>按账号 / 模型汇总</summary>
+          <summary>积分汇总（账号 / 模型 / 域 / Key）</summary>
           <div class="tbl-wrap">
             <div class="fbar" style="padding:8px 12px">
               <span class="vtabs" id="usCreditTabs">
                 <button type="button" data-dim="account" class="on" aria-pressed="true">按账号</button>
                 <button type="button" data-dim="model" aria-pressed="false">按模型</button>
+                <button type="button" data-dim="realm" aria-pressed="false">按域</button>
+                <button type="button" data-dim="key" aria-pressed="false">按 Key</button>
               </span>
             </div>
             <table class="acc zebra">
@@ -1744,7 +1713,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       </div>
       <div class="box">
         <header>
-          <h3>客户端接入 <span class="hint">OpenAI Chat / Responses / Anthropic Messages</span></h3>
+          <h3>客户端接入</h3>
           <span class="grow"></span>
           <span class="note" id="cxNote">—</span>
           <button class="xs" id="btnConnectReload">刷新</button>
@@ -1753,20 +1722,19 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <div class="grid2">
             <label class="fld"><span class="lb">OpenAI Base URL</span>
               <div class="inline"><input id="cxV1" readonly><button type="button" class="xs" data-copy-el="cxV1">复制</button></div>
-              <span class="hint">SDK 的 base_url；Chat Completions 与 Responses 共用</span></label>
+              <span class="hint">Chat / Responses 共用</span></label>
             <label class="fld"><span class="lb">Anthropic Base URL</span>
               <div class="inline"><input id="cxAnthropic" readonly><button type="button" class="xs" data-copy-el="cxAnthropic">复制</button></div>
-              <span class="hint">Claude Code 等客户端使用 /v1/messages</span></label>
+              <span class="hint">用于 /v1/messages</span></label>
           </div>
           <div class="grid2">
             <label class="fld"><span class="lb">网关根地址</span>
               <div class="inline"><input id="cxBase" readonly><button type="button" class="xs" data-copy-el="cxBase">复制</button></div></label>
             <label class="fld"><span class="lb">模型列表</span>
               <div class="inline"><input id="cxModels" readonly><button type="button" class="xs" data-copy-el="cxModels">复制</button></div>
-              <span class="hint">来自本机观测；完整目录以 /v1/models 为准</span></label>
+              </label>
           </div>
-          <div class="hint" style="margin:4px 0 14px">示例只使用 <code>$WB_API_KEY</code> 占位符，不包含任何真实密钥；请从部署环境的客户端 Key 中取值。</div>
-          <div class="grid2">
+                    <div class="grid2">
             <div><div class="lb">Python OpenAI SDK</div><div class="code"><button type="button" class="xs copy" data-copy-el="cxOpenAI">复制</button><pre id="cxOpenAI"></pre></div></div>
             <div><div class="lb">cURL · Chat Completions</div><div class="code"><button type="button" class="xs copy" data-copy-el="cxCurl">复制</button><pre id="cxCurl"></pre></div></div>
           </div>
@@ -1799,21 +1767,20 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             <div class="grid2">
               <label class="fld"><span class="lb">监听地址</span>
                 <input name="listen" placeholder=":7863">
-                <span class="hint">改动需重启进程</span></label>
+                <span class="hint">需重启</span></label>
               <label class="fld"><span class="lb">API 密钥</span>
             <div class="inline"><input name="api_key" id="cfgKey" type="password" placeholder="留空 = 保持原密钥（已设置时）">
                 <button type="button" class="xs" id="btnEye">显示</button></div>
-                <span class="hint">立即生效（含面板自身）</span></label>
+                <span class="hint">立即生效</span></label>
             </div>
             <label class="fld"><span class="lb">单账号明细默认展示条数</span>
-              <input name="package_detail_limit" type="number" min="1" placeholder="5">
-              <span class="hint">积分构成页按最早到期展示，其余未用完包聚合</span></label>
+              <input name="package_detail_limit" type="number" min="1" placeholder="5"></label>
           </div>
         </div>
 
         <div class="box">
           <header>
-            <h3>客户端 API Key <span class="hint">仅用于网关业务鉴权；不能登录管理面板</span></h3>
+            <h3>客户端 API Key <span class="hint">仅业务鉴权</span></h3>
             <span class="grow"></span>
             <span class="note">可限制 realm / 模型；密钥回显为 ***，留空表示保持不变</span>
             <button type="button" class="xs" id="btnAddAPIKey">添加 Key</button>
@@ -1848,16 +1815,16 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
               <div>
                 <div class="switch"><span class="lb">猫猫旅行</span>
                   <input type="checkbox" name="travel_enabled"><span class="switch-track" aria-hidden="true"></span></div>
-                <label class="fld"><span class="lb">旅行时点（小时，逗号分隔）</span>
+                <label class="fld"><span class="lb">猫猫旅行时点（小时，逗号分隔）</span>
                   <input name="travel_hours" placeholder="9, 21">
-                  <span class="hint">一趟派出 + 一趟领奖闭环</span></label>
+                  </label>
               </div>
               <div>
                 <div class="switch"><span class="lb">活跃上报</span>
                   <input type="checkbox" name="activity_enabled"><span class="switch-track" aria-hidden="true"></span></div>
                 <label class="fld"><span class="lb">上报时点（小时，逗号分隔）</span>
                   <input name="activity_hours" placeholder="10">
-                  <span class="hint">点亮连登 + 解锁领养前置</span></label>
+                  </label>
               </div>
             </div>
             <div class="hr"></div>
@@ -1873,7 +1840,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
                 <input type="checkbox" name="growth_enabled" checked><span class="switch-track" aria-hidden="true"></span></div>
               <label class="fld"><span class="lb">执行时点（小时，逗号分隔）</span>
                 <input name="growth_hours" placeholder="1">
-                <span class="hint">每日到点自动「扫描 + 执行全部待办」（Sequential 任务链零点解锁后自动推进，建议零点后）</span></label>
+                <span class="hint">建议 0 点后</span></label>
             </div>
             <div class="hr"></div>
             <div class="grid2">
@@ -1882,12 +1849,12 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
                   <input type="checkbox" name="blackcat_enabled"><span class="switch-track" aria-hidden="true"></span></div>
                 <label class="fld"><span class="lb">补足时点（小时，逗号分隔）</span>
                   <input name="blackcat_hours" placeholder="23">
-                  <span class="hint">仅在 23:00–08:00 计数窗口内补足 glm-5.2 短对话</span></label>
+                  <span class="hint">23:00-08:00 窗口</span></label>
               </div>
               <div class="switch"><span class="lb">保号任务覆盖已禁用账号</span>
                 <input type="checkbox" name="include_disabled_in_tasks"><span class="switch-track" aria-hidden="true"></span></div>
             </div>
-            <div class="hint">禁用只关选号：打开后已禁用的账号仍会签到 / 活跃上报 / 保活 / 刷新余额（依旧不参与选号）。适合「一次只放开一个账号、用禁用做流量开关」的轮换养号用法，默认关闭。<br>若只想让<b>单个</b>账号临时退出选号但保留保号，直接用账号行的「<b>暂停选号</b>」按钮（账号级，无需打开本开关）。</div>
+            <div class="hint">禁用只关选号</div>
           </div>
         </div>
 
@@ -1900,7 +1867,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
                 <span class="hint">0 = 不限制</span></label>
               <label class="fld"><span class="lb">国际版在途上限</span>
                 <input name="max_in_flight_global" type="number" min="1" placeholder="2">
-                <span class="hint">global 域风控更紧，默认 2</span></label>
+                </label>
               <label class="fld"><span class="lb">连续失败熔断阈值</span>
                 <input name="breaker_threshold" type="number" min="1" placeholder="3"></label>
             </div>
@@ -1917,7 +1884,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
                 <input name="breaker_cooldown_max" placeholder="6h"></label>
               <label class="fld"><span class="lb">连败降权阈值</span>
                 <input name="degrade_threshold" type="number" min="1" placeholder="5">
-                <span class="hint">未知错误连败 N 次临时出池</span></label>
+                </label>
               <label class="fld"><span class="lb">连败降权时长</span>
                 <input name="degrade_cooldown" placeholder="10m"></label>
             </div>
@@ -1932,16 +1899,16 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             <div class="grid3">
               <label class="fld"><span class="lb">成本探索窗口</span>
                 <input name="cost_explore_interval" placeholder="30m">
-                <span class="hint">垄断破除：免费层垄断时定期搭车探索未知号；0 关停</span></label>
+                <span class="hint">0 = 关停</span></label>
               <label class="fld"><span class="lb">积分保底</span>
                 <input name="credit_floor" type="number" min="0" placeholder="100">
-                <span class="hint">余额低于此值不再接实测收费模型（保住免费模型可用）；0 关闭</span></label>
+                <span class="hint">0 = 关闭</span></label>
               <label class="fld"><span class="lb">快过期路由窗口</span>
                 <input name="expiring_soon" placeholder="168h">
-                <span class="hint">窗口内有快过期批次的账号选号权重 ×3（不排序、与金额无关）；0 关闭</span></label>
+                <span class="hint">0 = 关闭</span></label>
               <label class="fld"><span class="lb">会话粘性 TTL</span>
                 <input name="ttl" placeholder="30m">
-                <span class="hint">改动需重启进程</span></label>
+                <span class="hint">需重启</span></label>
             </div>
             <div class="switch"><span class="lb">快过期积分优先</span>
               <input type="checkbox" name="prefer_expiring"><span class="switch-track" aria-hidden="true"></span></div>
@@ -1949,10 +1916,10 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             <div class="grid2">
               <label class="fld"><span class="lb">账号日 Token 上限</span>
                 <input name="daily_token_limit" type="number" min="0" placeholder="0">
-                <span class="hint">账号当日累计达到后暂停选号，次日零点恢复；0 = 关闭</span></label>
+                <span class="hint">0 = 关闭</span></label>
               <label class="fld"><span class="lb">账号+模型日 Token 上限</span>
                 <input name="model_daily_token_limit" type="number" min="0" placeholder="0">
-                <span class="hint">只限制该账号在该模型上的当日用量，不影响其他模型；0 = 关闭</span></label>
+                <span class="hint">0 = 关闭</span></label>
             </div>
           </div>
         </div>
@@ -1975,16 +1942,16 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             <div class="grid2">
               <label class="fld"><span class="lb">出站 User-Agent</span>
                 <input name="user_agent" placeholder="留空 = CLI/2.63.2 CodeBuddy/2.63.2">
-                <span class="hint">影响官网积分记录「使用端」显示；需重启</span></label>
+                <span class="hint">需重启</span></label>
             </div>
             <div class="hr"></div>
             <div class="grid2">
               <label class="fld"><span class="lb">后台任务模型重定向</span>
                 <input name="background_model_names" placeholder="留空 = 关闭；例如 gpt-5.6-terra, gpt-5.6-luna">
-                <span class="hint">客户端隐藏的后台请求常烧付费额度；逗号分隔，支持 * 通配。匹配发生在 Key 白名单校验之后</span></label>
+                <span class="hint">支持 * 通配</span></label>
               <label class="fld"><span class="lb">重定向目标模型</span>
                 <input name="background_model_target" placeholder="例如 deepseek-v4.1-flash">
-                <span class="hint">两个字段都填写才生效；可带 cn: / global: 前缀。Key 必须也允许目标模型</span></label>
+                <span class="hint">两项都填才生效</span></label>
             </div>
             <div class="hr"></div>
             <div class="grid2">
@@ -2004,8 +1971,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
               <input type="checkbox" name="sanitize_blacklist_fingerprints"><span class="switch-track" aria-hidden="true"></span></div>
             <div class="switch"><span class="lb">会话粘性路由</span>
               <input type="checkbox" name="session_sticky_enabled"><span class="switch-track" aria-hidden="true"></span></div>
-            <div class="hint" style="margin-top:10px">Upstash Redis 镜像、凭证目录与状态文件路径需手工编辑配置文件（判为重启项）。</div>
-          </div>
+                      </div>
         </div>
 
         <div class="box">
@@ -2013,18 +1979,16 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <div class="pad">
             <div class="switch"><span class="lb">记录调用来源（客户端 IP / User-Agent）</span>
               <input type="checkbox" name="request_client_info"><span class="switch-track" aria-hidden="true"></span></div>
-            <div class="hint">开启后，「运行日志」页的请求记录会显示每次调用来自哪个 IP、用什么客户端；
-              关闭则归档与面板都不再出现来源信息。改动即时生效，无需重启。</div>
             <div class="hr"></div>
             <div class="switch"><span class="lb">归档请求元数据</span>
               <input type="checkbox" name="request_archive_enabled"><span class="switch-track" aria-hidden="true"></span></div>
             <div class="grid2">
               <label class="fld"><span class="lb">归档保留天数</span>
                 <input name="request_retention_days" type="number" min="1" placeholder="7">
-                <span class="hint">超期文件在启动和周期清理时删除</span></label>
+                </label>
               <label class="fld"><span class="lb">归档容量上限（MiB）</span>
                 <input name="request_archive_max_mb" type="number" min="1" placeholder="100">
-                <span class="hint">超限时优先删除最旧的归档文件</span></label>
+                </label>
             </div>
           </div>
         </div>
@@ -2048,7 +2012,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       </div>
       <div class="box" id="reqBox">
         <header>
-          <h3>请求记录 <span class="hint">调用来源：IP 取 X-Forwarded-For 首段，无代理头时回落 TCP 对端</span></h3>
+          <h3>请求记录</h3>
           <span class="grow"></span>
           <span class="note" id="reqSummary">—</span>
           <span class="note" id="reqNote">—</span>
@@ -2131,9 +2095,8 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 <div class="veil" id="taskVeil">
   <div class="dlg" role="dialog" aria-modal="true" aria-labelledby="taskDialogTitle" style="width:940px">
     <header>
-      <h3 id="taskDialogTitle">积分任务 <span class="hint" id="taskWho"></span></h3>
-      <div class="hint">查询上游任务进度；「接受」为报名（幂等），「领取」在进度达标后可用。所有操作走网关，无需外部脚本。</div>
-    </header>
+      <h3 id="taskDialogTitle">成长任务 <span class="hint" id="taskWho"></span></h3>
+          </header>
     <div class="body">
       <div class="state" id="taskState"><span class="dots">加载中</span></div>
       <div class="tbl-wrap">
@@ -2158,21 +2121,21 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   <div class="dlg" role="dialog" aria-modal="true" style="width:440px">
     <header>
       <h3>账号设置 <span class="hint" id="profileWho"></span></h3>
-      <div class="hint">备注只做展示；权重 1 = 不干预，2-100 = 优先接单并按权重比分流。</div>
+      <div class="hint">权重 1 = 不干预</div>
     </header>
     <div class="body">
       <label class="fld"><span class="lb">备注</span>
         <input id="profileNote" maxlength="200" placeholder="例如：批量 / 自用 / 客户A">
-        <span class="hint">最多 200 字符，保存在 auth 文件中，重启后保留。</span></label>
+        <span class="hint">最多 200 字</span></label>
       <label class="fld"><span class="lb">调度权重</span>
         <input id="profileWeight" type="number" min="1" max="100" step="1" value="1">
-        <span class="hint">1 = 不干预；大于 1 时优先接单，多个高权重账号按权重比例分摊流量。</span></label>
+        <span class="hint">1 = 不干预</span></label>
       <div class="fld"><span class="lb">账号运维</span>
         <div style="display:flex;gap:8px;flex-wrap:wrap">
           <button type="button" id="btnAccountTest">测试连通</button>
           <button type="button" id="btnAccountSyncProfile">同步昵称</button>
         </div>
-        <span class="hint">测试会真实请求一次最小对话；同步只读取昵称，不保存手机号等敏感信息。</span></div>
+        </div>
       <div class="state err" id="profileErr" hidden></div>
       <div class="state" id="accountOpsResult" hidden></div>
     </div>
@@ -2189,7 +2152,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   <div class="dlg" role="dialog" aria-modal="true">
     <header>
       <h3>开学季 · 我的券码</h3>
-      <div class="hint">抽奖抽中的第三方券（KFC / 瑞幸 / 酷狗等），券码到店到对应app/小程序兑换。</div>
+      
     </header>
     <div class="body" id="vcBody"></div>
     <footer>
@@ -2216,11 +2179,11 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <div id="addTabLogin" class="tab-panel">
         <div id="addPick">
           <div class="realm-row">
-            <span class="hint" style="font-size:12px">版本：</span>
+            <span class="hint" style="font-size:12px">版本</span>
             <label class="realm-opt"><input type="radio" name="addRealm" value="cn" checked> 国内版（CN）</label>
             <label class="realm-opt"><input type="radio" name="addRealm" value="global"> 国际版（Global）</label>
           </div>
-          <div class="hint" style="font-size:12px;margin-top:2px">国际版登录后，网关自动完成注册地区、激活与试用额度领取，全程无需手动操作。</div>
+          
         </div>
         <div id="addLoad" class="state" hidden><span class="dots">正在获取授权链接</span></div>
         <div id="addReady" hidden>
@@ -2233,7 +2196,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       </div>
       <!-- 导入 JSON -->
       <div id="addTabImport" class="tab-panel" hidden>
-        <div class="hint" style="margin-bottom:8px">选择 cockpit tools 导出的 JSON 文件，批量导入账号。文件需为账号数组格式。</div>
+        <div class="hint" style="margin-bottom:8px">账号数组 JSON</div>
         <input type="file" id="importFile" accept=".json" style="margin-bottom:8px">
         <div id="importDone" class="state ok" hidden></div>
         <div id="importErr" class="state err" hidden></div>

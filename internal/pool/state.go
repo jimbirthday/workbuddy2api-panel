@@ -523,7 +523,7 @@ func (p *Pool) pickByUIDForModelLocked(uid, model string, now time.Time, dailyUs
 	if p.floorBlockedForRealmModel(e, model, e.a.Realm(), now) {
 		// 持写锁不能打日志：文案交给调用方在锁外打印。
 		return nil, fmt.Sprintf("WARN: [pool] credit floor: sticky acct=%s model=%s credits=%d < floor=%d, unbind (paid model held out)",
-			logfmt.Label(e.a.UID, e.a.Nickname), model, e.credits, p.creditFloor)
+			logfmt.Label(e.a.UID, e.a.NicknameValue()), model, e.credits, p.creditFloor)
 	}
 	if p.inFlightFull(e) {
 		return nil, ""
@@ -695,7 +695,7 @@ func (p *Pool) RealmLabels() map[string]string {
 		if realm == "" {
 			continue
 		}
-		out[logfmt.Label(e.a.UID, e.a.Nickname)] = realm
+		out[logfmt.Label(e.a.UID, e.a.NicknameValue())] = realm
 	}
 	return out
 }
@@ -708,8 +708,8 @@ func (p *Pool) Nicknames() map[string]string {
 	defer p.mu.RUnlock()
 	out := make(map[string]string, len(p.byUID))
 	for uid, e := range p.byUID {
-		if e.a.Nickname != "" {
-			out[uid] = e.a.Nickname
+		if e.a.NicknameValue() != "" {
+			out[uid] = e.a.NicknameValue()
 		}
 	}
 	return out
@@ -749,7 +749,7 @@ func (p *Pool) statusOf(uid string, e *entry, now time.Time) Status {
 		RateLimitedModels:        modelRows.rateLimited,
 		Realm:                    e.a.Realm(),
 		Enterprise:               e.a.IsEnterprise(),
-		Nickname:                 e.a.Nickname,
+		Nickname:                 e.a.NicknameValue(),
 		Weight:                   e.weight,
 		Note:                     e.note,
 		HasTokens:                hasAccess && hasRefresh,

@@ -18,7 +18,7 @@ func (p *Panel) recordManualActivity(a *auth.Auth, task activity.Task, ok bool, 
 		return
 	}
 	_ = p.cfg.Activity.Append(activity.Record{
-		UID: a.UID, Nickname: a.Nickname, Realm: a.Realm(),
+		UID: a.UID, Nickname: a.NicknameValue(), Realm: a.Realm(),
 		Task: task, Trigger: activity.TriggerManual, OK: ok, Message: message,
 	})
 }

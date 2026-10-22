@@ -100,7 +100,12 @@ func (p *Pool) startFlusher() {
 	// stopCh 同步登记，Close 才能可靠停止（New 与 startFlusher 之间无并发窗口）。
 	p.stopCh = stopCh
 	interval := flushInterval
+	// flusherDone 让 Close 能 join 落盘 goroutine：只 close(stopCh) 而不等，
+	// 可能出现「goroutine 正在写盘、进程已经退出」，最终那次 rename 落空。
+	done := make(chan struct{})
+	p.flusherDone = done
 	go func() {
+		defer close(done)
 		t := time.NewTicker(interval)
 		defer t.Stop()
 		for {
@@ -115,7 +120,16 @@ func (p *Pool) startFlusher() {
 }
 
 // Flush 同步把内存状态落盘（幂等：无变更不写盘）。供进程退出前调用。
+//
+// 必须等「正在写盘的那一份」写完再返回：dirty 只是「有变更」标志，flusher
+// 一旦 Swap 掉它就在锁外写盘了；此时 Flush 看到 dirty=false 直接返回，进程
+// 随即退出，最近几秒的 credits/冷却/在途状态可能永远没落盘（state.json 的
+// tmp+rename 没跑完）。这里加一道 saveMu 屏障：拿到它意味着所有在途写盘都已
+// 完成，随后自己再检查一次 dirty 并写一份最新的。
 func (p *Pool) Flush() {
+	p.persistDirty()
+	p.saveMu.Lock()
+	p.saveMu.Unlock()
 	p.persistDirty()
 }
 
@@ -302,6 +316,9 @@ func (p *Pool) saveSnapshot(sf stateFile, seq uint64) {
 		p.recordPersistFail(err)
 		return
 	}
+	if persistWriteHook != nil {
+		persistWriteHook()
+	}
 	p.persistWritten = seq
 	p.mu.Lock()
 	recovered := p.persistFails
@@ -403,6 +420,11 @@ type snapshotSavedAt struct {
 // writeStateAtomic 原子落盘：临时文件写入 + fsync + rename + 目录 fsync。
 // 目录 fsync 让 rename 本身也持久化（否则掉电后目录项可能未落，只剩旧文件或空目录项）。
 // 临时文件名带 pid：多实例共用同一 state.json 路径时不会互相覆盖半成品。
+// persistWriteHook 仅供测试统计实际落盘次数，生产环境保持 nil。
+// 批量操作的性能承诺（N 个账号只写一次）只能靠它取得直接证据：观察 state.json
+// 的 mtime 会被同秒内的多次写入掩盖。
+var persistWriteHook func()
+
 func writeStateAtomic(path string, raw []byte) error {
 	dir := filepath.Dir(path)
 	if dir != "" {

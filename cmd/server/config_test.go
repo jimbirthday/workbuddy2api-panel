@@ -978,3 +978,26 @@ func TestKeyringReturnsIndependentSlices(t *testing.T) {
 		t.Fatal("keyring copies must not share Models backing array")
 	}
 }
+
+// TestRestartRequiredIncludesSessionStickyEnabled 粘性路由在装配期决定（main.go
+// 里 enabled=false 时根本不构造 session.Router），运行期没有读取点。以前只把
+// ttl/gc_interval 列进重启清单，用户把 enabled 从 false 改成 true 后看到「已保存」
+// 却毫无效果。这里钉住三个字段都在清单里。
+func TestRestartRequiredIncludesSessionStickyEnabled(t *testing.T) {
+	fields := restartRequiredFields(&Config{})
+	want := map[string]bool{
+		"session_sticky.enabled":     false,
+		"session_sticky.ttl":         false,
+		"session_sticky.gc_interval": false,
+	}
+	for _, f := range fields {
+		if _, ok := want[f]; ok {
+			want[f] = true
+		}
+	}
+	for name, seen := range want {
+		if !seen {
+			t.Errorf("restart_required 缺少 %s（面板会谎报已热生效）", name)
+		}
+	}
+}

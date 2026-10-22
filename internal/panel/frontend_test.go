@@ -138,6 +138,7 @@ try {
 		t.Fatal(err)
 	}
 	hf.Close()
+	// #packages 已下架，保留在列表里正是为了验证深链会安全回落到账号池（不能白屏）。
 	for _, hash := range []string{"#taskscenter", "#accounts", "#activity", "#usage", "#models", "#config", "#logs", "#packages", "#connect"} {
 		cmd := exec.Command(node, hf.Name(), "app.js")
 		cmd.Dir = "." // 测试工作目录 = internal/panel

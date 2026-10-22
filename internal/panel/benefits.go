@@ -706,6 +706,27 @@ func (p *Panel) growthResult(ctx context.Context, a *auth.Auth) benefitGrowth {
 	}
 }
 
+// benefitsGrowthCached 在已就绪的成长快照里按 uid 取单个账号的结果。
+//
+// 用途：任务页聚焦单账号时优先蹭 /benefits 的整池快照——两个接口由浏览器
+// 并行加载，任务页多数情况下要么命中刚建好的缓存、要么在单飞等待中拿到同一批
+// 结果，从而避免「切一个账号就打一遍该账号的 2 个上游端点」。
+//
+// 只读已完成的快照（不等待在飞的 flight，也不触发新扫描）：任务页不能为了
+// 一个账号被整池扫描的时长拖住；未命中就让调用方走单账号子集查询。
+func (p *Panel) benefitsGrowthCached(uid string) (benefitGrowth, bool) {
+	if uid == "" {
+		return benefitGrowth{}, false
+	}
+	p.benefitsGrowthMu.Lock()
+	defer p.benefitsGrowthMu.Unlock()
+	if p.benefitsGrowthSnap == nil || time.Since(p.benefitsGrowthAt) >= benefitsGrowthCacheTTL {
+		return benefitGrowth{}, false
+	}
+	g, ok := p.benefitsGrowthSnap[uid]
+	return g, ok
+}
+
 // benefitsGrowthSnapshot 并发拉取国内个人号的成长福利详情。只读上游；
 // 企业号、国际号不参与（Hub 同一门控）。错误按账号记录，不写活动历史——
 // 这是展示查询，不是一次福利动作。

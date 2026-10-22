@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/linguo2625469/workbuddy2api-panel/internal/activity"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
@@ -490,5 +491,42 @@ func TestTravelDayAlignsCST(t *testing.T) {
 		if got := travelDay(c.in); got != c.want {
 			t.Errorf("%s: travelDay=%s want %s", c.name, got, c.want)
 		}
+	}
+}
+
+// TestRunTravelHonorsCtxDuringAccountThrottle 停机不能被账号间限速拖住：
+// 旧实现用 time.Sleep(travelAccountDelay)（470 号 × 800ms ≈ 6 分钟），
+// SIGTERM 后进程要等整轮睡完才退出。这里把限速调大、ctx 立刻取消，断言
+// runTravel 立即返回且没有触发第二个账号的上游调用。
+func TestRunTravelHonorsCtxDuringAccountThrottle(t *testing.T) {
+	stub := &travelStub{buddy: "null"}
+	srv := stub.server()
+	defer srv.Close()
+	s, _ := newTravelScheduler(t, srv, "u1", "u2")
+
+	old := travelAccountDelay
+	travelAccountDelay = 30 * time.Second
+	t.Cleanup(func() { travelAccountDelay = old })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		// 取消时机：等第一个账号的 buddy/info 已经打过（随后会撞上限速等待）。
+		for stub.infoCalls.Load() == 0 {
+			time.Sleep(2 * time.Millisecond)
+		}
+		cancel()
+	}()
+	start := time.Now()
+	s.runTravel(ctx, activity.TriggerManual)
+	elapsed := time.Since(start)
+	<-done
+
+	if elapsed > 2*time.Second {
+		t.Fatalf("runTravel took %v，限速等待未随 ctx 取消", elapsed)
+	}
+	if got := stub.infoCalls.Load(); got != 1 {
+		t.Fatalf("buddy/info calls=%d want 1（取消后不应继续下一个账号）", got)
 	}
 }

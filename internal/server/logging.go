@@ -209,6 +209,16 @@ func (s *chatStatsReader) parseSSELineBytes(line []byte) {
 			Credit               *float64 `json:"credit"`
 			PromptCacheHitTokens *int     `json:"prompt_cache_hit_tokens"`
 			PromptCacheMissTok   *int     `json:"prompt_cache_miss_tokens"`
+			CachedTokens         *int     `json:"cached_tokens"`
+			// 真实命中在嵌套 details 里（上游同时给顶层 0 值兼容别名），必须
+			// 与 upstream.bestUsageCacheHitTokens 同一优先级解析，否则流式请求
+			// 的缓存命中会被记成 0 或整体缺失，与非流式口径不一致。
+			PromptTokensDetails *struct {
+				CachedTokens *int `json:"cached_tokens"`
+			} `json:"prompt_tokens_details"`
+			InputTokensDetails *struct {
+				CachedTokens *int `json:"cached_tokens"`
+			} `json:"input_tokens_details"`
 		} `json:"usage"`
 	}
 	if json.Unmarshal(payload, &chunk) != nil {
@@ -263,9 +273,23 @@ func (s *chatStatsReader) parseSSELineBytes(line []byte) {
 		s.hasCredit = true
 		s.credit = *chunk.Usage.Credit
 	}
-	if chunk.Usage.PromptCacheHitTokens != nil {
-		s.hasCacheHit = true
-		s.cacheHit = *chunk.Usage.PromptCacheHitTokens
+	// 缓存命中按「嵌套优先、只取正值」解析：上游真实命中在
+	// prompt_tokens_details.cached_tokens / input_tokens_details.cached_tokens，
+	// 顶层 prompt_cache_hit_tokens / cached_tokens 常是 0 值兼容别名。只读顶层
+	// 会得到 hit=0（命中率恒 0%）或整体缺失（ok=false 不参与统计）。
+	nested := []*int{chunk.Usage.PromptCacheHitTokens, chunk.Usage.CachedTokens}
+	if d := chunk.Usage.PromptTokensDetails; d != nil {
+		nested = append([]*int{d.CachedTokens}, nested...)
+	}
+	if d := chunk.Usage.InputTokensDetails; d != nil {
+		nested = append(nested, d.CachedTokens)
+	}
+	for _, v := range nested {
+		if v != nil && *v > 0 {
+			s.hasCacheHit = true
+			s.cacheHit = *v
+			break
+		}
 	}
 	if chunk.Usage.PromptCacheMissTok != nil {
 		s.hasCacheMiss = true

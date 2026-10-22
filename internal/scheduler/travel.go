@@ -3,6 +3,7 @@
 package scheduler
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"time"
@@ -48,10 +49,13 @@ func travelDay(t time.Time) string {
 // 401/查询失败只跳过该账号本轮（不强刷 token，交 22:00 keepalive）；
 // 账号间限速 travelAccountDelay。
 func (s *Scheduler) RunTravelNow() {
-	s.runTravel(activity.TriggerManual)
+	s.runTravel(context.Background(), activity.TriggerManual)
 }
 
-func (s *Scheduler) runTravel(trigger activity.Trigger) {
+// runTravel 全池旅行巡检。ctx 取消时立即放弃剩余账号（含账号间限速等待）：
+// 停机不该被 470 号 × 800ms 的限速睡满拖住——此前这里用 time.Sleep，SIGTERM
+// 后进程要等整轮限速走完才能退出（docker stop 的 10s 宽限很容易被打穿）。
+func (s *Scheduler) runTravel(ctx context.Context, trigger activity.Trigger) {
 	first := true
 	for _, acct := range s.cfg.Pool.TaskAccounts(false) {
 		a := acct.Auth
@@ -65,10 +69,12 @@ func (s *Scheduler) runTravel(trigger activity.Trigger) {
 			continue // 企业版门控：无成长体系（/activity/growth/* 上游一律 403），不发起任何上游调用
 		}
 		if !first {
-			time.Sleep(travelAccountDelay)
+			if !sleepCtx(ctx, travelAccountDelay) {
+				return // 优雅停机：不等限速睡满，剩余账号下轮再跑
+			}
 		}
 		first = false
-		s.travelOne(a, trigger)
+		s.travelOne(ctx, a, trigger)
 	}
 }
 
@@ -84,23 +90,23 @@ func (s *Scheduler) RunTravelFor(a *auth.Auth) error {
 	if a.IsGlobal() || a.IsEnterprise() {
 		return fmt.Errorf("travel is only for CN personal accounts")
 	}
-	return s.travelOne(a, activity.TriggerManual)
+	return s.travelOne(context.Background(), a, activity.TriggerManual)
 }
 
 // travelOne 单账号单趟状态机：查有无猫 + 查状态 + 最多一个动作，不轮询不等待。
-func (s *Scheduler) travelOne(a *auth.Auth, trigger activity.Trigger) error {
+func (s *Scheduler) travelOne(ctx context.Context, a *auth.Auth, trigger activity.Trigger) error {
 	buddy, err := s.cfg.Upstream.BuddyInfo(a)
 	if err != nil {
-		log.Printf("travel %s: buddy-info: %v", logfmt.Label(a.UID, a.Nickname), err)
+		log.Printf("travel %s: buddy-info: %v", logfmt.Label(a.UID, a.NicknameValue()), err)
 		s.recordActivity(a, activity.TaskTravel, trigger, false, "buddy-info: "+err.Error())
 		return err
 	}
 	if buddy == nil {
-		return s.travelAdopt(a, trigger)
+		return s.travelAdopt(ctx, a, trigger)
 	}
 	ts, err := s.cfg.Upstream.TravelStatus(a)
 	if err != nil {
-		log.Printf("travel %s: status: %v", logfmt.Label(a.UID, a.Nickname), err)
+		log.Printf("travel %s: status: %v", logfmt.Label(a.UID, a.NicknameValue()), err)
 		s.recordActivity(a, activity.TaskTravel, trigger, false, "status: "+err.Error())
 		return err
 	}
@@ -110,10 +116,10 @@ func (s *Scheduler) travelOne(a *auth.Auth, trigger activity.Trigger) error {
 	case travelStateIdle:
 		return s.travelDepart(a, ts, trigger)
 	case travelStateTraveling:
-		log.Printf("travel %s: skip (traveling record=%d)", logfmt.Label(a.UID, a.Nickname), ts.RecordID)
+		log.Printf("travel %s: skip (traveling record=%d)", logfmt.Label(a.UID, a.NicknameValue()), ts.RecordID)
 		s.recordActivity(a, activity.TaskTravel, trigger, true, fmt.Sprintf("skip (traveling record=%d)", ts.RecordID))
 	default:
-		log.Printf("travel %s: skip (unknown state %q)", logfmt.Label(a.UID, a.Nickname), ts.State)
+		log.Printf("travel %s: skip (unknown state %q)", logfmt.Label(a.UID, a.NicknameValue()), ts.State)
 		s.recordActivity(a, activity.TaskTravel, trigger, true, fmt.Sprintf("skip (unknown state %q)", ts.State))
 	}
 	return nil
@@ -122,16 +128,16 @@ func (s *Scheduler) travelOne(a *auth.Auth, trigger activity.Trigger) error {
 // travelDepart 空闲且未达当日上限时派出（每日 1 次，自然日 00:00 CST 重置）。
 func (s *Scheduler) travelDepart(a *auth.Auth, ts *upstream.TravelState, trigger activity.Trigger) error {
 	if ts.DailyLimitReached {
-		log.Printf("travel %s: skip (daily limit reached)", logfmt.Label(a.UID, a.Nickname))
+		log.Printf("travel %s: skip (daily limit reached)", logfmt.Label(a.UID, a.NicknameValue()))
 		s.recordActivity(a, activity.TaskTravel, trigger, true, "skip (daily limit reached)")
 		return nil
 	}
 	if err := s.cfg.Upstream.TravelDepart(a, travelLocationID); err != nil {
-		log.Printf("travel %s: depart: %v", logfmt.Label(a.UID, a.Nickname), err)
+		log.Printf("travel %s: depart: %v", logfmt.Label(a.UID, a.NicknameValue()), err)
 		s.recordActivity(a, activity.TaskTravel, trigger, false, "depart: "+err.Error())
 		return err
 	}
-	log.Printf("travel %s: depart ok location=%d", logfmt.Label(a.UID, a.Nickname), travelLocationID)
+	log.Printf("travel %s: depart ok location=%d", logfmt.Label(a.UID, a.NicknameValue()), travelLocationID)
 	s.recordActivity(a, activity.TaskTravel, trigger, true, fmt.Sprintf("depart ok location=%d", travelLocationID))
 	return nil
 }
@@ -139,17 +145,17 @@ func (s *Scheduler) travelDepart(a *auth.Auth, ts *upstream.TravelState, trigger
 // travelClaim 到站领奖（必须带 record_id）。
 func (s *Scheduler) travelClaim(a *auth.Auth, ts *upstream.TravelState, trigger activity.Trigger) error {
 	if ts.RecordID == 0 {
-		log.Printf("travel %s: claim skipped (arrived but no record_id)", logfmt.Label(a.UID, a.Nickname))
+		log.Printf("travel %s: claim skipped (arrived but no record_id)", logfmt.Label(a.UID, a.NicknameValue()))
 		s.recordActivity(a, activity.TaskTravel, trigger, false, "claim skipped (arrived but no record_id)")
 		return fmt.Errorf("arrived but no record_id")
 	}
 	reward, err := s.cfg.Upstream.TravelClaim(a, ts.RecordID)
 	if err != nil {
-		log.Printf("travel %s: claim record=%d: %v", logfmt.Label(a.UID, a.Nickname), ts.RecordID, err)
+		log.Printf("travel %s: claim record=%d: %v", logfmt.Label(a.UID, a.NicknameValue()), ts.RecordID, err)
 		s.recordActivity(a, activity.TaskTravel, trigger, false, fmt.Sprintf("claim record=%d: %v", ts.RecordID, err))
 		return err
 	}
-	log.Printf("travel %s: claim ok record=%d reward=%d", logfmt.Label(a.UID, a.Nickname), ts.RecordID, reward)
+	log.Printf("travel %s: claim ok record=%d reward=%d", logfmt.Label(a.UID, a.NicknameValue()), ts.RecordID, reward)
 	s.recordActivity(a, activity.TaskTravel, trigger, true, fmt.Sprintf("claim ok record=%d reward=%d", ts.RecordID, reward))
 	return nil
 }
@@ -161,34 +167,36 @@ func (s *Scheduler) travelClaim(a *auth.Auth, ts *upstream.TravelState, trigger 
 // 400 "first_buddy task not completed yet"——该门槛的真实来源是"当日无活跃上报"，
 // 不是账号问题（report.go 注释亦明确「解锁 first_buddy 任务（领养前置）」）。
 // conversation 门槛未达标仍属预期行为，记一次当日已试后静默跳过，不再重试。
-func (s *Scheduler) travelAdopt(a *auth.Auth, trigger activity.Trigger) error {
+func (s *Scheduler) travelAdopt(ctx context.Context, a *auth.Auth, trigger activity.Trigger) error {
 	if s.adoptTriedToday(a.UID) {
 		s.recordActivity(a, activity.TaskTravel, trigger, true, "adopt skipped (already tried today)")
 		return nil
 	}
 	// 前置：解锁 first_buddy 任务（幂等；失败不阻塞，让 buddy/first 按既有错误路径暴露）。
 	if err := s.cfg.Upstream.ReportChatActivity(a, fmt.Sprintf("wb2api-adopt-%d", time.Now().UnixMilli()), ""); err != nil {
-		log.Printf("travel %s: adopt preflight report: %v", logfmt.Label(a.UID, a.Nickname), err)
+		log.Printf("travel %s: adopt preflight report: %v", logfmt.Label(a.UID, a.NicknameValue()), err)
 		s.recordActivity(a, activity.TaskTravel, trigger, false, "adopt preflight report: "+err.Error())
-	} else {
-		time.Sleep(adoptReportGap) // 给上游事件处理留时间（对齐脚本实测的 1.05s 间隔口径）
+	} else if !sleepCtx(ctx, adoptReportGap) {
+		// 给上游事件处理留时间（对齐脚本实测的 1.05s 间隔口径）；停机时不再继续
+		// 发 agreement/first——半途中断比放弃本轮更安全，下一轮会重跑。
+		return nil
 	}
 	if err := s.cfg.Upstream.BuddyAgreement(a); err != nil {
-		log.Printf("travel %s: agreement: %v", logfmt.Label(a.UID, a.Nickname), err)
+		log.Printf("travel %s: agreement: %v", logfmt.Label(a.UID, a.NicknameValue()), err)
 		s.recordActivity(a, activity.TaskTravel, trigger, false, "agreement: "+err.Error())
 		return err
 	}
 	err := s.cfg.Upstream.BuddyFirst(a)
 	switch {
 	case err == nil:
-		log.Printf("travel %s: adopt ok (+300 credits)", logfmt.Label(a.UID, a.Nickname))
+		log.Printf("travel %s: adopt ok (+300 credits)", logfmt.Label(a.UID, a.NicknameValue()))
 		s.recordActivity(a, activity.TaskTravel, trigger, true, "adopt ok (+300 credits)")
 	case upstream.IsBuddyTaskIncomplete(err):
 		s.markAdoptTried(a.UID)
-		log.Printf("travel %s: adopt skipped (conversation threshold not reached, retry tomorrow)", logfmt.Label(a.UID, a.Nickname))
+		log.Printf("travel %s: adopt skipped (conversation threshold not reached, retry tomorrow)", logfmt.Label(a.UID, a.NicknameValue()))
 		s.recordActivity(a, activity.TaskTravel, trigger, true, "adopt skipped (conversation threshold not reached, retry tomorrow)")
 	default:
-		log.Printf("travel %s: adopt: %v", logfmt.Label(a.UID, a.Nickname), err)
+		log.Printf("travel %s: adopt: %v", logfmt.Label(a.UID, a.NicknameValue()), err)
 		s.recordActivity(a, activity.TaskTravel, trigger, false, "adopt: "+err.Error())
 		return err
 	}

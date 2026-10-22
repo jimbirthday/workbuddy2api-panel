@@ -113,134 +113,144 @@ func IsStreamReadError(err error) bool {
 	return errors.As(err, &re)
 }
 
+// aggChoice 单个 choice（按 index 区分）的聚合缓冲。
+//
+// 为什么要分桶：OpenAI 的 n>1 让上游在同一流里并行下发 choices[].index=0..n-1，
+// 每路各有自己的 content、tool_calls 与 finish_reason。旧实现把所有 choice 的
+// delta 拼进同一份 content，返回时又只合成一个 index=0 的 choice——客户端要
+// n=2 却拿到两个回答交错的一段正文，且 finish_reason 只剩最后一路的值，
+// 属于静默数据损坏。分桶后每路独立聚合，输出仍是合法的 n 条 choices。
+type aggChoice struct {
+	content       strings.Builder
+	reasoning     strings.Builder
+	refusal       strings.Builder
+	role          string
+	finishReason  string
+	sawTerminal   bool // 本 choice 收到过非空 finish_reason
+	gotAnyContent bool // 本 choice 已取到正文（message 回退的 latch）
+	toolCalls     map[int]map[string]any
+	toolOrder     []int
+	toolSeq       int
+	idIndex       map[string]int
+	legacyFC      map[string]any
+}
+
+// appendContent 是本 choice「已取到正文」latch 的唯一写入点：
+//   - 空串不算已取到正文（role-only 首帧 / 整条空 message 是常态帧，
+//     置位后会把后续真正文挡在 message 回退分支的 !gotAnyContent 守卫外）；
+//   - 空串也无字节可追加，跳过写入。
+func (c *aggChoice) appendContent(txt string) {
+	if txt == "" {
+		return
+	}
+	c.content.WriteString(txt)
+	c.gotAnyContent = true
+}
+
+// nextToolIndex 分配下一个不冲突的缺 index 序号：从 toolSeq 起递增跳过既有
+// index（合规流的 index 是 0..N-1，缺 index 的补位不能覆盖它们）。
+func (c *aggChoice) nextToolIndex() int {
+	for {
+		idx := c.toolSeq
+		c.toolSeq++
+		if _, used := c.toolCalls[idx]; !used {
+			return idx
+		}
+	}
+}
+
+// mergeToolCallsChunk 把一段 tool_calls 数组按 index 合并进本 choice。
+// 兼容缺 index 的上游：id 优先、最近槽兜底（见下方调用点注释）。
+func (c *aggChoice) mergeToolCallsChunk(tcs []any) {
+	if c.toolCalls == nil {
+		c.toolCalls = map[int]map[string]any{}
+	}
+	if c.idIndex == nil {
+		c.idIndex = map[string]int{}
+	}
+	for _, tc := range tcs {
+		call, ok := tc.(map[string]any)
+		if !ok {
+			continue
+		}
+		idx := -1
+		if v, ok := call["index"].(float64); ok {
+			idx = int(v)
+		} else if cid, _ := call["id"].(string); cid != "" {
+			if mid, seen := c.idIndex[cid]; seen {
+				idx = mid // 该 id 已归位过：延续既有调用（跨帧有效）
+			} else {
+				idx = c.nextToolIndex()
+			}
+		} else if len(c.toolOrder) > 0 {
+			idx = c.toolOrder[len(c.toolOrder)-1] // 无 id 碎片：延续最近调用
+		} else {
+			idx = c.nextToolIndex()
+		}
+		merged, seen := c.toolCalls[idx]
+		if !seen {
+			merged = map[string]any{"index": idx}
+			c.toolCalls[idx] = merged
+			c.toolOrder = append(c.toolOrder, idx)
+		}
+		if cid, _ := call["id"].(string); cid != "" {
+			c.idIndex[cid] = idx
+		}
+		if cid, _ := merged["id"].(string); cid != "" {
+			c.idIndex[cid] = idx
+		}
+		mergeToolCallDelta(merged, call)
+	}
+}
+
+// mergeMessageFields 把非 delta 的完整 message 内容并入本 choice（message 是整条
+// 下发，非流式拼接，content 只取一次）。
+func (c *aggChoice) mergeMessageFields(msg map[string]any) {
+	if r2, ok := msg["role"].(string); ok && r2 != "" {
+		c.role = r2
+	}
+	if txt, ok := msg["content"].(string); ok {
+		c.appendContent(txt)
+	}
+	if rc, ok := msg["reasoning_content"].(string); ok {
+		c.reasoning.WriteString(rc)
+	}
+	if tcs, ok := msg["tool_calls"].([]any); ok {
+		c.mergeToolCallsChunk(tcs)
+	}
+	if fc, ok := msg["function_call"].(map[string]any); ok {
+		mergeLegacyFunctionCall(&c.legacyFC, fc)
+	}
+}
+
 // Aggregate 读取完整 SSE 流，聚合 delta.content 为单个 OpenAI chat.completion 响应。
 // 分片/半行由 sseLineReader 处理；遇到 "data: [DONE]" 结束。
 // tool_calls 以流式 delta 到达（按 index 合并：首片带 id/type/name，后续只带 arguments 片段）。
+// n>1 的多路 choice 按 index 分桶聚合，各自保留正文与 finish_reason。
 func Aggregate(r io.Reader) (map[string]any, error) {
 	lr := newSSELineReader(r)
 	var (
-		id, model     string
-		created       float64
-		content       strings.Builder
-		reasoning     strings.Builder
-		role          = "assistant"
-		finishReason  = "stop"
-		usage         map[string]any
-		gotAnyContent bool
-		// gotAnswer 累计「本次流出现过客户端可见内容」：role-only/元信息/空收尾帧
-		// 不算回答。只有内容帧才计入 validEvents；finish_reason 仅在该流已经
-		// 出现内容时才作为有效收尾（避免只发 role + stop 也合成 200 空回答）。
-		gotAnswer   bool
+		id, model   string
+		created     float64
+		usage       map[string]any
+		gotAnswer   bool // 本次流出现过客户端可见内容（role-only/元信息不算）
 		validEvents int
 		// sawChoice 标记是否真的见过非空 choices。Aggregate 会自行合成 choices，
 		// 若只有正文却从未出现可解析 choice，说明帧结构不可交付，不能 200 放行。
 		sawChoice bool
 		sawDone   bool // 上游显式发过 data: [DONE]（正常收尾）
-		toolCalls = map[int]map[string]any{}
-		toolOrder []int
-		// legacyFunctionCall 累积遗留 function_call（非 tool_calls 数组形态）。
-		// 上游真实流里 name 在首片、arguments 在后续分片；必须合并而不是丢弃，
-		// 否则合法的 function_call-only 回答会被最终闸门误判为空流。
-		legacyFunctionCall map[string]any
-		// toolSeq 缺 index 的 tool_call 的分配序号源：跨帧延续「最近分配」槽位，
-		// 同帧内递增（见 mergeToolCallsChunk 注释）。
-		toolSeq int
-		// idIndex id → 已分配的 index：跨帧持续（延续碎片的 id 常出现在后续帧），
-		// 供缺 index 时按 id 归位既有调用（见 mergeToolCallsChunk 注释）。
-		idIndex = map[string]int{}
+		// choicesByIndex 按 index 分桶；choiceOrder 保留首次出现顺序，输出前排序。
+		choicesByIndex = map[int]*aggChoice{}
+		choiceOrder    []int
 	)
-	// appendContent 是「已取到正文」（gotAnyContent latch）的唯一写入点：delta 与
-	// message 两路 content 都必须经此并入，规约只有一份（issue #142）——
-	//   S1 空串不算「已取到正文」、不占 latch 名额：OpenAI 风格 role-only 首帧
-	//      （delta.content=""）和整条空 message 帧是常态帧，若空串置位 latch，
-	//      后续真正文会被 message 回退分支的 !gotAnyContent 守卫静默拒绝；
-	//   S2 空串本身也无可追加字节，跳过 WriteString 与追加语义自洽。
-	appendContent := func(txt string) {
-		if txt == "" {
-			return
+	choiceAt := func(idx int) *aggChoice {
+		c := choicesByIndex[idx]
+		if c == nil {
+			c = &aggChoice{}
+			choicesByIndex[idx] = c
+			choiceOrder = append(choiceOrder, idx)
 		}
-		content.WriteString(txt)
-		gotAnyContent = true
-	}
-	// mergeToolCallsChunk 把一段 tool_calls 数组按 index 合并进累计表。
-	// delta（流式分片，按 index 累积）与 message（非 delta 整条）共用同一合并逻辑，
-	// 保证「上游给的身份/函数名不丢、arguments 拼接语义一致」。
-	//
-	// index 缺失兼容：OpenAI 规范要求 delta 帧的 tool_call 带 index（标记分片归属），
-	// 但部分上游省略它。此前缺 index 一律归 0——多调用场景下不同 call 被合并进同一
-	// index 槽，arguments 串联、name 互相覆盖（数据污染）。修法按「id 优先、lastIdx 兜底」：
-	//   - 带 index → 按 index 累积（合规形态，零改动）；
-	//   - 缺 index 带 id 且 id 已见过 → 延续该 id 所在 index；
-	//   - 缺 index 带 id 且 id 是新的 → 开新序号（多调用不合并）；
-	//   - 缺 index 无 id → 追加到最近收到碎片的 index（单个调用的延续分片无 id
-	//     是标准形态），无既往则开新号。
-	// 带 index 的碎片照常按 index 累积，不受影响。
-	// nextToolIndex 分配下一个不冲突的缺 index 序号：从 toolSeq 起递增跳过既有
-	// index（合规流的 index 是 0..N-1，缺 index 的补位不能覆盖它们）。
-	nextToolIndex := func() int {
-		for {
-			idx := toolSeq
-			toolSeq++
-			if _, used := toolCalls[idx]; !used {
-				return idx
-			}
-		}
-	}
-	mergeToolCallsChunk := func(tcs []any) {
-		for _, tc := range tcs {
-			call, ok := tc.(map[string]any)
-			if !ok {
-				continue
-			}
-			idx := -1
-			if v, ok := call["index"].(float64); ok {
-				idx = int(v)
-			} else if cid, _ := call["id"].(string); cid != "" {
-				if mid, seen := idIndex[cid]; seen {
-					idx = mid // 该 id 已归位过：延续既有调用（跨帧有效）
-				} else {
-					idx = nextToolIndex()
-				}
-			} else if len(toolOrder) > 0 {
-				idx = toolOrder[len(toolOrder)-1] // 无 id 碎片：延续最近调用
-			} else {
-				idx = nextToolIndex()
-			}
-			merged, seen := toolCalls[idx]
-			if !seen {
-				merged = map[string]any{"index": idx}
-				toolCalls[idx] = merged
-				toolOrder = append(toolOrder, idx)
-			}
-			if cid, _ := call["id"].(string); cid != "" {
-				idIndex[cid] = idx
-			}
-			if cid, _ := merged["id"].(string); cid != "" {
-				idIndex[cid] = idx
-			}
-			mergeToolCallDelta(merged, call)
-		}
-	}
-	// mergeMessageFields 把非 delta 的完整 message 内容并入聚合（message 是整条下发，
-	// 非流式拼接，content 只取一次）。role/reasoning_content/tool_calls 与 delta 分支
-	// 同构透出；content 同样置 gotAnyContent，与 delta 路径的 latch 语义一致
-	// （一帧整条 message 之后，后续 delta 帧不重复追加）。
-	mergeMessageFields := func(msg map[string]any) {
-		if r2, ok := msg["role"].(string); ok && r2 != "" {
-			role = r2
-		}
-		if txt, ok := msg["content"].(string); ok {
-			appendContent(txt)
-		}
-		if rc, ok := msg["reasoning_content"].(string); ok {
-			reasoning.WriteString(rc)
-		}
-		if tcs, ok := msg["tool_calls"].([]any); ok {
-			mergeToolCallsChunk(tcs)
-		}
-		if fc, ok := msg["function_call"].(map[string]any); ok {
-			mergeLegacyFunctionCall(&legacyFunctionCall, fc)
-		}
+		return c
 	}
 	for {
 		line, err := lr.readLine()
@@ -290,7 +300,10 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 					if v, ok := chunk["created"].(float64); ok && created == 0 {
 						created = v
 					}
-					if u, ok := chunk["usage"].(map[string]any); ok {
+					// 只在非空对象时覆盖：上游常在正文流中间插一帧 `"usage":{}`
+					// 占位，整体覆盖会把已收到的 prompt/completion/credit 抹掉，
+					// 导致该次调用 token/credit 不入账、成本台账断档。
+					if u, ok := chunk["usage"].(map[string]any); ok && len(u) > 0 {
 						usage = u
 					}
 					if ch, ok := chunk["choices"].([]any); ok {
@@ -302,32 +315,44 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 							if c == nil {
 								continue
 							}
+							// 缺 index 的帧按 0 处理（单路流是绝大多数形态）。
+							idx := 0
+							if v, ok := c["index"].(float64); ok {
+								idx = int(v)
+							}
+							cc := choiceAt(idx)
 							if fr, ok := c["finish_reason"].(string); ok && fr != "" {
-								finishReason = fr
+								cc.finishReason = fr
+								cc.sawTerminal = true
 							}
 							if delta, ok := c["delta"].(map[string]any); ok {
 								if r2, ok := delta["role"].(string); ok && r2 != "" {
-									role = r2
+									cc.role = r2
 								}
 								if txt, ok := delta["content"].(string); ok {
-									appendContent(txt)
+									cc.appendContent(txt)
+								}
+								// 内容拒绝也属于回答正文：既要在最终闸门里可交付，也要
+								// 出现在聚合 message 里，否则非流式响应会丢掉拒绝文本。
+								if rc, ok := delta["refusal"].(string); ok && rc != "" {
+									cc.refusal.WriteString(rc)
 								}
 								if rc, ok := delta["reasoning_content"].(string); ok {
-									reasoning.WriteString(rc)
+									cc.reasoning.WriteString(rc)
 								}
 								if tcs, ok := delta["tool_calls"].([]any); ok {
-									mergeToolCallsChunk(tcs)
+									cc.mergeToolCallsChunk(tcs)
 								}
 								if fc, ok := delta["function_call"].(map[string]any); ok {
-									mergeLegacyFunctionCall(&legacyFunctionCall, fc)
+									mergeLegacyFunctionCall(&cc.legacyFC, fc)
 								}
 							}
 							// 有的上游把完整消息放在 message 里（非 delta）：
 							// 整条并入（role/content/reasoning_content/tool_calls），
-							// 与 delta 分支同构。delta 已取过正文（gotAnyContent）则跳过
+							// 与 delta 分支同构。本 choice 已取过正文则跳过
 							// （避免与 delta 路径重复拼接——PR #134 的 latch 语义）。
-							if msg, ok := c["message"].(map[string]any); ok && !gotAnyContent {
-								mergeMessageFields(msg)
+							if msg, ok := c["message"].(map[string]any); ok && !cc.gotAnyContent {
+								cc.mergeMessageFields(msg)
 							}
 						}
 					}
@@ -349,66 +374,84 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 	if created == 0 {
 		created = float64(time.Now().Unix())
 	}
-	message := map[string]any{
-		"role":    role,
-		"content": content.String(),
-	}
-	if reasoning.Len() > 0 {
-		message["reasoning_content"] = reasoning.String()
-	}
-	if len(toolOrder) > 0 {
-		sort.Ints(toolOrder)
-		calls := make([]map[string]any, 0, len(toolOrder))
-		for _, idx := range toolOrder {
-			calls = append(calls, toolCalls[idx])
+	sort.Ints(choiceOrder)
+	outChoices := make([]any, 0, len(choiceOrder))
+	deliverable := false
+	for _, idx := range choiceOrder {
+		c := choicesByIndex[idx]
+		rawFinish := c.finishReason
+		if rawFinish == "" {
+			rawFinish = "stop"
 		}
-		// P1b：流被截断时 tool_call 的 arguments 是残缺 JSON（解析失败），不把脏参数
-		// 交给客户端——残留分片会被客户端解析成非法 JSON 卡死会话。截断的两个来源：
-		//   - finish_reason=="length"（模型因 max_tokens 提前中止）；
-		//   - 上游连接中断（EOF 收尾但未发 data: [DONE]，sawDone=false）。
-		// 完整参数原样保留（正例零改动）；空参数（无参工具）不是截断，同样保留。
-		// 此前只认 finish_reason=="length"，EOF 截断的 tool_calls 残缺参数被原样下发。
-		if finishReason == "length" || !sawDone {
-			calls = dropTruncatedToolCalls(calls)
+		roleOut := c.role
+		if roleOut == "" {
+			roleOut = "assistant"
 		}
-		if len(calls) > 0 {
-			message["tool_calls"] = calls
+		message := map[string]any{
+			"role":    roleOut,
+			"content": c.content.String(),
 		}
-	}
-	if len(legacyFunctionCall) > 0 {
-		name, _ := legacyFunctionCall["name"].(string)
-		args, _ := legacyFunctionCall["arguments"].(string)
-		// 遗留 function_call 与标准 tool_calls 同口径：截断时残缺参数不得交付。
-		// 否则 finish_reason=length / 缺 [DONE] 的半截 JSON 会以 200 返回，
-		// 客户端解析失败后卡死会话；清空后由下方最终闸门返回 errEmptyStream。
-		if (finishReason == "length" || !sawDone) && isTruncatedArguments(args) {
-			args = ""
-			name = ""
+		if c.refusal.Len() > 0 {
+			message["refusal"] = c.refusal.String()
 		}
-		if name != "" || args != "" {
-			message["function_call"] = legacyFunctionCall
+		if c.reasoning.Len() > 0 {
+			message["reasoning_content"] = c.reasoning.String()
 		}
+		if len(c.toolOrder) > 0 {
+			sort.Ints(c.toolOrder)
+			calls := make([]map[string]any, 0, len(c.toolOrder))
+			for _, ti := range c.toolOrder {
+				calls = append(calls, c.toolCalls[ti])
+			}
+			// P1b：流被截断时 tool_call 的 arguments 是残缺 JSON（解析失败），不把脏参数
+			// 交给客户端——残留分片会被客户端解析成非法 JSON 卡死会话。截断的两个来源：
+			//   - finish_reason=="length"（模型因 max_tokens 提前中止）；
+			//   - 上游连接中断（EOF 收尾但未发 data: [DONE]，sawDone=false）。
+			// 完整参数原样保留（正例零改动）；空参数（无参工具）不是截断，同样保留。
+			if rawFinish == "length" || !sawDone {
+				calls = dropTruncatedToolCalls(calls)
+			}
+			if len(calls) > 0 {
+				message["tool_calls"] = calls
+			}
+		}
+		if len(c.legacyFC) > 0 {
+			name, _ := c.legacyFC["name"].(string)
+			args, _ := c.legacyFC["arguments"].(string)
+			// 遗留 function_call 与标准 tool_calls 同口径：截断时残缺参数不得交付。
+			// 否则 finish_reason=length / 缺 [DONE] 的半截 JSON 会以 200 返回，
+			// 客户端解析失败后卡死会话；清空后由下方最终闸门返回 errEmptyStream。
+			if (rawFinish == "length" || !sawDone) && isTruncatedArguments(args) {
+				args = ""
+				name = ""
+			}
+			if name != "" || args != "" {
+				message["function_call"] = c.legacyFC
+			}
+		}
+		// 截断识别：只有「既没有 [DONE]、也没有任何显式收尾」才算连接中断——此时
+		// 正文可能被截断，而 finish_reason 仍是默认 "stop"，客户端无法察觉。
+		// 上游显式给了 finish_reason（含 stop）就是正常收尾，与流式路径的
+		// !sawTerminal 判据保持同一口径；否则同一条上游流在流式/非流式两条路径上
+		// 会给出互相矛盾的 finish_reason，非流式客户端据此误判截断并重复续写。
+		finishOut := rawFinish
+		if !sawDone && !c.sawTerminal && finishOut == "stop" && c.gotAnyContent {
+			finishOut = "length"
+		}
+		// 聚合后的最终有效性校验：event 层看起来「有内容」不等于能交付给客户端。
+		// 截断流里的 tool_calls 参数会被 dropTruncatedToolCalls 全部丢弃；上游也可能
+		// 只发 {"index":0} 的空壳 tool_call。此时若直接构造响应，就会得到 content:""
+		// 的空消息——正是非流式假成功。
+		if aggregateHasDeliverableAnswer(c.content.String(), c.reasoning.String(), message) {
+			deliverable = true
+		}
+		outChoices = append(outChoices, map[string]any{
+			"index":         idx,
+			"message":       message,
+			"finish_reason": finishOut,
+		})
 	}
-	// 截断识别：上游连接中断（EOF 收尾但从未发 data: [DONE]，sawDone=false）时
-	// 正文可能被截断，而 finish_reason 仍是默认 "stop"——客户端无法察觉，会把
-	// 半句话当完整回答落库。这里把「未正常收尾」如实报出来（与上方 tool_calls
-	// 用 !sawDone 判截断的口径一致）。仅改默认值，上游显式给过 finish_reason 的
-	// （如 length/tool_calls）不动。
-	// 仅当确实取到正文才把「未收到 [DONE]」标成截断：上游省略 [DONE]、但已给完整
-	// 正文并以 stop 收尾时，标 length 会把完整回答误报成被截断（客户端据此误判）。
-	// 无正文（如仅 role 帧的收尾）不涉及截断，保留原 finish_reason。
-	if !sawDone && finishReason == "stop" && gotAnyContent {
-		finishReason = "length"
-	}
-	// 聚合后的最终有效性校验：event 层看起来「有内容」不等于能交付给客户端。
-	// 截断流里的 tool_calls 参数会被 dropTruncatedToolCalls 全部丢弃；上游也可能
-	// 只发 {"index":0} 的空壳 tool_call。此时若直接构造响应，就会得到 content:""
-	// 的空消息——正是非流式假成功。必须把「非空正文/思考/带名称或参数的
-	// tool_calls 或遗留 function_call」作为最后一道闸。
-	if !aggregateHasDeliverableAnswer(content.String(), reasoning.String(), message) {
-		return nil, errEmptyStream
-	}
-	if !sawChoice {
+	if !deliverable || !sawChoice {
 		return nil, errEmptyStream
 	}
 	resp := map[string]any{
@@ -416,13 +459,7 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 		"object":  "chat.completion",
 		"created": int64(created),
 		"model":   model,
-		"choices": []any{
-			map[string]any{
-				"index":         0,
-				"message":       message,
-				"finish_reason": finishReason,
-			},
-		},
+		"choices": outChoices,
 	}
 	if usage != nil {
 		// OpenAI 非流式 usage 必含 total_tokens。上游若只发 prompt_tokens +
@@ -440,6 +477,10 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 // 仅 id/type 的空壳调用，都不是回答。
 func aggregateHasDeliverableAnswer(content, reasoning string, message map[string]any) bool {
 	if content != "" || reasoning != "" {
+		return true
+	}
+	// refusal 与正文同权：纯拒绝回答是有效交付物（见 deltaHasClientContent）。
+	if txt, ok := message["refusal"].(string); ok && txt != "" {
 		return true
 	}
 	for _, call := range aggregateToolCalls(message) {
@@ -598,6 +639,75 @@ func mergeLegacyFunctionCall(dst *map[string]any, fc map[string]any) {
 // seen 记录每个 index 是否已发过首片（与 name 是否非空无关）；删除是幂等的。
 // 只动 function.name 键，id/type/arguments 原样透传。
 func stripToolCallNames(obj map[string]any, seen map[int]bool) {
+	stripToolCallNamesState(obj, &toolNameState{seenName: seen})
+}
+
+// toolNameState 跨帧记录 tool_call 的槽位归属与「该槽是否已发过非空 name」。
+//
+// 为什么不能用裸 map[int]bool：上游常有「tool_call 不带 index」的分片。此前缺
+// index 一律按 0 处理，第二个并行调用首现时 seen[0] 已置位 → 它的 function.name
+// 被当成重复分片删掉，客户端拿到空工具名、工具调用直接失败。这里按与
+// mergeToolCallsChunk 相同的归属规则（index → id → 最近槽）解析槽位，并只在该槽
+// 已发过**非空** name 之后才删后续 name 键（首片 name 为空、后续补 name 的兼容
+// 形态也不会被误删）。
+type toolNameState struct {
+	seenName map[int]bool   // 槽位 → 已发过非空 name
+	idSlot   map[string]int // id → 槽位
+	last     int            // 最近一次用过的槽位（跨帧保留）
+	hasLast  bool
+	next     int  // 缺 index 且 id 为新时的分配游标
+	base     bool // next 是否已初始化
+}
+
+// slot 解析一条 tool_call 分片应归属的槽位。
+func (st *toolNameState) slot(tc map[string]any) int {
+	cid, _ := tc["id"].(string)
+	if v, ok := tc["index"].(float64); ok {
+		idx := int(v)
+		if cid != "" {
+			if st.idSlot == nil {
+				st.idSlot = map[string]int{}
+			}
+			st.idSlot[cid] = idx
+		}
+		st.last, st.hasLast = idx, true
+		if !st.base || idx >= st.next {
+			st.next, st.base = idx+1, true
+		}
+		return idx
+	}
+	if st.idSlot == nil {
+		st.idSlot = map[string]int{}
+	}
+	if cid != "" {
+		if idx, ok := st.idSlot[cid]; ok {
+			st.last, st.hasLast = idx, true
+			return idx
+		}
+		if !st.base {
+			// 已知槽位数为 0..len(seenName)-1，新调用接在其后。
+			st.next, st.base = len(st.seenName), true
+		}
+		idx := st.next
+		st.next++
+		st.idSlot[cid] = idx
+		st.last, st.hasLast = idx, true
+		return idx
+	}
+	if st.hasLast {
+		return st.last
+	}
+	idx := st.next
+	st.next++
+	st.last, st.hasLast = idx, true
+	return idx
+}
+
+func stripToolCallNamesState(obj map[string]any, st *toolNameState) {
+	if st.seenName == nil {
+		st.seenName = map[int]bool{}
+	}
+	// last 跨帧保留：无 id 的后续分片要延续「最近收到的调用」槽位。
 	choices, _ := obj["choices"].([]any)
 	for _, ci := range choices {
 		c, _ := ci.(map[string]any)
@@ -614,20 +724,25 @@ func stripToolCallNames(obj map[string]any, seen map[int]bool) {
 			if tc == nil {
 				continue
 			}
-			idx := 0
-			if v, ok := tc["index"].(float64); ok {
-				idx = int(v)
-			}
-			if seen[idx] {
-				// 已发过首片：删除本分片的 name 键（存在即删，幂等）。
-				if fn, _ := tc["function"].(map[string]any); fn != nil {
-					delete(fn, "name")
+			idx := st.slot(tc)
+			fn, _ := tc["function"].(map[string]any)
+			name := ""
+			if fn != nil {
+				if n, ok := fn["name"].(string); ok {
+					name = n
 				}
+			}
+			if name != "" && !st.seenName[idx] {
+				// 该槽的首个非空 name：保留，记已发。
+				st.seenName[idx] = true
 				continue
 			}
-			// 首现：保留 name 键原样（上游首片通常带非空 name；空 name 也照发，
-			// 与 OpenAI 对「首帧无 name」的容忍一致），随后分片统一删除。
-			seen[idx] = true
+			if st.seenName[idx] {
+				// 已发过 name：删除本分片的 name 键（存在即删，幂等）。
+				if fn != nil {
+					delete(fn, "name")
+				}
+			}
 		}
 	}
 }
@@ -815,9 +930,9 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 		w.WriteHeader(http.StatusOK)
 	}
 
-	// toolCallSeen 跨帧记录 delta.tool_calls 里已发过首片的 index，
+	// toolNames 跨帧记录 delta.tool_calls 的槽位归属与已发过的 name（见 toolNameState），
 	// 供逐 chunk 透传时收敛 name 为「每 index 一次」（对齐 OpenAI 官方流）。
-	toolCallSeen := map[int]bool{}
+	toolNames := &toolNameState{seenName: map[int]bool{}}
 	// clientSawContent 一旦为 true，后续 error 帧必须透传：客户端已经在读回答，
 	// 换号会把两个账号的输出拼进同一条流。
 	clientSawContent := false
@@ -907,7 +1022,7 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 	// fallback 是规范化失败时的兜底原文（与修复前「marshal 失败即原样透传」一致）。
 	writeChunk := func(obj map[string]any, fallback string) error {
 		// 先按 index 收敛 tool_calls name（每 index 仅首片保留，后续分片删 name 键），再规范化透传。
-		stripToolCallNames(obj, toolCallSeen)
+		stripToolCallNamesState(obj, toolNames)
 		// id 续传：首帧非空真实 id 缓存；后续帧缺 id / 空 id 一律用缓存值，
 		// 有自己 id 的帧保持原样（不同流分裂的帧允许各自 id）。
 		if firstID == "" {
@@ -1355,6 +1470,13 @@ func deltaHasClientContent(delta map[string]any) bool {
 	// 遗留 function_call（非 tool_calls 数组形态）：也是客户端可见的回答内容，
 	// 此前漏判会让「首帧即 function_call」的流被当成还没有正文。
 	if fc, ok := delta["function_call"].(map[string]any); ok && len(fc) > 0 {
+		return true
+	}
+	// 内容拒绝（OpenAI refusal 字段）是合法的模型回答：normalizeFrame 明确保留
+	// 该字段、Responses/Messages 转换也会把它映射成 stop_reason=refusal。若不计入
+	// 客户端可见内容，纯 refusal 流会被当成空流回 502，客户端把「模型礼貌拒绝」
+	// 误读成网关故障并重试，账号还会被记一次失败。
+	if txt, ok := delta["refusal"].(string); ok && txt != "" {
 		return true
 	}
 	return false

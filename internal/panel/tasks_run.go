@@ -14,6 +14,7 @@ import (
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/activity"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
@@ -118,16 +119,7 @@ func (p *Panel) tasksOverview(w http.ResponseWriter, r *http.Request) {
 	var growth benefitGrowth
 	if !all && len(accounts) == 1 {
 		if a := p.cfg.Pool.AuthByUID(focusUID); a != nil && p.cfg.Upstream != nil {
-			// Reuse the same 30s snapshot as /benefits. The browser loads both
-			// endpoints in parallel; querying growth twice would double the
-			// upstream RPC count for every focus change. /benefits owns the
-			// refresh=1 bypass, so this endpoint only consumes the snapshot.
-			snap := p.benefitsGrowthSnapshot(statuses, false)
-			if g, ok := snap[focusUID]; ok {
-				growth = g
-			} else {
-				growth = p.growthResult(r.Context(), a)
-			}
+			growth = p.focusGrowth(r.Context(), focusUID, statuses)
 			taskRows = append(taskRows, growth.Tasks...)
 			taskErr = growth.TasksErr
 		}
@@ -174,6 +166,37 @@ func (p *Panel) tasksOverview(w http.ResponseWriter, r *http.Request) {
 		"tasks_error":     taskErr,
 		"welfare_credits": summary.WelfareCredits,
 	})
+}
+
+// focusGrowth 取单个聚焦账号的成长明细。
+//
+// 本页只渲染这一个账号的任务行，而 benefitsGrowthSnapshot 会对传入的每个账号
+// 并发打 2 个上游端点。早先直接把整池 statuses 传进去，等于「切一个账号」触发
+// 一次全池成长扫描（470 号 = 数百次 RPC），且与并行加载的 /benefits 完全重复。
+//
+// 现在的三级取值：已缓存的整池快照（/benefits 通常已经就绪或正在飞）→ 单账号
+// 子集快照（自成一条缓存 key，不覆盖整池快照）→ 单账号直查兜底。
+func (p *Panel) focusGrowth(ctx context.Context, focusUID string, statuses []pool.Status) benefitGrowth {
+	if g, ok := p.benefitsGrowthCached(focusUID); ok {
+		return g
+	}
+	focusStatuses := make([]pool.Status, 0, 1)
+	for _, st := range statuses {
+		if st.UID == focusUID {
+			focusStatuses = append(focusStatuses, st)
+			break
+		}
+	}
+	if snap := p.benefitsGrowthSnapshot(focusStatuses, false); snap != nil {
+		if g, ok := snap[focusUID]; ok {
+			return g
+		}
+	}
+	a := p.cfg.Pool.AuthByUID(focusUID)
+	if a == nil {
+		return benefitGrowth{}
+	}
+	return p.growthResult(ctx, a)
 }
 
 // tasksRunRequest accepts Hub's POST /tasks/run shape. uid/ref/scope are
@@ -326,6 +349,24 @@ func (p *Panel) runTaskTargetsProgress(ctx context.Context, targets []*auth.Auth
 	return results
 }
 
+// taskRunConflictLocked 返回与本轮重叠的在跑批次（调用方必须持有 p.batchMu）。
+// 重叠口径：scope 相同、任一方为 all（全池请求必然触碰目标账号）。
+func (p *Panel) taskRunConflictLocked(action, scope string) *batchRun {
+	prefix := "tasks_" + action
+	for kind, run := range p.batchRuns {
+		if run == nil || !run.Running {
+			continue
+		}
+		if kind != prefix && !strings.HasPrefix(kind, prefix+"_") {
+			continue
+		}
+		if run.Scope == scope || run.Scope == "all" || scope == "all" {
+			return run
+		}
+	}
+	return nil
+}
+
 // startTaskRun returns immediately and publishes account outcomes through the
 // existing batch endpoint. A browser disconnect never cancels accepted work.
 func (p *Panel) startTaskRun(w http.ResponseWriter, targets []*auth.Auth, action, scope string, concurrency int) {
@@ -335,9 +376,17 @@ func (p *Panel) startTaskRun(w http.ResponseWriter, targets []*auth.Auth, action
 		scope = benefitRefFor(targets[0].UID)
 	}
 	kind := "tasks_" + action
+	// 单账号动作按账号区分子类：不同账号之间本来就有 per-account 锁保护，不该
+	// 被同一把全局单飞挡住（此前账号 A 在跑时点账号 B 的「一键做任务」直接
+	// 409，清 10 个账号只能串行 40 分钟）。
+	if len(targets) == 1 && scope != "all" {
+		kind += "_" + scope
+	}
 	run := &batchRun{Kind: kind, StartedAt: time.Now(), Running: true, Total: len(targets), Scope: scope}
 	p.batchMu.Lock()
-	if current := p.batchRuns[kind]; current != nil && current.Running {
+	// 冲突判定按 scope 重叠：同一账号重复点击仍拒绝；全池请求与任一单账号
+	// 请求重叠（它会触碰该账号）也拒绝；不同账号之间互不阻塞。
+	if current := p.taskRunConflictLocked(action, scope); current != nil {
 		p.batchMu.Unlock()
 		writeErr(w, http.StatusConflict, "该动作正在执行，请查看执行进度")
 		return

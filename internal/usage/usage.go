@@ -648,11 +648,15 @@ type Point struct {
 // CreditAgg 积分扣除统计的一行。Key 在账号维度是 UID，在模型维度是裸模型名；
 // Rate 仅模型维度使用；比例分母只统计与 credit 同时存在的 Token 样本。
 type CreditAgg struct {
-	Key                string  `json:"key"`
-	Realm              string  `json:"realm,omitempty"`
-	Nickname           string  `json:"nickname,omitempty"`
-	Rate               string  `json:"rate,omitempty"`
-	Requests           int64   `json:"requests"`
+	Key      string `json:"key"`
+	Realm    string `json:"realm,omitempty"`
+	Nickname string `json:"nickname,omitempty"`
+	Rate     string `json:"rate,omitempty"`
+	Requests int64  `json:"requests"`
+	// CreditRequests 是真正带 usage.credit 观测的请求数（桶的 CRN 之和）。
+	// Requests 含「该账号/模型下没有 credit 观测」的请求，两者相减即覆盖率；
+	// 直接拿 Requests 当分母会把「无观测」误算成「免费」。
+	CreditRequests     int64   `json:"credit_requests"`
 	Credits            float64 `json:"credits"`
 	CreditSamples      int64   `json:"credit_samples"`
 	CreditTokens       int64   `json:"credit_tokens"`
@@ -668,6 +672,7 @@ type creditAcc struct {
 
 func (a *creditAcc) add(b *bucket) {
 	a.Requests += b.Req
+	a.CreditRequests += b.CRN
 	a.Credits += b.CR
 	a.CreditSamples += b.CRN
 	a.CreditTokens += b.CRT
@@ -700,9 +705,12 @@ type Snapshot struct {
 	CreditByAccount []CreditAgg `json:"credit_by_account"`
 	CreditByModel   []CreditAgg `json:"credit_by_model"`
 	CreditByKey     []CreditAgg `json:"credit_by_key"`
-	Buckets         int         `json:"buckets"`
-	FileBytes       int64       `json:"file_bytes"`
-	Since           string      `json:"since,omitempty"`
+	// CreditByRealm 按域（cn/global）聚合积分扣减。前端「积分」明细的域维度
+	// 与用量明细的 by_realm 对齐，否则按域查看消耗时只能看到 token 没有积分。
+	CreditByRealm []CreditAgg `json:"credit_by_realm"`
+	Buckets       int         `json:"buckets"`
+	FileBytes     int64       `json:"file_bytes"`
+	Since         string      `json:"since,omitempty"`
 	// WindowFrom/WindowTo 本次实际生效的统计区间（本地时间，RFC3339），供面板
 	// 回显口径——「自定义」区间下用户必须能确认服务端到底按哪段算的。
 	// 空串 = 该侧不设界（全部历史 / 到今天为止）。
@@ -969,6 +977,7 @@ func (r *Recorder) snapshotWindow(w Window, nicks map[string]string, currentRate
 	creditAcctAgg := map[string]*creditAcc{}
 	creditModelAgg := map[string]*creditAcc{}
 	creditKeyAgg := map[string]*creditAcc{}
+	creditRealmAgg := map[string]*creditAcc{}
 	rateCache := map[string]string{}
 
 	parsed := make(map[string]bucketTimeAt, 96)
@@ -1066,6 +1075,12 @@ func (r *Recorder) snapshotWindow(w Window, nicks map[string]string, currentRate
 				da.add(b)
 			}
 			if b.CRN > 0 {
+				cr := creditRealmAgg[b.Realm]
+				if cr == nil {
+					cr = &creditAcc{CreditAgg: CreditAgg{Key: b.Realm, Realm: b.Realm}}
+					creditRealmAgg[b.Realm] = cr
+				}
+				cr.add(b)
 				ck := creditKeyAgg[b.KeyID]
 				if ck == nil {
 					ck = &creditAcc{CreditAgg: CreditAgg{Key: b.KeyID}}
@@ -1132,6 +1147,7 @@ func (r *Recorder) snapshotWindow(w Window, nicks map[string]string, currentRate
 		CreditByAccount: creditKeyed(creditAcctAgg),
 		CreditByModel:   creditKeyed(creditModelAgg),
 		CreditByKey:     creditKeyed(creditKeyAgg),
+		CreditByRealm:   creditKeyed(creditRealmAgg),
 		Buckets:         matched,
 		Generated:       time.Now().Format(time.RFC3339),
 	}

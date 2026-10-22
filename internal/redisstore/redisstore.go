@@ -128,11 +128,40 @@ type Upstash struct {
 	stateMu      sync.Mutex
 	pendingState []byte
 	stateQueued  bool
+
+	// bindMu/pendingBind/bindQueued 保护「粘性绑定镜像」的按 key 顺序语义。
+	//
+	// 为什么需要它：writeConcurrencyLimit 个 worker 并发执行队列里的写，同一个 key
+	// 的 SetBind 与 DelBind 可能被不同 worker 乱序执行——本地 GC 淘汰了会话（Del）
+	// 之后又一次命中/改绑（Set）时，Redis 里可能留下已删除的旧绑定，重启后把会话
+	// 粘到错误账号；反过来也可能是刚写入的绑定被旧 Del 抹掉。
+	// 这里按「每个 key 只保留最新目标状态」合并：同一 key 的连续写只落最后一次
+	// （Set(a)→Set(b) 落 b，Set→Del 落 Del，Del→Set 落 Set），并由单个 flusher
+	// 顺序应用，天然消除乱序，同时把高频改绑的写放大压到常数级。
+	bindMu      sync.Mutex
+	pendingBind map[string]bindWrite
+	bindQueued  bool
+
+	// applyBind 仅供测试注入（client 为 nil 时无法构造真实 Redis 调用）。
+	// 生产路径为 nil，flushBinds 直接走 client。
+	applyBind func(key string, w bindWrite)
 }
 
 type writeTask struct {
 	fn func()
 }
+
+// bindWrite 一个 key 的粘性镜像目标状态：del=true 表示删除该绑定，
+// 否则写入 uid（ttl<=0 表示用默认 TTL）。
+type bindWrite struct {
+	uid string
+	ttl time.Duration
+	del bool
+}
+
+// bindPendingLimit 合并表容量上限。同一时刻的待写 key 数受此限制约束；
+// 超限直接丢弃（内存仍是权威状态，Redis 只是恢复备份），绝不阻塞请求热路径。
+const bindPendingLimit = writeQueueLimit * 4
 
 // ensure 初始化零值 Upstash（仅测试会直接构造）并启动固定写 worker。
 func (u *Upstash) ensure() {
@@ -227,29 +256,82 @@ func (u *Upstash) closeClient() error {
 
 func bindKey(key string) string { return bindPrefix + key }
 
-// SetBind 异步镜像粘性会话绑定。
+// SetBind 异步镜像粘性会话绑定（按 key 合并、顺序应用，见 bindMu 注释）。
 func (u *Upstash) SetBind(key, uid string, ttl time.Duration) {
 	if ttl <= 0 {
 		ttl = keyTTL
 	}
-	u.goWrite(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := u.client.Set(ctx, bindKey(key), uid, ttl).Err(); err != nil {
-			log.Printf("[redisstore] debug: SetBind %s: %v", key, err)
-		}
-	})
+	u.enqueueBind(key, bindWrite{uid: uid, ttl: ttl})
 }
 
-// DelBind 异步删除粘性会话绑定。
+// DelBind 异步删除粘性会话绑定（按 key 合并、顺序应用，见 bindMu 注释）。
 func (u *Upstash) DelBind(key string) {
-	u.goWrite(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := u.client.Del(ctx, bindKey(key)).Err(); err != nil {
-			log.Printf("[redisstore] debug: DelBind %s: %v", key, err)
+	u.enqueueBind(key, bindWrite{del: true})
+}
+
+// enqueueBind 登记一个 key 的最新目标状态；只有「当前没有 flusher 在跑」时
+// 才向写队列提交一次任务，后续登记只覆盖合并表，因此写入量与原实现同阶，
+// 但同一 key 的最终状态由最后一次登记决定（fail-safe：顺序不再是随机的）。
+func (u *Upstash) enqueueBind(key string, w bindWrite) {
+	u.ensure()
+	u.bindMu.Lock()
+	if u.pendingBind == nil {
+		u.pendingBind = make(map[string]bindWrite)
+	}
+	if _, exists := u.pendingBind[key]; !exists && len(u.pendingBind) >= bindPendingLimit {
+		u.bindMu.Unlock()
+		u.noteDrop()
+		return
+	}
+	u.pendingBind[key] = w
+	needTask := !u.bindQueued
+	if needTask {
+		u.bindQueued = true
+	}
+	u.bindMu.Unlock()
+	if !needTask {
+		return
+	}
+	if !u.goWrite(u.flushBinds) {
+		// 队列满/已关停：撤销占位并释放合并表，下一次写可重新提交。
+		u.bindMu.Lock()
+		u.bindQueued = false
+		u.pendingBind = nil
+		u.bindMu.Unlock()
+	}
+}
+
+// flushBinds 由单个 worker 顺序排空合并表：期间新登记只替换 pendingBind，
+// 不新增任务，积压上限固定为 bindPendingLimit 个 key。同一 key 的多次写
+// 在同一个 flusher 内按「最后一次登记」落地，不可能与自身乱序。
+func (u *Upstash) flushBinds() {
+	for {
+		u.bindMu.Lock()
+		pending := u.pendingBind
+		u.pendingBind = nil
+		if len(pending) == 0 {
+			u.bindQueued = false
+			u.bindMu.Unlock()
+			return
 		}
-	})
+		u.bindMu.Unlock()
+
+		for key, w := range pending {
+			if u.applyBind != nil {
+				u.applyBind(key, w)
+				continue
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			if w.del {
+				if err := u.client.Del(ctx, bindKey(key)).Err(); err != nil {
+					log.Printf("[redisstore] debug: DelBind %s: %v", key, err)
+				}
+			} else if err := u.client.Set(ctx, bindKey(key), w.uid, w.ttl).Err(); err != nil {
+				log.Printf("[redisstore] debug: SetBind %s: %v", key, err)
+			}
+			cancel()
+		}
+	}
 }
 
 // SaveState 异步写池状态 JSON 快照，并合并排队中的快照：只保留最后提交的

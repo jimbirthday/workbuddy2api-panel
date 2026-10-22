@@ -13,6 +13,7 @@ package panel
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
@@ -96,6 +97,16 @@ type Panel struct {
 	// 不同账号之间不互斥（并行照旧）。TryLock 语义，锁条目常驻（账号数有界）。
 	taskMu    sync.Mutex
 	taskLocks map[string]*sync.Mutex
+	// mpPaceOnce/mp 是小程序口径成长任务的「真人节奏」事件调度器状态
+	//（见 mppacer.go）：把 45s 级的间隔等待从请求/队列 worker 里摘出来。
+	mpPaceOnce sync.Once
+	mp         *mpPaceState
+
+	// taskSnapOnce/ts 是账号成长任务列表的短 TTL 快照（见 tasksnapshot.go）：
+	// 一次「一键做任务」原本会为每个动作各拉一遍列表，单号 50+ 次上游 GET。
+	taskSnapOnce sync.Once
+	ts           *taskSnapState
+
 	// benefitRefMu/benefitRefs 是福利页动作的服务端短引用映射。页面只拿到
 	// uid8 展示值与不可逆引用，完整 UID 不进入浏览器；引用随每次快照刷新重建，
 	// 使已移除账号的旧按钮自然失效，且不会因 uid8 碰撞命中错误账号。
@@ -116,6 +127,11 @@ type Panel struct {
 	bgWG       sync.WaitGroup
 	bgStop     bool
 	bgRejected int
+	// bgCtx/bgCancel 是面板后台作业的统一取消信号：任务链里所有「给上游留
+	// 处理时间」的等待都挂在它上面，停机时立刻返回，不会让 docker stop 被
+	// 最长的 45s 事件间隔拖住数分钟。
+	bgCtx    context.Context
+	bgCancel context.CancelFunc
 
 	// 说明：四类「一键全部」批量任务的 per-kind 单飞闸门已下移到
 	// scheduler.TryRunBatch（手动与定时共用同一把锁）。此处不再持有副本，
@@ -236,7 +252,16 @@ func (p *Panel) GoBackground(fn func()) bool {
 func (p *Panel) StopWaiting() {
 	p.bgMu.Lock()
 	p.bgStop = true
+	cancel := p.bgCancel
+	if cancel == nil {
+		// 零值 Panel（测试里直接 &Panel{}）没有构造过 ctx：补一个已取消的，
+		// 让可取消等待立刻返回而不是永久阻塞。
+		cancel = func() {}
+	}
 	p.bgMu.Unlock()
+	// 先取消再等待：后台任务链里的可取消等待会立即返回，队列/任务不会为了
+	// 跑完 45s 的事件间隔而把停机拖成分钟级。
+	cancel()
 	p.bgWG.Wait()
 }
 
@@ -255,8 +280,11 @@ func New(cfg Config) *Panel {
 	if cfg.RedisMode == "" {
 		cfg.RedisMode = "noop"
 	}
+	bgCtx, bgCancel := context.WithCancel(context.Background())
 	p := &Panel{
 		cfg:         cfg,
+		bgCtx:       bgCtx,
+		bgCancel:    bgCancel,
 		mux:         http.NewServeMux(),
 		started:     time.Now(),
 		logs:        NewRing(500),
@@ -292,6 +320,7 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/resume", p.withAuth(p.accountResume))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/profile", p.withAuth(p.accountProfile))
 	p.mux.HandleFunc("POST /panel/api/accounts/set_all", p.withAuth(p.accountsSetAll))
+	p.mux.HandleFunc("POST /panel/api/accounts/remove_all", p.withAuth(p.accountsRemoveAll))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/checkin", p.withAuth(p.accountCheckin))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/balance", p.withAuth(p.accountBalance))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/test", p.withAuth(p.accountTest))
@@ -1225,7 +1254,7 @@ func (p *Panel) benefitsDailyChatWeb(w http.ResponseWriter, r *http.Request) {
 	res := p.cfg.Upstream.DailyChatWeb(a, "deepseek-v4.1-flash")
 	p.invalidateBenefitsGrowth()
 	_ = p.cfg.Activity.Append(activity.Record{
-		UID: uid, Nickname: a.Nickname, Realm: a.Realm(), Task: activity.TaskDailyChat,
+		UID: uid, Nickname: a.NicknameValue(), Realm: a.Realm(), Task: activity.TaskDailyChat,
 		Trigger: activity.TriggerManual, OK: res.OK,
 		Message: "网页通道打卡：" + dailyChatResultMessage(res),
 	})

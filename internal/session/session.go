@@ -554,6 +554,24 @@ func ExtractKey(body []byte) string {
 	return ExtractKeyFromObject(obj)
 }
 
+// MaxSessionKeyBytes 会话键长度上限。会话键由客户端完全控制（conversation_id /
+// prompt_cache_key 都是任意字符串），而它会成为内存 map key 与 Redis key：
+// 没有上限时，一个 4 MiB 的键就能让单条绑定占 4 MiB 内存、并在会话全局写锁内
+// 逐字节哈希（hashIndex），阻塞所有会话命中。4 KiB 足以容纳任何真实会话 id
+// （UUID 36 字节、<uuid>+后缀通常 <120），超限一律视为「无会话键」而回落轮换。
+const MaxSessionKeyBytes = 4 << 10
+
+// clampSessionKey 把任意客户端字符串收敛成可信的会话键：去空白、超长截断为空。
+// 超出上限时返回空串（而不是截断前 N 字节）——截断会让不同的超长键碰撞成同一
+// 粘性槽位，反而制造跨会话串号。
+func clampSessionKey(v string) string {
+	v = strings.TrimSpace(v)
+	if v == "" || len(v) > MaxSessionKeyBytes {
+		return ""
+	}
+	return v
+}
+
 // ExtractKeyFromObject 是 ExtractKey 的已解析版本：handler 在请求入口已把 body
 // 解码为 map 后直接复用，不再为会话键做第二次全量解码。obj 必须是成功
 // json.Unmarshal 到 map[string]any 的结果（与 ExtractKey 内解析同构）；nil 返回空串。
@@ -561,23 +579,24 @@ func ExtractKeyFromObject(obj map[string]any) string {
 	if obj == nil {
 		return ""
 	}
+	// 每个候选都过 clampSessionKey：超长键直接丢弃（见 MaxSessionKeyBytes）。
 	if meta, ok := obj["metadata"].(map[string]any); ok {
-		if v := strOrEmpty(meta["conversation_id"]); v != "" {
+		if v := clampSessionKey(strOrEmpty(meta["conversation_id"])); v != "" {
 			return v
 		}
-		if v := strOrEmpty(meta["conversationId"]); v != "" {
+		if v := clampSessionKey(strOrEmpty(meta["conversationId"])); v != "" {
 			return v
 		}
 	}
-	if v := strOrEmpty(obj["conversation_id"]); v != "" {
+	if v := clampSessionKey(strOrEmpty(obj["conversation_id"])); v != "" {
 		return v
 	}
-	if v := strOrEmpty(obj["conversationId"]); v != "" {
+	if v := clampSessionKey(strOrEmpty(obj["conversationId"])); v != "" {
 		return v
 	}
 	// 5. prompt_cache_key：OpenAI 系的会话级前缀缓存键，语义就是"同一会话复用同一
 	//    前缀"，与粘性诉求同源。放显式会话键之后、派生键之前，不抢占优先级。
-	if v := strOrEmpty(obj["prompt_cache_key"]); v != "" {
+	if v := clampSessionKey(strOrEmpty(obj["prompt_cache_key"])); v != "" {
 		return v
 	}
 	// 派生回退闸：带 user 维度标识的请求不派生（契约见上）。

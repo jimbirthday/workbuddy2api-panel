@@ -427,13 +427,13 @@ func (s *Scheduler) runBatch(ctx context.Context, kinds []taskKind) {
 			case taskCheckin:
 				s.tryRunBatchKind("checkin", func() { s.runCheckin(activity.TriggerSchedule) })
 			case taskTravel:
-				s.tryRunBatchKind("travel", func() { s.runTravel(activity.TriggerSchedule) })
+				s.tryRunBatchKind("travel", func() { s.runTravel(ctx, activity.TriggerSchedule) })
 			case taskActivity:
 				s.tryRunBatchKind("activity", func() { s.runActivity(ctx, activity.TriggerSchedule) })
 			case taskKeepalive:
 				s.tryRunBatchKind("keepalive", func() { s.runKeepalive(activity.TriggerSchedule) })
 			case taskBlackcat:
-				s.tryRunBatchKind("blackcat", s.RunBlackcatNow)
+				s.tryRunBatchKind("blackcat", func() { s.runBlackcat(ctx) })
 			case taskGrowth:
 				// 成长任务队列：回调在 panel 侧异步启动（返回不等执行完），nil 未挂载则跳过。
 				s.schedMu.Lock()
@@ -584,10 +584,10 @@ func (s *Scheduler) runCheckin(trigger activity.Trigger) {
 				// "今天已签到"是幂等成功（上游对重复签到返回 code!=0），不再当失败打 error 行。
 				if upstream.IsAlreadyCheckin(err) {
 					s.cfg.Pool.NoteCheckinDone(uid)
-					log.Printf("checkin %s: 今天已签到（幂等）", logfmt.Label(uid, a.Nickname))
+					log.Printf("checkin %s: 今天已签到（幂等）", logfmt.Label(uid, a.NicknameValue()))
 					s.recordActivity(a, activity.TaskCheckin, trigger, true, "今天已签到（幂等）")
 				} else {
-					log.Printf("checkin %s: %v", logfmt.Label(uid, a.Nickname), err)
+					log.Printf("checkin %s: %v", logfmt.Label(uid, a.NicknameValue()), err)
 					s.recordActivity(a, activity.TaskCheckin, trigger, false, err.Error())
 				}
 				// 其余业务错误也继续走余额查询
@@ -595,14 +595,14 @@ func (s *Scheduler) runCheckin(trigger activity.Trigger) {
 				// 首次签到成功此前静默——排查「签到到底跑没跑」时无迹可循（幂等行只在
 				// 重复触发时出现），成功也落一行。
 				s.cfg.Pool.NoteCheckinDone(uid)
-				log.Printf("checkin %s: 签到成功", logfmt.Label(uid, a.Nickname))
+				log.Printf("checkin %s: 签到成功", logfmt.Label(uid, a.NicknameValue()))
 				s.recordActivity(a, activity.TaskCheckin, trigger, true, "签到成功")
 			}
 		}
 		// 分桶查余额：配置窗口内的积分单独标记，同时记录最早未来到期批次。
 		remain, total, expiring, earliestAt, earliestRemaining, err := s.cfg.Upstream.UserResourceDetailedWithExpiry(a, expiringSoon)
 		if err != nil {
-			log.Printf("user-resource %s: %v", logfmt.Label(uid, a.Nickname), err)
+			log.Printf("user-resource %s: %v", logfmt.Label(uid, a.NicknameValue()), err)
 			continue
 		}
 		s.cfg.Pool.ReenableIfCredits(uid, remain, total)
@@ -653,7 +653,7 @@ func (s *Scheduler) runActivity(ctx context.Context, trigger activity.Trigger) {
 		first = false
 		cid := fmt.Sprintf("wb2api-%d", time.Now().UnixMilli())
 		if err := s.cfg.Upstream.ReportChatActivity(a, cid, ""); err != nil {
-			log.Printf("activity %s: %v", logfmt.Label(a.UID, a.Nickname), err)
+			log.Printf("activity %s: %v", logfmt.Label(a.UID, a.NicknameValue()), err)
 			s.recordActivity(a, activity.TaskActivity, trigger, false, err.Error())
 			continue
 		}
@@ -672,14 +672,14 @@ func (s *Scheduler) runActivity(ctx context.Context, trigger activity.Trigger) {
 func (s *Scheduler) checkActivityStreak(a *auth.Auth) bool {
 	days, err := s.cfg.Upstream.GrowthStreak(a)
 	if err != nil {
-		log.Printf("activity %s: streak check failed (report OK): %v", logfmt.Label(a.UID, a.Nickname), err)
+		log.Printf("activity %s: streak check failed (report OK): %v", logfmt.Label(a.UID, a.NicknameValue()), err)
 		return true
 	}
 	if days == 0 {
-		log.Printf("activity %s: report OK but streak.days=0 (silent drop?)", logfmt.Label(a.UID, a.Nickname))
+		log.Printf("activity %s: report OK but streak.days=0 (silent drop?)", logfmt.Label(a.UID, a.NicknameValue()))
 		return true
 	}
-	log.Printf("activity %s: streak days=%d", logfmt.Label(a.UID, a.Nickname), days)
+	log.Printf("activity %s: streak days=%d", logfmt.Label(a.UID, a.NicknameValue()), days)
 	return false
 }
 
@@ -702,19 +702,19 @@ func (s *Scheduler) runKeepalive(trigger activity.Trigger) {
 			continue
 		}
 		if err := s.cfg.Upstream.RefreshToken(a); err != nil {
-			log.Printf("keepalive %s: %v", logfmt.Label(uid, a.Nickname), err)
+			log.Printf("keepalive %s: %v", logfmt.Label(uid, a.NicknameValue()), err)
 			s.recordActivity(a, activity.TaskKeepalive, trigger, false, err.Error())
 			var ue *upstream.Error
 			if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
 				if s.cfg.Pool.NoteSessionDead(uid) {
-					log.Printf("keepalive %s: 连续 %d 次 12153 session dead — 禁用", logfmt.Label(uid, a.Nickname), pool.SessionDeadThreshold())
+					log.Printf("keepalive %s: 连续 %d 次 12153 session dead — 禁用", logfmt.Label(uid, a.NicknameValue()), pool.SessionDeadThreshold())
 				}
 			}
 			continue
 		}
 		s.cfg.Pool.ClearSessionDead(uid) // 刷新成功清误判计数，失败不该累计
 		if err := a.SaveAtomic(); err != nil {
-			log.Printf("keepalive %s save: %v", logfmt.Label(uid, a.Nickname), err)
+			log.Printf("keepalive %s save: %v", logfmt.Label(uid, a.NicknameValue()), err)
 			s.recordActivity(a, activity.TaskKeepalive, trigger, false, "token 刷新成功，写回失败: "+err.Error())
 			continue
 		}

@@ -158,7 +158,9 @@ func (p *Panel) taskAcceptAll(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		accepted += end - i
-		time.Sleep(acceptBatchGap) // 批间节流（对齐脚本 1.05s 口径）
+		if !p.wait(acceptBatchGap) { // 批间节流（对齐脚本 1.05s 口径；停机可中断）
+			break
+		}
 	}
 	// 小程序口径任务单独批量接受（默认列表不含 mp 码，accept 也要求 mp 头）。
 	if mpTasks, mpErr := p.cfg.Upstream.ListTasksMP(a); mpErr == nil {
@@ -175,7 +177,7 @@ func (p *Panel) taskAcceptAll(w http.ResponseWriter, r *http.Request) {
 				failed = append(failed, mpCodes...)
 			} else {
 				accepted += len(mpCodes)
-				time.Sleep(acceptBatchGap)
+				p.wait(acceptBatchGap)
 			}
 		}
 	}

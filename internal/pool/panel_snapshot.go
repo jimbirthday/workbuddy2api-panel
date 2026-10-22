@@ -207,7 +207,7 @@ func (p *Pool) UsageRows() []UsageRow {
 		e := p.byUID[uid]
 		out = append(out, UsageRow{
 			UID:      uid,
-			Nickname: e.a.Nickname,
+			Nickname: e.a.NicknameValue(),
 			Realm:    e.a.Realm(),
 		})
 	}

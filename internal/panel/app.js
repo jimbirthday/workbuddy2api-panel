@@ -120,7 +120,7 @@ function syncAccSelectionUI(shown, pageRows) {
     note.textContent = n ? '已选 ' + n + ' 个' : '';
     note.className = n ? 'note src-off' : 'note';
   }
-  for (const id of ['btnSelEnable', 'btnSelPause', 'btnSelDisable']) {
+  for (const id of ['btnSelEnable', 'btnSelPause', 'btnSelDisable', 'btnSelRemove']) {
     const b = $(id);
     if (b) b.disabled = n === 0;
   }
@@ -677,7 +677,7 @@ if ($('keyInput')) $('keyInput').addEventListener('keydown', e => {
 });
 
 /* ── 路由 ─────────────────────────────────────────────────────────── */
-/* 积分包明细共享缓存：「积分构成」视图与首页「积分到期提醒」卡片共用同一份
+/* 积分包明细共享缓存：任务页「刷新积分」与首页「积分到期提醒」卡片共用同一份
    /panel/api/packages 数据（逐账号实时查上游，能省一次是一次）。声明在路由区
    是因为 go() 的初始调用就会触发首页卡片的渲染，必须先于它就位。 */
 let lastPackages = null;
@@ -685,7 +685,7 @@ let lastPackagesAt = 0;
 let expFetching = false;                       // 到期卡片在途标记（防重复打上游）
 const EXP_FRESH_MS = 2 * 60 * 1000;            // 缓存新鲜窗口：2 分钟内复用
 /* invalidatePackagesCache 账号增删后作废 packages 缓存（易用性修复 8）：新加/移除的
-   账号不在旧快照里，继续复用会让到期卡片与积分构成表里挂着已删除的账号、少了新账号。
+   账号不在旧快照里，继续复用会让到期卡片里挂着已删除的账号、少了新账号。
    下一次 loadPackages / loadExpiry 会重新实时查上游。 */
 function invalidatePackagesCache() {
   lastPackages = null;
@@ -693,7 +693,7 @@ function invalidatePackagesCache() {
 }
 
 // loadPackagesData 所有「逐账号实时查 packages」的入口共享这一份在途 Promise：
-// 首页到期检查、积分构成刷新、套餐页刷新以前各用各的锁，同时点会重复打一整套
+// 首页到期检查与任务页「刷新积分」以前各用各的锁，同时点会重复打一整套
 // 上游请求，先回来的还可能覆盖后回来的。这里只允许一个真实查询，其余调用复用
 // 同一结果；force 语义由调用方决定是否接受缓存。
 let packagesInFlight = null;
@@ -709,7 +709,7 @@ function loadPackagesData() {
   return run.finally(() => { if (packagesInFlight === run) packagesInFlight = null; });
 }
 
-const TITLES = { accounts: '账号池', activity: '活动记录', usage: '用量', packages: '积分构成', taskscenter: '任务与福利', connect: '接入', models: '模型与档位', config: '配置', logs: '运行日志' };
+const TITLES = { accounts: '账号池', activity: '活动记录', usage: '用量', taskscenter: '任务与福利', connect: '接入', models: '模型与档位', config: '配置', logs: '运行日志' };
 // cfgDirty 标记配置页是否有未保存修改。页面内切视图用 confirm，关闭/刷新用
 // beforeunload 的浏览器原生提示。loadConfig 回填后清除，避免误报。
 let cfgDirty = false;
@@ -753,7 +753,6 @@ function go(v) {
   if (v === 'activity') { renderActivityAccountOptions(); loadActivity(); }
   if (v === 'taskscenter' && typeof loadBenefits === 'function') loadBenefits();
   if (v === 'connect') loadConnect();
-  if (v === 'packages') loadPackages();
   // 到期提醒卡片：默认可见，进页面即用 overview 快照渲染（零上游请求，随首页统计
   // 每轮刷新）。不再「打开账号池就打上游」——逐账号实时查在账号多时会卡死面板。
   // 完整逐包明细由卡片上的「检查」按钮显式触发（loadPackages/loadExpiry）。
@@ -1191,7 +1190,25 @@ async function loadOverview(quiet) {
   try {
     const h = authHeaders();
     if (overviewETag) h['If-None-Match'] = overviewETag;
-    const r = await fetch('/panel/api/overview', { headers: h });
+    // 必须自带截止时间：这里为了 ETag/304 没有复用 api()，但裸 fetch 一旦被
+    // 反代或半关连接挂住就永不 settle，overviewInFlight 恒 true，之后每 5s
+    // 的轮询全部被跳过——账号表与统计条长期停更且没有任何错误提示。
+    let ovCtl = null, ovTimed = false;
+    let ovSignal;
+    if (typeof AbortController === 'function') {
+      ovCtl = new AbortController();
+      ovSignal = ovCtl.signal;
+    }
+    const ovTimer = ovCtl ? setTimeout(() => { ovTimed = true; try { ovCtl.abort(); } catch (e) { /* ignore */ } }, 15000) : null;
+    let r;
+    try {
+      r = await fetch('/panel/api/overview', { headers: h, signal: ovSignal });
+    } catch (e) {
+      if (ovTimed) throw new Error('概览请求超时（15 秒），请稍后重试');
+      throw e;
+    } finally {
+      if (ovTimer) clearTimeout(ovTimer);
+    }
     if (r.status === 401) rejectUnauthorized(h);
     if (r.status === 304) {
       if (my !== overviewSeq) return;
@@ -1401,9 +1418,12 @@ function syncAccSelectionRows() {
 async function accSelectedAction(kind) {
   const uids = Array.from(accSelected);
   if (!uids.length) return;
-  const labels = { enable: '启用（解冻）', pause: '暂停选号', disable: '禁用' };
+  const labels = { enable: '启用（解冻）', pause: '暂停选号', disable: '禁用', remove: '移除（删除凭证文件，不可恢复）' };
   if (!confirm('将对选中的 ' + uids.length + ' 个账号执行「' + labels[kind] + '」。确认？')) return;
-  const btn = $({ enable: 'btnSelEnable', pause: 'btnSelPause', disable: 'btnSelDisable' }[kind]);
+  // 移除不可恢复：再加一次独立确认。只靠一次 confirm 的话，误点「全选」+
+  // 误点按钮就能把整池凭证删掉；第二次确认明确数量，让人停下来看清楚。
+  if (kind === 'remove' && !confirm('即将删除 ' + uids.length + ' 个账号的凭证文件，删除后无法恢复（需重新登录）。确定继续？')) return;
+  const btn = $({ enable: 'btnSelEnable', pause: 'btnSelPause', disable: 'btnSelDisable', remove: 'btnSelRemove' }[kind]);
   const label = btn ? btn.textContent : '';
   if (btn) { btn.disabled = true; btn.textContent = '执行中…'; }
   try {
@@ -1427,6 +1447,32 @@ async function accSelectedAction(kind) {
       await Promise.all(Array.from({ length: Math.min(8, uids.length) }, worker));
       const failed = results.filter(x => !x.ok);
       toast(failed.length ? '已暂停 ' + (uids.length - failed.length) + ' 个，' + failed.length + ' 个失败' : '已暂停 ' + uids.length + ' 个账号', failed.length ? 'err' : 'ok');
+    } else if (kind === 'remove') {
+      // 单请求 + 后端逐 UID 汇总：删除每号都要 fsync 落盘，逐号并发只会
+      // 加剧 IO 抖动，且失败回滚语义在客户端无法正确处理。超时放大到 60s。
+      const r = await api('accounts/remove_all', {
+        method: 'POST',
+        body: JSON.stringify({ uids, confirm: uids.length }),
+        timeoutMs: 60000,
+      });
+      const gone = Array.isArray(r.removed_uids) ? r.removed_uids : [];
+      // 只把真正删掉的从选择集里剔除：失败/跳过的账号仍在池里，保留选中
+      // 让用户能直接再点一次重试（清空选择会让人重新一个个勾）。
+      for (const u of gone) accSelected.delete(u);
+      const okN = Number(r.removed || 0);
+      const failedN = Number(r.failed || 0);
+      const skippedN = Number(r.skipped || 0);
+      const tail = (failedN ? ' · ' + failedN + ' 个失败' : '') + (skippedN ? ' · ' + skippedN + ' 个跳过' : '');
+      toast('已移除 ' + okN + ' 个账号' + tail + (failedN || skippedN ? '（失败的仍保持选中，可重试）' : ''), failedN ? 'err' : 'ok');
+      if (failedN || skippedN) {
+        // 逐条原因只写控制台：toast 放不下，且失败原因里可能含路径等长文本。
+        if (typeof console !== 'undefined' && console.warn) {
+          console.warn('[accounts] remove_all 未全部成功', r.results || [], r.warnings || []);
+        }
+      }
+      const shown = accShownRows();
+      syncAccSelectionUI(shown, shown.slice(0, Math.max(1, accPageSize > 0 ? accPageSize : shown.length)));
+      syncAccSelectionRows();
     } else {
       const r = await api('accounts/set_all', { method: 'POST', body: JSON.stringify({ enabled: kind === 'enable', uids }) });
       toast('已' + (kind === 'enable' ? '启用 ' : '禁用 ') + (r.changed || 0) + ' 个账号', 'ok');
@@ -1442,6 +1488,7 @@ async function accSelectedAction(kind) {
 if ($('btnSelEnable')) $('btnSelEnable').onclick = () => accSelectedAction('enable');
 if ($('btnSelPause')) $('btnSelPause').onclick = () => accSelectedAction('pause');
 if ($('btnSelDisable')) $('btnSelDisable').onclick = () => accSelectedAction('disable');
+if ($('btnSelRemove')) $('btnSelRemove').onclick = () => accSelectedAction('remove');
 
 if ($('accBody')) $('accBody').addEventListener('click', async ev => {
   const pick = ev.target.closest && ev.target.closest('input[data-pick]');
@@ -1511,7 +1558,9 @@ if ($('accBody')) $('accBody').addEventListener('click', async ev => {
       try {
         const r = await api('accounts/' + encodeURIComponent(u) + '/remove', { method: 'POST' });
         invalidatePackagesCache();   // 账号已删：旧 packages 快照里还挂着它（易用性修复 8）
-        toast(r.removed === false ? (r.message || '移除未完成，账号仍保留') : '已移除', r.removed === false ? 'err' : 'ok');
+        // 后端成功恒为 {"ok":true}，失败走 4xx/5xx：不能靠 r.removed===false 判失败
+        //（该分支永远不成立，是历史遗留的死判断）。
+        toast('已移除', 'ok');
       } catch (e) {
         // 500 表示账号已出池但凭证文件仍在：必须先失效缓存刷新表格，再提示
         // 用户手动处理文件；不能只显示一句泛化错误让表格继续挂着旧账号。
@@ -1524,7 +1573,8 @@ if ($('accBody')) $('accBody').addEventListener('click', async ev => {
   finally { busyKeys.delete(busyKey); b.disabled = false; loadOverview(true); }
 });
 
-/* 四个「全部」动作（全部签到 / 旅行巡检 / 活跃上报 / 全部保活）。
+/* 批量动作（全部签到 / 全部猫猫旅行 / 全部活跃上报 / 全部 Token 保活 /
+   全部连登与抽奖 / 全部国际版每日活跃），统一挂在「任务与福利」页。
    后端对并发重复调用返回 409 already_running，所以点击前先 confirm，点击后立刻
    disabled + "执行中…"：既避免误触把全池任务又跑一遍，也让用户看得出正在执行
    （易用性修复 7）。任务在后台异步跑，无法从 overview 轮询恢复按钮状态（header
@@ -1551,16 +1601,14 @@ function bindAllAction(id, path, confirmText, okText) {
     el.textContent = label;
   };
 }
-bindAllAction('btnCheckinAll', 'checkin_all', '将对全部个人账号执行签到（企业账号无签到体系，会自动跳过；已签到的会跳过）。确认开始？', '全部签到已开始（企业账号已跳过），结果见日志');
-bindAllAction('btnTravelAll', 'travel_all', '将对全部账号执行旅行巡检（含领养链路，耗时较长）。确认开始？', '旅行巡检已开始（含领养链路），结果见日志');
-bindAllAction('btnActivityAll', 'activity_all', '将对全部账号执行活跃上报。确认开始？', '活跃上报已开始，结果见日志');
-bindAllAction('btnKeepaliveAll', 'keepalive_all', '将对全部账号执行保活（维持会话活跃）。确认开始？', '全部保活已开始，结果见日志');
-bindAllAction('btnBfCheckinAll', 'checkin_all', '将对全部个人账号执行签到（企业账号与已签到账号自动跳过）。确认开始？', '全部签到已开始，结果见活动记录');
-bindAllAction('btnBfTravelAll', 'travel_all', '将对全部账号执行旅行巡检（含领养链路，耗时较长）。确认开始？', '旅行巡检已开始，结果见活动记录');
-bindAllAction('btnBfActivityAll', 'activity_all', '将对全部账号执行成长活跃上报。确认开始？', '活跃上报已开始，结果见活动记录');
-bindAllAction('btnBfKeepaliveAll', 'keepalive_all', '将对全部账号执行 Token 保活。确认开始？', '全部保活已开始，结果见活动记录');
-bindAllAction('btnBfStreakAll', 'streak_all', '将执行连登补签、档位兑换与抽奖（未解锁档位/无次数会自动跳过）。确认开始？', '连登与抽奖已开始，结果见活动记录');
-bindAllAction('btnBfDailyChatAll', 'daily_chat_all', '将对全部国际版个人账号发起一次每日活跃对话（不计入真实流量模型额度）。确认开始？', '国际版每日活跃已开始，结果见活动记录');
+// 批量动作全部收敛到「任务与福利」页：同一页里既能发起、也能就地看进度，
+// 不再出现「在账号池点按钮、结果要去另一页找」的割裂。
+bindAllAction('bfBtnAllCheckin', 'checkin_all', '将对全部国内个人账号执行签到（企业账号与已签到账号自动跳过）。确认开始？', '全部签到已开始');
+bindAllAction('bfBtnAllTravel', 'travel_all', '将对全部国内个人账号执行猫猫旅行（含领养链路，耗时较长）。确认开始？', '全部猫猫旅行已开始');
+bindAllAction('bfBtnAllActivity', 'activity_all', '将对全部个人账号执行活跃上报。确认开始？', '全部活跃上报已开始');
+bindAllAction('bfBtnAllKeepalive', 'keepalive_all', '将对全部个人账号执行 Token 保活（维持会话活跃）。确认开始？', '全部 Token 保活已开始');
+bindAllAction('bfBtnAllStreak', 'streak_all', '将执行连登补签、档位兑换与抽奖（未解锁档位/无次数会自动跳过）。确认开始？', '全部连登与抽奖已开始');
+bindAllAction('btnBfDailyChatAll', 'daily_chat_all', '将对全部国际版个人账号发起每日活跃对话（不计入真实流量模型额度）。确认开始？', '全部国际版每日活跃已开始');
 
 // 批量启停：后端逐号执行，返回 changed 数；确认文案明确区分「启用=解冻」与「禁用=判死需手动解冻」。
 function bindSetAll(id, enabled, confirmText) {
@@ -2259,14 +2307,48 @@ async function withExportBusy(btn, run) {
     if (btn) { btn.disabled = false; btn.textContent = label; }
   }
 }
-function downloadHiddenURL(url) {
+/* 导出必须自己带鉴权去取：/panel/api/* 只认 Authorization 头，而浏览器打开
+   <a href> 下载链接时不会复用页面 fetch 的请求头。之前直接把导出地址挂到隐藏
+   <a> 上，后端只会回 {"error":"invalid_api_key"}，表现为「导出失败」。现在先
+   fetch 拿 blob，再触发本地保存，401 仍走统一的重新登录逻辑。 */
+function exportFilenameFrom(headers, url) {
+  const cd = (headers && headers.get ? headers.get('Content-Disposition') : '') || '';
+  const m = /filename="?([^";]+)"?/i.exec(cd);
+  if (m && m[1].trim()) return m[1].trim();
+  const tail = String(url || '').split('?')[0].split('/').pop();
+  return tail || 'export';
+}
+function saveBlob(blob, filename) {
+  const href = URL.createObjectURL(blob);
   const a = document.createElement('a');
-  a.href = url;
+  a.href = href;
+  a.download = filename || 'export';
   a.rel = 'noopener';
   a.style.display = 'none';
   document.body.appendChild(a);
   a.click();
   a.remove();
+  // 立即 revoke 会让部分浏览器的下载在开始前失效；延到下一轮事件循环。
+  setTimeout(() => { try { URL.revokeObjectURL(href); } catch (_) { /* ignore */ } }, 0);
+}
+async function downloadAuthedURL(url) {
+  const h = authHeaders();
+  let r;
+  try {
+    r = await fetch(url, { headers: h });
+  } catch (e) {
+    throw new Error('网络错误，导出未完成');
+  }
+  if (r.status === 401) rejectUnauthorized(h);
+  if (!r.ok) {
+    let msg = 'HTTP ' + r.status;
+    try {
+      const d = await r.json();
+      if (d && d.error) msg = d.error;
+    } catch (_) { /* 非 JSON 错误体：保留状态码文案 */ }
+    throw new Error(msg);
+  }
+  saveBlob(await r.blob(), exportFilenameFrom(r.headers, url));
 }
 function exportURL(path, params) {
   const q = params ? params.toString() : '';
@@ -2281,16 +2363,16 @@ function requestExportQuery() {
   return q;
 }
 if ($('btnReqExportCsv')) $('btnReqExportCsv').onclick = () => withExportBusy($('btnReqExportCsv'), async () => {
-  const q = requestExportQuery(); q.set('format', 'csv'); downloadHiddenURL(exportURL('request_logs/export', q));
+  const q = requestExportQuery(); q.set('format', 'csv'); await downloadAuthedURL(exportURL('request_logs/export', q));
 });
 if ($('btnReqExportJsonl')) $('btnReqExportJsonl').onclick = () => withExportBusy($('btnReqExportJsonl'), async () => {
-  const q = requestExportQuery(); q.set('format', 'jsonl'); downloadHiddenURL(exportURL('request_logs/export', q));
+  const q = requestExportQuery(); q.set('format', 'jsonl'); await downloadAuthedURL(exportURL('request_logs/export', q));
 });
 if ($('btnUsageExport')) $('btnUsageExport').onclick = () => withExportBusy($('btnUsageExport'), async () => {
-  const q = trangeQuery('usRange', true); q.set('dim', usDim); downloadHiddenURL(exportURL('usage/export', q));
+  const q = trangeQuery('usRange', true); q.set('dim', usDim); await downloadAuthedURL(exportURL('usage/export', q));
 });
 if ($('btnAccountsExport')) $('btnAccountsExport').onclick = () => withExportBusy($('btnAccountsExport'), async () => {
-  downloadHiddenURL(exportURL('accounts/export'));
+  await downloadAuthedURL(exportURL('accounts/export'));
 });
 // 时间范围：默认「全部历史」——请求记录页的历史行为就是"取最近 N 条"，
 // 加一个默认收窄的区间会让打开页面时看到的条数凭空变少。
@@ -2953,7 +3035,7 @@ function onVisibilityChange() {
 document.addEventListener('visibilitychange', onVisibilityChange);
 start();
 
-/* ── 积分任务 ─────────────────────────────────────────────────────── */
+/* ── 成长任务（账号弹窗）─────────────────────────────────────────── */
 let taskUID = null;
 
 // 可自动完成的任务（与后端 autoActions 表一致）：判据为行为事件、可经网关复现。
@@ -3855,11 +3937,18 @@ function updateProgress(q) {
     (q.pre_warn ? ' · ' + q.pre_warn : '');
   // 部分账号预扫失败时队列仍会启动；持续显示漏扫警告，避免把“已启动”
   // 误读成“所有账号都已纳入”。空态/终态 toast 仍由调用方负责。
+  // HTMLElement.dataset 在严格模式下是只读 getter：直接赋值会抛 TypeError，
+  // 把 renderQueue → updateProgress 的调用链打断，下面的 stopQueuePolling
+  // 便永不执行（队列每 3s 无限轮询、按钮永久停在「执行中」）。属性写法规避该
+  // 问题，并在测试的普通对象桩下同样可用。
   if (q.pre_warn) {
-    progText.dataset = progText.dataset || {};
-    progText.dataset.warn = '1';
-  } else if (progText.dataset) {
-    delete progText.dataset.warn;
+    if (progText.setAttribute) progText.setAttribute('data-warn', '1');
+    else {
+      progText.dataset = progText.dataset || {};
+      progText.dataset.warn = '1';
+    }
+  } else if (progText.removeAttribute) {
+    progText.removeAttribute('data-warn');
   }
 }
 // 队列状态 → 分组（执行时轮询）
@@ -3931,8 +4020,12 @@ function startQueuePolling() {
     }
     // 结束：终态只渲染这一次，随即停表。此后残留的 items（running=false）不再
     // 回写视图——曾把用户刚点开的「扫描待办」结果在下一个 tick 冲掉。
-    renderQueue(groupsFromQueue(q.items || []), q);
-    stopQueuePolling();
+    // 渲染放 try/finally：任何 DOM 异常都不能让轮询继续跑下去。
+    try {
+      renderQueue(groupsFromQueue(q.items || []), q);
+    } finally {
+      stopQueuePolling();
+    }
     // 预扫失败/无待办等终态带 message：必须显示失败原因，不能只报“执行结束”。
     if (q.message) toast(q.message, 'err');
     else toast('任务队列执行结束', 'ok');
@@ -4216,7 +4309,7 @@ function renderCreditGrants(d) {
   if (table) table.hidden = !rows.length;
   if (empty) {
     empty.hidden = !!rows.length;
-    empty.textContent = '当前没有可展示的积分包快照。请先到「积分构成」刷新余额/套餐，或等待后台余额刷新后再试。';
+    empty.textContent = '当前没有积分包快照。请到「任务与福利」点「刷新积分」，或等待后台余额刷新。';
   }
   const count = Number(d.count == null ? rows.length : d.count);
   const returned = Number(d.returned == null ? rows.length : d.returned);
@@ -4281,6 +4374,13 @@ function fmtCreditRatio(v, samples, tokens) {
   if (!Number.isFinite(n)) return '—';
   return trimFixed(n.toFixed(4)) + ' / 1M';
 }
+/* creditText 是积分数字的唯一显示口径：samples=credit_samples（CRN），表示
+   本窗口内真正观测到 usage.credit 的请求数。旧库（升级前只有 token）samples=0，
+   此时显示 0 会被读成「这窗口一分没花」，实际是「从来没观测到」。 */
+function creditText(v, samples) {
+  if (!samples) return '—';
+  return fmtCredit(v);
+}
 function fmtModelRate(rate) {
   const s = String(rate || '').trim();
   return s ? 'x' + s : '—';
@@ -4332,6 +4432,9 @@ function usRow(name, sub, a, mid, withPerf) {
     '<td class="num" data-label="Completion">' + fmtTok(a.completion_tokens) + '</td>' +
     '<td class="num" data-label="合计">' + fmtTok(a.total_tokens) +
       usMixBar(a.prompt_tokens, a.completion_tokens, a.total_tokens) + '</td>' +
+    '<td class="num" data-label="扣除积分">' + creditText(a.credits, a.credit_samples) + '</td>' +
+    '<td class="num" data-label="积分 / 1M">' +
+      fmtCreditRatio(a.credits_per_1m_tokens, a.credit_samples, a.credit_tokens) + '</td>' +
     (withPerf
       ? '<td class="num" data-label="均延迟">' + fmtMs(a.avg_latency_ms) + '</td>' +
         '<td class="num" data-label="均速率">' + fmtRate(a.avg_tokens_per_second) + '</td>'
@@ -4342,11 +4445,14 @@ function usRow(name, sub, a, mid, withPerf) {
 /* ── 用量明细：三个维度共用一张表 + 页内切换 ──────────────────────────
    账号 / 模型 / 域三张表此前各自占一个 box，页面纵向拉得很长且表头结构几乎一样。
    现在合成一个 box：表头由维度定义生成，行渲染复用 usRow，切换零请求。 */
+// span 必须与实际渲染列数一致（窄屏 .cardify 用它撑空态的 colspan）。
+// 每个维度都带「扣除积分 / 积分 1M」两列：四个维度的行对象都内嵌同一个 Agg，
+// 积分数据本来就随 /usage 一起返回，此前只是没渲染。
 const US_DIMS = {
-  account: { key: 'by_account', title: '账号', withRealm: true, withPerf: true, span: 10 },
-  key: { key: 'by_key', title: '客户端 Key', withRealm: false, withPerf: true, span: 10 },
-  model: { key: 'by_model', title: '模型', withRealm: false, withPerf: false, span: 7 },
-  realm: { key: 'by_realm', title: 'realm', withRealm: false, withPerf: false, span: 7 },
+  account: { key: 'by_account', title: '账号', withRealm: true, withPerf: true, span: 12 },
+  key: { key: 'by_key', title: '客户端 Key', withRealm: false, withPerf: true, span: 12 },
+  model: { key: 'by_model', title: '模型', withRealm: false, withPerf: false, span: 9 },
+  realm: { key: 'by_realm', title: 'realm', withRealm: false, withPerf: false, span: 9 },
 };
 
 // usSortRows 按当前排序字段降序（默认合计 Token，最大者最相关）。
@@ -4368,6 +4474,7 @@ function usSortRows(rows, sort) {
   const val = a => sort === 'requests' ? num(a.requests)
     : sort === 'errors' ? num(a.errors)
     : sort === 'latency' ? num(a.avg_latency_ms)
+    : sort === 'credits' ? num(a.credits)
     : num(a.total_tokens);
   out.sort((a, b) => val(b) - val(a));
   return out;
@@ -4379,6 +4486,7 @@ function usDimHead(dim) {
     (m.withRealm ? '<th>域</th>' : '') +
     '<th class="num">请求</th><th class="num">失败</th>' +
     '<th class="num">Prompt</th><th class="num">Completion</th><th class="num">合计</th>' +
+    '<th class="num">扣除积分</th><th class="num">积分 / 1M</th>' +
     (m.withPerf ? '<th class="num">均延迟</th><th class="num">均速率</th>' : '') +
     '</tr>';
 }
@@ -4667,13 +4775,11 @@ function renderUsageDim() {
 
 /* 积分扣除：按账号 / 按模型两个维度共用一张表（同上，两个 box 合成一个）。 */
 function usCreditHead(dim) {
-  return dim === 'model'
-    ? '<tr><th class="mark" aria-hidden="true"></th><th>模型</th><th>积分倍率</th>' +
-      '<th class="num">请求</th><th class="num">扣除积分</th>' +
-      '<th class="num">有效样本 Token</th><th class="num">积分 / 1M Token</th><th class="num">缓存命中率</th></tr>'
-    : '<tr><th class="mark" aria-hidden="true"></th><th>账号</th>' +
-      '<th class="num">请求</th><th class="num">扣除积分</th>' +
-      '<th class="num">有效样本 Token</th><th class="num">积分 / 1M Token</th><th class="num">缓存命中率</th></tr>';
+  const head = dim === 'model' ? '模型' : dim === 'realm' ? '域' : dim === 'key' ? '客户端 Key' : '账号';
+  const rate = dim === 'model' ? '<th>积分倍率</th>' : '';
+  return '<tr><th class="mark" aria-hidden="true"></th><th>' + head + '</th>' + rate +
+    '<th class="num">请求</th><th class="num">扣除积分</th><th class="num">积分样本</th>' +
+    '<th class="num">有效样本 Token</th><th class="num">积分 / 1M Token</th><th class="num">缓存命中率</th></tr>';
 }
 
 /* 缓存命中率（issue #92）：颜色即健康度——≥90% 绿 / 80–90% 黄 / <80% 红，
@@ -4687,6 +4793,10 @@ function cacheRateCell(hit, miss) {
   return '<span style="color:' + color + '" title="命中 ' + fmtTok(h) + ' / 未命中 ' + fmtTok(m) + ' tok">' + txt + '</span>';
 }
 
+// 积分汇总的四个维度。后端四个数组都已存在（credit_by_realm 本轮新增），
+// 前端此前只注册了账号/模型两档，按域或按 Key 看消耗时只能去明细表换算。
+const CREDIT_DIM_TABS = [['account', '按账号'], ['model', '按模型'], ['realm', '按域'], ['key', '按 Key']];
+
 function renderCreditDim() {
   const d = usageData || {};
   // 积分扣减汇总在「积分流水」里是可选折叠区：旧二进制/旧缓存版本可能没有
@@ -4696,8 +4806,38 @@ function renderCreditDim() {
     return;
   }
   setHTML('usCreditHead', usCreditHead(usCreditDim));
-  const empty = '暂无积分扣除记录；升级前仅含 Token 的历史不会伪造积分。';
-  if (usCreditDim === 'model') {
+  const empty = '本窗口没有积分观测。';
+  if (usCreditDim === 'realm') {
+    const realms = d.credit_by_realm || [];
+    setHTML('usCreditBody', realms.map(row =>
+      '<tr>' +
+        '<td class="mark" aria-hidden="true"></td>' +
+        '<td data-label="域">' + esc(benefitRealmLabel(row.realm || row.key || '')) + '</td>' +
+        '<td class="num" data-label="请求">' + fmtTok(row.requests) + '</td>' +
+        '<td class="num" data-label="扣除积分">' + creditText(row.credits, row.credit_samples) + '</td>' +
+        '<td class="num" data-label="积分样本">' + fmtTok(row.credit_samples) + '</td>' +
+        '<td class="num" data-label="有效样本 Token">' + fmtTok(row.credit_tokens) + '</td>' +
+        '<td class="num" data-label="积分 / 1M Token">' + fmtCreditRatio(row.credits_per_1m_tokens, row.credit_samples, row.credit_tokens) + '</td>' +
+        '<td class="num" data-label="缓存命中率">' + cacheRateCell(row.cache_hit_tokens, row.cache_miss_tokens) + '</td>' +
+      '</tr>'
+    ).join('') || '<tr><td colspan="8" class="empty">' + empty + '</td></tr>');
+  } else if (usCreditDim === 'key') {
+    const keys = d.credit_by_key || [];
+    setHTML('usCreditBody', keys.map(row => {
+      const label = usKeyLabel(row.key);
+      return '<tr>' +
+        '<td class="mark" aria-hidden="true"></td>' +
+        '<td data-label="客户端 Key">' + esc(label.name) +
+          (label.sub ? '<div class="note">' + esc(label.sub) + '</div>' : '') + '</td>' +
+        '<td class="num" data-label="请求">' + fmtTok(row.requests) + '</td>' +
+        '<td class="num" data-label="扣除积分">' + creditText(row.credits, row.credit_samples) + '</td>' +
+        '<td class="num" data-label="积分样本">' + fmtTok(row.credit_samples) + '</td>' +
+        '<td class="num" data-label="有效样本 Token">' + fmtTok(row.credit_tokens) + '</td>' +
+        '<td class="num" data-label="积分 / 1M Token">' + fmtCreditRatio(row.credits_per_1m_tokens, row.credit_samples, row.credit_tokens) + '</td>' +
+        '<td class="num" data-label="缓存命中率">' + cacheRateCell(row.cache_hit_tokens, row.cache_miss_tokens) + '</td>' +
+        '</tr>';
+    }).join('') || '<tr><td colspan="8" class="empty">' + empty + '</td></tr>');
+  } else if (usCreditDim === 'model') {
     const models = d.credit_by_model || [];
     setHTML('usCreditBody', models.map(row =>
       '<tr>' +
@@ -4705,12 +4845,13 @@ function renderCreditDim() {
         '<td data-label="模型">' + esc(row.key || '—') + '</td>' +
         '<td data-label="积分倍率">' + esc(fmtModelRate(row.rate)) + '</td>' +
         '<td class="num" data-label="请求">' + fmtTok(row.requests) + '</td>' +
-        '<td class="num" data-label="扣除积分">' + fmtCredit(row.credits) + '</td>' +
+        '<td class="num" data-label="扣除积分">' + creditText(row.credits, row.credit_samples) + '</td>' +
+        '<td class="num" data-label="积分样本">' + fmtTok(row.credit_samples) + '</td>' +
         '<td class="num" data-label="有效样本 Token">' + fmtTok(row.credit_tokens) + '</td>' +
         '<td class="num" data-label="积分 / 1M Token">' + fmtCreditRatio(row.credits_per_1m_tokens, row.credit_samples, row.credit_tokens) + '</td>' +
         '<td class="num" data-label="缓存命中率">' + cacheRateCell(row.cache_hit_tokens, row.cache_miss_tokens) + '</td>' +
       '</tr>'
-    ).join('') || '<tr><td colspan="8" class="empty">' + empty + '</td></tr>');
+    ).join('') || '<tr><td colspan="9" class="empty">' + empty + '</td></tr>');
   } else {
     const accounts = d.credit_by_account || [];
     setHTML('usCreditBody', accounts.map(row => {
@@ -4720,16 +4861,19 @@ function renderCreditDim() {
         '<td class="mark" aria-hidden="true"></td>' +
         '<td data-label="账号">' + esc(account) + '<div class="note">' + esc(row.realm || '') + ' · ' + esc(uid.slice(0, 8)) + '</div></td>' +
         '<td class="num" data-label="请求">' + fmtTok(row.requests) + '</td>' +
-        '<td class="num" data-label="扣除积分">' + fmtCredit(row.credits) + '</td>' +
+        '<td class="num" data-label="扣除积分">' + creditText(row.credits, row.credit_samples) + '</td>' +
+        '<td class="num" data-label="积分样本">' + fmtTok(row.credit_samples) + '</td>' +
         '<td class="num" data-label="有效样本 Token">' + fmtTok(row.credit_tokens) + '</td>' +
         '<td class="num" data-label="积分 / 1M Token">' + fmtCreditRatio(row.credits_per_1m_tokens, row.credit_samples, row.credit_tokens) + '</td>' +
         '<td class="num" data-label="缓存命中率">' + cacheRateCell(row.cache_hit_tokens, row.cache_miss_tokens) + '</td>' +
         '</tr>';
-    }).join('') || '<tr><td colspan="7" class="empty">' + empty + '</td></tr>');
+    }).join('') || '<tr><td colspan="8" class="empty">' + empty + '</td></tr>');
   }
-  setHTML('usCreditTabs', usTabsHtml([['account', '按账号'], ['model', '按模型']], usCreditDim, {
+  setHTML('usCreditTabs', usTabsHtml(CREDIT_DIM_TABS, usCreditDim, {
     account: (d.credit_by_account || []).length,
     model: (d.credit_by_model || []).length,
+    realm: (d.credit_by_realm || []).length,
+    key: (d.credit_by_key || []).length,
   }));
 }
 
@@ -4762,6 +4906,8 @@ function renderUsage(d) {
   setHTML('usStats',
     usKpi(fmtTok(reqs), '请求数', 'c-accent',
       errs ? '其中失败 ' + errs + ' 次' : '全部成功') +
+    usKpi(creditText(t.credits, t.credit_samples), '扣除积分', 'c-warn',
+      t.credit_samples ? ('样本 ' + fmtTok(t.credit_samples) + ' 次') : '本窗口无积分观测') +
     usKpi(fmtTok(total), '总 token', 'c-accent',
       'prompt ' + usPct(pt, total) + ' · completion ' + usPct(ct, total),
       '<div class="kbar"><i style="width:' + pctW(pt) + ';background:var(--accent)"></i>' +
@@ -4796,16 +4942,20 @@ function renderUsage(d) {
 
   // 积分扣除的四张卡片与说明。
   creditSpendStatsHtml =
-    usKpi(fmtCredit(t.credits), '扣除积分', 'c-accent', '按上游 usage.credit 累计') +
+    usKpi(creditText(t.credits, t.credit_samples), '扣除积分', 'c-accent', '按上游 usage.credit 累计') +
     usKpi(fmtTok(t.credit_tokens), '匹配 Token', 'c-mute', '与积分同时观测到的 Token') +
     usKpi(fmtCreditRatio(t.credits_per_1m_tokens, t.credit_samples, t.credit_tokens),
       '平均积分 / 1M Token', 'c-ok', '越低越划算') +
     usKpi(String(t.credit_samples || 0), '有效积分样本', 'c-mute', '缺字段的历史不参与折算') +
     usKpi(cacheRateText(t.cache_hit_tokens, t.cache_miss_tokens), '缓存命中率', 'c-mute',
       '上游前缀缓存命中 / (命中+未命中)；低命中意味着费用数倍放大');
+  // 覆盖率是本卡最容易被误读的数字：credits 只累加「明确回了 usage.credit」的
+  // 请求，旧历史与未回字段的成功请求都不在内。把分母摆出来，用户才知道
+  // 「扣除积分 0」到底是没花钱还是没观测到。
+  const creditCoverage = reqs ? Math.round((Number(t.credit_samples || 0) / reqs) * 100) : 0;
   creditSpendNote =
     (usageData.credit_by_account || []).length + ' 个账号 · ' +
-    (usageData.credit_by_model || []).length + ' 个模型倍率分组 · 仅统计与积分同时观测到的 Token';
+    (usageData.credit_by_model || []).length + ' 个模型倍率分组 · 积分覆盖率 ' + creditCoverage + '%';
   if (usCreditKind !== 'grant') {
     setHTML('usCreditStats', creditSpendStatsHtml);
     const spendNote = $('usCreditNote');
@@ -4948,11 +5098,41 @@ function fmtTokTimeLabel(p) {
     : String(d.getHours()).padStart(2, '0') + ':00';
 }
 
+/* usChartMetric 是时序图的指标：tokens（堆叠 prompt/completion）或 credits
+   （单根积分柱）。积分数据一直在 /usage 的 series 里（Agg 内嵌），此前只画 token，
+   所以「积分消耗趋势」只能靠底部流水表一行行看。 */
+let usChartMetric = 'tokens';
+// 绑定用 typeof 守卫：图表渲染函数会被 node 测试切片单独求值（桩 DOM 没有
+// addEventListener），无条件绑定会让整段渲染逻辑在测试与旧骨架里抛错。
+if ($('usChartTabs') && typeof $('usChartTabs').addEventListener === 'function') $('usChartTabs').addEventListener('click', ev => {
+  const target = ev.target && ev.target.closest ? ev.target.closest('button[data-metric]') : null;
+  if (!target) return;
+  usChartMetric = target.dataset.metric === 'credits' ? 'credits' : 'tokens';
+  const tabs = $('usChartTabs');
+  if (tabs && tabs.querySelectorAll) {
+    for (const b of Array.from(tabs.querySelectorAll('button[data-metric]'))) {
+      const on = b.dataset.metric === usChartMetric;
+      if (b.classList) b.classList.toggle('on', on);
+      b.setAttribute('aria-pressed', on ? 'true' : 'false');
+    }
+  }
+  const title = $('usChartTitle');
+  if (title) title.textContent = usChartMetric === 'credits' ? '积分时序' : 'Token 时序';
+  const legend = $('usChartLegend');
+  if (legend) {
+    legend.innerHTML = usChartMetric === 'credits'
+      ? '<i class="sw sw-t"></i>积分<i class="sw sw-p"></i>均值'
+      : '<i class="sw sw-p"></i>prompt<i class="sw sw-c"></i>completion<span class="sep"></span><i class="sw sw-t"></i>均值';
+  }
+  renderUsageChart(usageData.series || []);
+});
+
 function renderUsageChart(series) {
   const host = $('usChart');
   const noteEl = $('usChartNote');
   if (!host) { noteDOM('usChart'); return; }
 
+  const creditsMode = usChartMetric === 'credits';
   // 丢掉时间解析不出来的点，而不是让 NaN 传染整张图。
   const pts = [];
   for (const p of series) {
@@ -4960,14 +5140,24 @@ function renderUsageChart(series) {
     if (t === null) continue;
     const pt = Number(p.prompt_tokens || 0);
     const ct = Number(p.completion_tokens || 0);
+    const cs = Number(p.credit_samples || 0);
     pts.push({ t, scope: p.scope, raw: p.t, pt, ct, tt: Number(p.total_tokens || 0) || (pt + ct),
-               req: p.requests || 0 });
+               req: p.requests || 0,
+               // 没有 credit 观测的桶保持 null：画成 0 会在曲线上造出假的「零消耗」谷底。
+               credit: cs > 0 ? Number(p.credits || 0) : null, cs });
   }
   if (!pts.length) {
     host.innerHTML = '<div class="us-empty">暂无用量数据。发起一次对话后再刷新。</div>';
     if (noteEl) noteEl.textContent = '—';
     return;
   }
+  if (creditsMode && !pts.some(p => p.credit !== null)) {
+    host.innerHTML = '<div class="us-empty">本窗口没有积分观测。</div>';
+    if (noteEl) noteEl.textContent = '—';
+    return;
+  }
+  const valOf = p => creditsMode ? (p.credit || 0) : p.tt;
+  const fmtVal = v => creditsMode ? fmtCredit(v) : fmtTok(v);
 
   const W = 1200, H = 200, PL = 58, PR = 14, PT = 18, PB = 30;
   const iw = W - PL - PR, ih = H - PT - PB;
@@ -4976,12 +5166,12 @@ function renderUsageChart(series) {
   const t1 = pts[pts.length - 1].t;
   const span = Math.max(1, t1 - t0);
 
-  const max = Math.max(1, ...pts.map(p => p.tt));
-  const peak = pts.reduce((a, b) => (b.tt > a.tt ? b : a), pts[0]);
-  const avg = pts.reduce((s, p) => s + p.tt, 0) / pts.length;
+  const max = Math.max(1, ...pts.map(p => valOf(p)));
+  const peak = pts.reduce((a, b) => (valOf(b) > valOf(a) ? b : a), pts[0]);
+  const avg = pts.reduce((s, p) => s + valOf(p), 0) / pts.length;
   if (noteEl) noteEl.textContent =
-    pts.length + ' 个点 · 峰值 ' + fmtTok(peak.tt) + ' @ ' + fmtTokTimeLabel(peak) +
-    ' · 均值 ' + fmtTok(avg);
+    pts.length + ' 个点 · 峰值 ' + fmtVal(valOf(peak)) + ' @ ' + fmtTokTimeLabel(peak) +
+    ' · 均值 ' + fmtVal(avg);
 
   // 柱宽取「最小真实间隔」的 70%，并夹在合理区间内——窗口拉到 30 天时柱子会
   // 变细，但不会细到看不见。
@@ -5017,7 +5207,7 @@ function renderUsageChart(series) {
     out += '<line class="gl" x1="' + PL + '" y1="' + y.toFixed(1) + '" x2="' + (W - PR) +
            '" y2="' + y.toFixed(1) + '"/>';
     out += '<text class="tk" x="' + (PL - 6) + '" y="' + (y + 3.5).toFixed(1) +
-           '" text-anchor="end">' + fmtTok(max * i / 4) + '</text>';
+           '" text-anchor="end">' + fmtVal(max * i / 4) + '</text>';
   }
 
   // 均值参考线：一眼看出"这根是不是异常高"，比只给刻度省心。
@@ -5027,16 +5217,18 @@ function renderUsageChart(series) {
     out += '<line class="avg" x1="' + PL + '" y1="' + y.toFixed(1) + '" x2="' + (W - PR) +
            '" y2="' + y.toFixed(1) + '"/>';
     out += '<text class="tk-avg" x="' + (PL + 5) + '" y="' + (y - 4).toFixed(1) +
-           '" text-anchor="start">均值 ' + fmtTok(avg) + '</text>';
+           '" text-anchor="start">均值 ' + fmtVal(avg) + '</text>';
   }
 
   // 柱子
   const yBase = PT + ih;
   for (const p of pts) {
     const x = xOf(p.t) - bw / 2;
-    const hTot = ih * (p.tt / max);
-    const hP = p.tt ? hTot * (p.pt / p.tt) : 0;
-    const hC = Math.max(p.tt && p.ct ? 1 : 0, hTot - hP);
+    const v = valOf(p);
+    const hTot = ih * (v / max);
+    // 积分模式下只有一根柱（积分没有 prompt/completion 之分），prompt 段留空。
+    const hP = creditsMode ? 0 : (p.tt ? hTot * (p.pt / p.tt) : 0);
+    const hC = creditsMode ? hTot : Math.max(p.tt && p.ct ? 1 : 0, hTot - hP);
     // 每根柱子包一个 <g>，把 <title> 放进去。
     //
     // 为什么必须包裹：SVG 里 <title> 描述的是它的**父元素**。此前 <title> 是
@@ -5044,8 +5236,10 @@ function renderUsageChart(series) {
     // 根下 —— 整张图只有一个 tooltip（浏览器取第一个），悬停任何柱子都显示同一
     // 份数据（issue #128）。包进 <g> 后 tooltip 跟随该柱，且堆叠的两段
     //（prompt + completion）共用同一个提示。
-    out += '<g><title>' + esc(p.raw) + '  ' + fmtTok(p.pt) + ' prompt / ' +
-           fmtTok(p.ct) + ' completion / ' + p.req + ' 次</title>';
+    out += '<g><title>' + esc(p.raw) + '  ' + (creditsMode
+      ? (p.credit === null ? '无积分观测' : fmtCredit(p.credit) + ' 积分')
+      : fmtTok(p.pt) + ' prompt / ' + fmtTok(p.ct) + ' completion') +
+      ' / ' + p.req + ' 次</title>';
     // 圆角只给堆叠顶端（贴轴的底边保持方角，柱子才像"立"在基线上）。
     // 类名用 usbar 而不是 bar：账号池的积分条是 .bar{height:3px}，而 SVG2 里
     // height 是 rect 的 CSS 几何属性，同名类会把每根柱子压成 3px 高（踩过）。
@@ -5061,11 +5255,11 @@ function renderUsageChart(series) {
   // 峰值标注：柱子够窄时文字压在柱顶，够宽时贴右侧避免和柱体重叠。
   {
     const px = xOf(peak.t);
-    const py = yOf(peak.tt);
+    const py = yOf(valOf(peak));
     const anchor = px > W - PR - 90 ? 'end' : 'middle';
     out += '<text class="tk-peak" x="' + Math.max(PL, Math.min(W - PR, px)).toFixed(1) +
            '" y="' + Math.max(10, py - 5).toFixed(1) + '" text-anchor="' + anchor + '">' +
-           '峰值 ' + fmtTok(peak.tt) + '</text>';
+           '峰值 ' + fmtVal(valOf(peak)) + '</text>';
   }
 
   // x 轴基线画在柱子之后，避免压在柱底
@@ -5202,9 +5396,9 @@ async function loadUsage() {
     clearNode('usCreditHead', 'innerHTML');
     // 页签按钮按维度重绘；只用一次节点引用，成功后不再写 innerHTML。
     applyNode('usDimTabs', el => { el.innerHTML = usTabsHtml(US_DIM_TABS, usDim, null); });
-    applyNode('usCreditTabs', el => { el.innerHTML = usTabsHtml([['account', '按账号'], ['model', '按模型']], usCreditDim, null); });
-    applyNode('usDimBody', el => { el.innerHTML = '<tr><td colspan="10" class="empty">读取用量失败</td></tr>'; });
-    applyNode('usCreditBody', el => { el.innerHTML = '<tr><td colspan="7" class="empty">读取用量失败</td></tr>'; });
+    applyNode('usCreditTabs', el => { el.innerHTML = usTabsHtml(CREDIT_DIM_TABS, usCreditDim, null); });
+    applyNode('usDimBody', el => { el.innerHTML = '<tr><td colspan="12" class="empty">读取用量失败</td></tr>'; });
+    applyNode('usCreditBody', el => { el.innerHTML = '<tr><td colspan="9" class="empty">读取用量失败</td></tr>'; });
   } finally {
     // 按钮状态属于本次请求而非全局：只有仍是最新请求才恢复，避免旧请求的
     // finally 把新请求的“读取中…”提前清掉。取消/失败/成功都走同一出口。
@@ -5227,7 +5421,7 @@ if ($('btnCreditHist')) $('btnCreditHist').onclick = loadCreditHistory;
 if ($('usRange')) trangeBind('usRange', loadUsage);
 
 /* ── 活动记录 ─────────────────────────────────────────────────────── */
-/* 只读活动历史：签到/活跃/旅行/保活每次真实尝试。筛选全部由服务端按同一口径
+/* 只读活动历史：签到/活跃/猫猫旅行/保活每次真实尝试。筛选全部由服务端按同一口径
    执行（task/result/uid/from	o），前端不缓存旧页结果，避免“看起来筛选了”。 */
 const ACT_TASK_LABEL = { growth: '成长任务', streak: '连登与抽奖', checkin: '签到', activity: '活跃上报', travel: '猫猫旅行', keepalive: 'Token 保活', daily_chat: '国际版每日活跃' };
 const ACT_TRIGGER_LABEL = { schedule: '定时', manual: '手动', unknown: '未知' };
@@ -5339,17 +5533,18 @@ async function loadActivity(more) {
       // 「加载更多」失败不能清掉已经看见的旧行；只在表底追加可重试提示。
       // 首次加载失败才用整表错误态。
       const body = $('actBody');
-      const msg = '读取活动记录失败：' + esc(e && e.message ? e.message : String(e));
+      // 文案先保留原文，插入 DOM 时再 esc（此前先 esc 再拼接，& < " 会显示成实体）。
+      const msg = '读取活动记录失败：' + (e && e.message ? e.message : String(e));
       if (more === true && body) {
         // 加载更多失败时无论窗口多大都保留已看见的行；第一次（200）只在
         // 按钮上给出重试入口，避免把整表换成一行错误把上下文全清掉。
         if (prevLimit > 200) {
           const old = body.querySelector && body.querySelector('.act-more-err');
           if (old) old.remove();
-          body.insertAdjacentHTML('beforeend', '<tr class="act-more-err"><td colspan="7" class="empty err">' + msg + '（已保留已加载记录，可重试）</td></tr>');
+          body.insertAdjacentHTML('beforeend', '<tr class="act-more-err"><td colspan="7" class="empty err">' + esc(msg) + '（已保留已加载记录，可重试）</td></tr>');
         }
       } else if (body) {
-        body.innerHTML = '<tr><td colspan="7" class="empty err">' + msg + '</td></tr>';
+        body.innerHTML = '<tr><td colspan="7" class="empty err">' + esc(msg) + '</td></tr>';
       }
       const note = $('actNote');
       if (note) note.textContent = '读取失败';
@@ -5513,12 +5708,12 @@ function renderBenefitsAccounts(rows, corrected = false) {
       : '';
     let acts = '';
     if (!a.enterprise && a.realm !== 'global') {
-      acts += btn('checkin', '签到', '', '执行 Buddy 签到并刷新余额');
+      acts += btn('checkin', '签到', '', '签到并刷新余额');
       acts += btn('streak', '连登', '', '连登兑换与抽奖');
-      acts += btn('travel', '旅行', '', '猫猫旅行巡检');
+      acts += btn('travel', '猫猫旅行', '', '猫猫旅行');
       acts += btn('tasks', '成长任务', '', '查看成长任务队列');
     } else if (a.realm === 'global' && !a.enterprise) {
-      acts += btn('daily_chat', '每日活跃', 'primary', '国际版每日活跃对话');
+      acts += btn('daily_chat', '国际版每日活跃', 'primary', '国际版每日活跃对话');
       acts += btn('daily_chat_web', '网页打卡', '', '仅走网页通道补打每日活跃');
     }
     if (!acts) acts = '—';
@@ -5613,7 +5808,7 @@ function renderBenefitGrants(rows, summary) {
   const note = $('bfGrantNote');
   if (note) {
     note.textContent = !s.welfare_grants_available
-      ? '尚未刷新积分包：先在积分构成页刷新'
+      ? '尚未刷新积分包：点「刷新积分」'
       : (s.welfare_snapshot_at ? '快照 ' + benefitsTime(s.welfare_snapshot_at) : (rows.length + ' 笔'));
   }
   if (!rows.length) {
@@ -5640,8 +5835,8 @@ function renderBenefitGrants(rows, summary) {
 }
 
 const BENEFIT_BATCH_LABELS = {
-  checkin: '全部签到', travel: '旅行巡检', activity: '活跃上报',
-  keepalive: 'Token 保活', daily_chat: '国际版每日活跃', streak: '连登与抽奖',
+  checkin: '全部签到', travel: '全部猫猫旅行', activity: '全部活跃上报',
+  keepalive: '全部 Token 保活', daily_chat: '全部国际版每日活跃', streak: '全部连登与抽奖',
   tasks_checkin: '签到', tasks_tasks: '成长任务', tasks_travel: '猫猫旅行', tasks_streak: '连登与抽奖',
 };
 
@@ -5707,7 +5902,7 @@ function renderBenefitLog(rows) {
   const note = $('bfLogNote');
   if (note) note.textContent = rows.length ? '最近 ' + rows.length + ' 条' : '—';
   if (!rows.length) {
-    box.innerHTML = '<div class="empty">暂无执行记录；手动执行签到/任务/旅行后会出现在这里</div>';
+    box.innerHTML = '<div class="empty">暂无执行记录；手动执行签到/成长任务/猫猫旅行后会出现在这里</div>';
     return;
   }
   box.innerHTML = rows.map(r => {
@@ -5905,8 +6100,8 @@ async function runTaskAction(action, btn) {
   const ref = benefitsFocusRef || 'all';
   // 全部成长待办与定时成长排程共用同一后台队列和进度视图。
   if (action === 'tasks' && ref === 'all') {
-    const advanced = $('bfAdvanced');
-    if (advanced) advanced.open = true;
+    // 「全部成长任务」= 扫描 + 执行队列：与队列区的「执行全部待办」是同一后台
+    // 管线（同单飞、同进度视图）。队列区现在是常驻区块，滚动过去即可看到进度。
     const queueButton = $('btnRunQueue');
     if (queueButton && queueButton.onclick) await queueButton.onclick();
     return;
@@ -6003,7 +6198,11 @@ function openTasksForRef(ref, tasks, enterprise) {
 
 // 福利弹窗内的任务动作：按短引用走同一福利路由，后端解析后复用账号动作。
 function benefitsTaskPath(suffix) {
-  return 'benefits/' + encodeURIComponent(benefitsTaskRef) + '/tasks/' + suffix;
+  // suffix 为空时不能拼出尾斜杠：后端只注册了 GET /benefits/{ref}/tasks，
+  // Go 1.22 ServeMux 不对面板 API 做尾斜杠重定向，.../tasks/ 会直接 404
+  //（表现为弹窗「刷新任务」必然失败）。
+  const base = 'benefits/' + encodeURIComponent(benefitsTaskRef) + '/tasks';
+  return suffix ? base + '/' + suffix : base;
 }
 
 if ($('bfGrowthAcct')) $('bfGrowthAcct').addEventListener('change', ev => {
@@ -6012,6 +6211,14 @@ if ($('bfGrowthAcct')) $('bfGrowthAcct').addEventListener('change', ev => {
 });
 
 if ($('bfBtnFocusRun')) $('bfBtnFocusRun').onclick = () => runTaskAction('tasks', $('bfBtnFocusRun'));
+// 「全部成长任务」与单号按钮同一入口，只是强制 scope=all（走队列）。
+if ($('bfBtnAllTasks')) $('bfBtnAllTasks').onclick = () => {
+  benefitsFocusRef = 'all';
+  if ($('bfGrowthAcct')) $('bfGrowthAcct').value = 'all';
+  runTaskAction('tasks', $('bfBtnAllTasks'));
+};
+// 账号池头部的「批量任务」只做跳转：批量动作与结果都在任务页，避免两处入口语义漂移。
+if ($('btnGoTasks')) $('btnGoTasks').onclick = () => go('taskscenter');
 if ($('bfBtnFocusCheckin')) $('bfBtnFocusCheckin').onclick = () => runTaskAction('checkin', $('bfBtnFocusCheckin'));
 if ($('bfBtnFocusTravel')) $('bfBtnFocusTravel').onclick = () => runTaskAction('travel', $('bfBtnFocusTravel'));
 if ($('bfBtnFocusStreak')) $('bfBtnFocusStreak').onclick = () => runTaskAction('streak', $('bfBtnFocusStreak'));
@@ -6281,7 +6488,7 @@ async function loadConnect() {
 }
 if ($('btnConnectReload')) $('btnConnectReload').onclick = loadConnect;
 
-/* ── 积分构成 ─────────────────────────────────────────────────────── */
+/* ── 积分构成（视图已下架，后端接口与渲染函数保留） ────────────── */
 
 /* ── 剩余额度 ─────────────────────────────────────────────────────── */
 /* loadRemaining 是独立区块：单飞、世代守卫、离页丢弃。它不依赖 /usage 的返回，
@@ -6857,7 +7064,7 @@ if ($('btnPkDetailToggle')) $('btnPkDetailToggle').onclick = () => {
 };
 
 // loadPackages 按需拉取：有缓存（上次任意入口拉到的 packages 数据）先直接渲染，
-// 不再「切进积分构成页就打一次上游」——逐账号实时查询在账号多时既慢又压上游。
+// 不再「一进相关页面就打一次上游」——逐账号实时查询在账号多时既慢又压上游。
 // 无缓存（首次进入）才自动查一次；显式刷新（force=true，点「刷新」按钮）始终实时查。
 // packages 请求逐账号实时打上游，重复点击「刷新」/切页会叠加很长时间的请求，
 // 旧响应晚到还可能把新数据覆盖回去。这里做单飞 + 代次：同一时刻只允许一个
@@ -6905,7 +7112,7 @@ let pkPending = false;
 /* ── 积分到期提醒（首页卡片）────────────────────────────────────────── */
 /* 积分不是永久的：签到/任务发的裂变包约一个月失效。只看「剩余积分 ÷ 日消耗」
    会系统性偏乐观——用不完的部分到期直接蒸发。这里把「最近要过期的是哪批、
-   有多少、到期前每天要至少消耗多少」顶到首页，数据源与「积分构成」共用
+   有多少、到期前每天要至少消耗多少」顶到首页，数据源与逐包明细共用
    （lastPackages 缓存，EXP_FRESH_MS 内复用，不重复打上游）。 */
 
 // expBatches 把某账号的包聚合成「到期日 → 该日作废积分」升序列表。
@@ -6932,7 +7139,7 @@ function renderExpiry(d) {
   const today = new Date(); today.setHours(0, 0, 0, 0);
   // 提醒收敛（首页信息密度）：只把 3 天内到期的账号逐行展示，4–7 天合并成一行
   // 汇总，7 天外与无到期批次折叠成一行。逐个账号平铺在 470 个账号时会把首页变成
-  // 一堵墙，真正需要行动的少数反而被淹没；完整逐包明细仍在「积分构成」页。
+  // 一堵墙，真正需要行动的少数反而被淹没；完整逐包明细在「展开明细 / 实时检查」。
   // 后端 /panel/api/packages 按余额降序返回，所以这里仍按最早到期日重排（issue #125）。
   const urgent = [], soon = [], failed = [];
   let quiet = 0;

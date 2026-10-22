@@ -2756,3 +2756,55 @@ func TestChatNonStreamContentBlockedDegradedRetry(t *testing.T) {
 		t.Fatalf("degraded retry should succeed, code=%d body=%s", rec.Code, rec.Body)
 	}
 }
+
+// TestUsageCreditTotalKeepsCreditWithoutTotal 上游只回 credit、不回 total_tokens
+// 时，积分观测必须保留：旧实现把「有 credit 但 total=0」整条丢弃，导致用量页
+// 少记一次扣减、积分/1M 比例分母缺样本。
+func TestUsageCreditTotalKeepsCreditWithoutTotal(t *testing.T) {
+	cases := []struct {
+		name   string
+		resp   map[string]any
+		credit float64
+		total  int
+		ok     bool
+	}{
+		{
+			name:   "credit only",
+			resp:   map[string]any{"usage": map[string]any{"credit": 2.5}},
+			credit: 2.5, total: 0, ok: true,
+		},
+		{
+			name:   "credit with total",
+			resp:   map[string]any{"usage": map[string]any{"credit": 2.5, "total_tokens": 1000.0}},
+			credit: 2.5, total: 1000, ok: true,
+		},
+		{
+			name:   "no credit key",
+			resp:   map[string]any{"usage": map[string]any{"total_tokens": 1000.0}},
+			credit: 0, total: 0, ok: false,
+		},
+		{
+			name:   "credit null",
+			resp:   map[string]any{"usage": map[string]any{"credit": nil, "total_tokens": 10.0}},
+			credit: 0, total: 0, ok: false,
+		},
+		{
+			name:   "credit as string",
+			resp:   map[string]any{"usage": map[string]any{"credit": "2.5"}},
+			credit: 0, total: 0, ok: false,
+		},
+		{
+			name:   "no usage",
+			resp:   map[string]any{},
+			credit: 0, total: 0, ok: false,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			credit, total, ok := usageCreditTotal(c.resp)
+			if ok != c.ok || credit != c.credit || total != c.total {
+				t.Fatalf("got (%v,%d,%v) want (%v,%d,%v)", credit, total, ok, c.credit, c.total, c.ok)
+			}
+		})
+	}
+}

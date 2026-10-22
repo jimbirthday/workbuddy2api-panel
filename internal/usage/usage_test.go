@@ -974,3 +974,95 @@ func TestUsageFlushNoLostDirtyDuringWrite(t *testing.T) {
 		t.Fatalf("persisted tokens=%d want 3 (first snapshot + concurrent add)", saved.Totals.TotalTokens)
 	}
 }
+
+// TestSnapshotCreditByRealmAndSeries 积分必须能按域聚合、也能从时序里读到：
+// 前端「积分」曲线与「按域」表都直接依赖这两个字段，此前后端完全没有
+// credit_by_realm，series 里的 credits 也从未被任何测试覆盖。
+func TestSnapshotCreditByRealmAndSeries(t *testing.T) {
+	r := New("")
+	now := time.Now().Add(-2 * time.Hour) // 落在当前小时桶内即可（同一窗口）
+	r.Add(now, "cn", "uid1", "glm-5.2", Delta{
+		PromptTokens: 600, HasPromptTokens: true, CompletionTokens: 400, HasCompletion: true,
+		Credit: 3, HasCredit: true, ModelRate: "0.05",
+	}, true)
+	r.Add(now, "global", "uid2", "claude-4.6", Delta{
+		PromptTokens: 500, HasPromptTokens: true, CompletionTokens: 500, HasCompletion: true,
+		Credit: 7, HasCredit: true, ModelRate: "0.1",
+	}, true)
+	// 没有 credit 观测的请求（同一倍率桶）：只计入请求数与 token，不污染积分。
+	r.Add(now, "cn", "uid1", "glm-5.2", Delta{
+		PromptTokens: 100, HasPromptTokens: true, CompletionTokens: 100, HasCompletion: true,
+		ModelRate: "0.05",
+	}, true)
+
+	s := r.Snapshot(24, nil)
+	if len(s.CreditByRealm) != 2 {
+		t.Fatalf("credit_by_realm=%+v, want 2 realms", s.CreditByRealm)
+	}
+	byRealm := map[string]CreditAgg{}
+	for _, row := range s.CreditByRealm {
+		byRealm[row.Key] = row
+	}
+	if got := byRealm["cn"]; got.Credits != 3 || got.CreditRequests != 1 {
+		t.Errorf("cn credit=%v credit_requests=%d, want 3/1", got.Credits, got.CreditRequests)
+	}
+	if got := byRealm["global"]; got.Credits != 7 || got.CreditRequests != 1 {
+		t.Errorf("global credit=%v credit_requests=%d, want 7/1", got.Credits, got.CreditRequests)
+	}
+	// CreditAgg.Requests 含无积分观测的请求（cn 共 2 次），CreditRequests 只算
+	// 真正带 credit 的那次——两者相减就是覆盖率的分母/分子，不能混用。
+	if got := byRealm["cn"]; got.Requests != 2 {
+		t.Errorf("cn requests=%d, want 2（含无 credit 观测的那次）", got.Requests)
+	}
+
+	// 时序点必须带积分：这是「积分消耗趋势」图的唯一数据源。
+	var credSum float64
+	pts := 0
+	for _, p := range s.Series {
+		credSum += p.Credits
+		pts++
+	}
+	if pts == 0 {
+		t.Fatal("series should not be empty")
+	}
+	if credSum != 10 {
+		t.Errorf("series credits sum=%v, want 10", credSum)
+	}
+}
+
+// TestCreditByKeyAndAccountCarryCoverage credit_requests 必须按维度正确填充，
+// 前端用它与 requests 计算覆盖率，否则「0 消耗」与「无观测」无法区分。
+func TestCreditByKeyAndAccountCarryCoverage(t *testing.T) {
+	r := New("")
+	now := time.Now()
+	for i := 0; i < 3; i++ {
+		r.Add(now, "cn", "uid1", "glm-5.2", Delta{
+			PromptTokens: 10, HasPromptTokens: true, TotalTokens: 20, HasTotal: true,
+			Credit: 1, HasCredit: true, KeyID: "k1",
+		}, true)
+	}
+	// 同一 Key、同一账号，但上游没回 credit。
+	r.Add(now, "cn", "uid1", "glm-5.2", Delta{
+		PromptTokens: 10, HasPromptTokens: true, TotalTokens: 20, HasTotal: true, KeyID: "k1",
+	}, true)
+
+	s := r.Snapshot(24, nil)
+	if len(s.CreditByAccount) != 1 {
+		t.Fatalf("credit_by_account=%+v", s.CreditByAccount)
+	}
+	row := s.CreditByAccount[0]
+	if row.Requests != 4 || row.CreditRequests != 3 {
+		t.Fatalf("requests=%d credit_requests=%d, want 4/3", row.Requests, row.CreditRequests)
+	}
+	if row.Credits != 3 {
+		t.Fatalf("credits=%v want 3", row.Credits)
+	}
+	// 按 Key 同口径。
+	if len(s.CreditByKey) != 1 || s.CreditByKey[0].CreditRequests != 3 || s.CreditByKey[0].Requests != 4 {
+		t.Fatalf("credit_by_key=%+v", s.CreditByKey)
+	}
+	// by_account 明细行也带同样的积分字段（前端明细表直接渲染这些列）。
+	if len(s.ByAccount) != 1 || s.ByAccount[0].CreditSamples != 3 || s.ByAccount[0].Credits != 3 {
+		t.Fatalf("by_account row must carry credit fields: %+v", s.ByAccount)
+	}
+}

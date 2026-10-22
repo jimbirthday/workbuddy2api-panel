@@ -1,10 +1,45 @@
 package panel
 
 import (
+	"context"
 	"log"
 	"runtime/debug"
 	"sync"
+	"time"
 )
+
+// sleepCtx 是面板侧的可取消等待：ctx 已取消时立即返回 false（停机不必等
+// 剩余节流时间）。面板任务里大量「给上游留处理时间」的等待都必须走它，
+// 否则 StopWaiting / docker stop 会被最长的 sleep 拖住数分钟。
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	if d <= 0 {
+		return ctx == nil || ctx.Err() == nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return false
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// wait 是面板后台作业的可取消等待（绑定 p.bgCtx）。返回 false 表示停机信号
+// 已到，调用方应立即收尾（不要再打后续上游请求）。
+//
+// 与 sleepCtx(context.Background(), …) 的区别：Background 版本只能被显式的
+// 任务级 ctx 取消，面板停机时不会生效。队列/接受任务这类长链路必须走这里，
+// 否则 docker stop 要等「账号数 × 项间节流」全部睡完。
+func (p *Panel) wait(d time.Duration) bool {
+	return sleepCtx(p.bgCtx, d)
+}
 
 // runBounded 在固定数量的 worker 上处理 n 个下标，避免「每个任务先起一个
 // goroutine、再在 goroutine 里等信号量」造成的瞬时 goroutine 放大。并发上限

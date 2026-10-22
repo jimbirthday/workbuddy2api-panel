@@ -265,3 +265,61 @@ func TestBenefitBatchWaitsForAllHistoryAndPreservesNewerRun(t *testing.T) {
 		t.Fatal("old history monitor replaced a newer batch")
 	}
 }
+
+// TestTaskRunConflictScopedPerAccount 单账号动作之间互不阻塞，同账号/全池仍互斥。
+// 旧实现用 kind="tasks_"+action 做全局单飞：账号 A 在跑时点账号 B 直接 409，
+// 清 10 个账号只能串行。这里直接对冲突判定做表驱动断言（比走 HTTP 稳定，
+// 不依赖上游时序）。
+func TestTaskRunConflictScopedPerAccount(t *testing.T) {
+	p := New(Config{Pool: pool.New(""), APIKey: "k"})
+	p.batchRuns = map[string]*batchRun{
+		"tasks_growth_" + benefitRefFor("a"): {Kind: "tasks_growth_" + benefitRefFor("a"), Running: true, Scope: benefitRefFor("a")},
+	}
+	cases := []struct {
+		name   string
+		scope  string
+		action string
+		want   bool
+	}{
+		{"同账号重复点击", benefitRefFor("a"), "growth", true},
+		{"不同账号可并行", benefitRefFor("b"), "growth", false},
+		{"全池请求与单账号重叠", "all", "growth", true},
+		{"不同动作不冲突", benefitRefFor("a"), "checkin", false},
+	}
+	for _, c := range cases {
+		p.batchMu.Lock()
+		got := p.taskRunConflictLocked(c.action, c.scope) != nil
+		p.batchMu.Unlock()
+		if got != c.want {
+			t.Errorf("%s: conflict=%v want %v", c.name, got, c.want)
+		}
+	}
+
+	// 全池批次在跑时，任一单账号请求都必须被拒（它会触碰该账号）。
+	p.batchRuns["tasks_growth"] = &batchRun{Kind: "tasks_growth", Running: true, Scope: "all"}
+	p.batchMu.Lock()
+	got := p.taskRunConflictLocked("growth", benefitRefFor("b"))
+	p.batchMu.Unlock()
+	if got == nil {
+		t.Fatal("全池批次在跑时单账号请求必须冲突")
+	}
+}
+
+// TestClaimPollBackoffTotalBudget claim 回读的退避预算必须短于原来的固定 3s×3，
+// 且首个探测点提前（上游异步计分多在 1~4s 落账，命中即提前返回）。
+func TestClaimPollBackoffTotalBudget(t *testing.T) {
+	var total time.Duration
+	for i := 1; i < claimPollAttempts; i++ {
+		d := claimPollBackoff(i)
+		if d <= 0 || d > claimPollGap {
+			t.Fatalf("第 %d 次退避=%v（应 >0 且不超过 %v）", i, d, claimPollGap)
+		}
+		total += d
+	}
+	if total >= 9*time.Second {
+		t.Fatalf("总预算=%v want < 9s（原固定 3×3s）", total)
+	}
+	if first := claimPollBackoff(1); first > 500*time.Millisecond {
+		t.Fatalf("首个探测等待=%v want ≤500ms（命中提前返回）", first)
+	}
+}

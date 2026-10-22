@@ -47,8 +47,11 @@ type Pool struct {
 	// (域, 模型) 多至 1 次即时重探；已毕业号经 ModelCosts 恢复 tier，学费不重付。
 	// 只在探索事件时写入（tier 1 枯竭期间停走，陈旧无害）；不做对称清理。
 	exploreLast map[string]time.Time
-	// costExploreEvents 累计探索事件数（/status 透出；pick 写锁内 ++，无需 atomic）。
+	// costExploreEvents 累计探索事件数（/status 透出）。
 	costExploreEvents int64
+	// exploreLock 保护 exploreLast/costExploreEvents。候选快照已降为读锁，
+	// 探索节流状态改由这把独立小锁保护，避免为低频写入持池写锁。
+	exploreLock sync.Mutex
 	// degradeThreshold / degradeCooldown / degradeCooldownMax 连败降权参数
 	// （SetDegrade 注入；默认值见 defaultDegrade*，issue #114）。
 	degradeThreshold   int
@@ -94,6 +97,9 @@ type Pool struct {
 	// 为 LRU 兜底/防惊群提供与 time.Now() 精度无关的严格全序（Windows ~0.5ms 精度下
 	// lastUsed 墙钟会全等）。仅 pick 写锁路径读写，无需 atomic。
 	pickSeq uint64
+	// lastPrune 全池过期条目清理的最近时刻（unix 纳秒，atomic）。选号热路径
+	// 用 CAS + 时间节流决定是否做一次清理，避免写锁全量扫描压住并发选号。
+	lastPrune atomic.Int64
 	// stopCh 关闭信号：Close 关闭它使 startFlusher 的后台 goroutine 退出。
 	// nil = 未启动 flusher（stateFp 为空时 New 不起 flusher）。
 	stopCh chan struct{}
@@ -216,8 +222,8 @@ func (p *Pool) SetCostExploreInterval(d time.Duration) {
 // 「探索→毕业」全链路）。RLock 只读遍历；map 大小受「服务过的 (域, 模型)」集合
 // 约束（与 modelCost 同界，天然有界）。
 func (p *Pool) CostExploreStatus() (events int64, last map[string]time.Time) {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
+	p.exploreLock.Lock()
+	defer p.exploreLock.Unlock()
 	last = make(map[string]time.Time, len(p.exploreLast))
 	for k, ts := range p.exploreLast {
 		// 键 realm+"\x1f"+model → 输出 "|"（JSON 安全可读；\x1f 不可打印）。

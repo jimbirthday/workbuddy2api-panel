@@ -61,16 +61,12 @@ func TestDegradeGateTriggerNoRenewal(t *testing.T) {
 	var g degradeGate
 	g.Trigger()
 	first := func() time.Time {
-		g.mu.Lock()
-		defer g.mu.Unlock()
-		return g.until
+		return time.Unix(0, g.until.Load())
 	}()
 	// 再次 Trigger：仍在降级期内，until 不应改变。
 	g.Trigger()
 	second := func() time.Time {
-		g.mu.Lock()
-		defer g.mu.Unlock()
-		return g.until
+		return time.Unix(0, g.until.Load())
 	}()
 	if !first.Equal(second) {
 		t.Errorf("Trigger during active should not renew: first=%v second=%v", first, second)

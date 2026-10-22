@@ -156,6 +156,12 @@ func (r *MarkupRepair) Feed(text string) (string, []MarkupCall) {
 	var calls []MarkupCall
 	for {
 		if !r.inBlock {
+			// 便宜预检：绝大多数增量不含标记起始 "<"。只有出现才做逐字节候选扫描。
+			// 每帧省一次 O(chunk) 全量扫描（stream 路径逐帧调用，高频）。
+			if !strings.Contains(s, "<") {
+				emit.WriteString(s)
+				break
+			}
 			i := markupStartCandidate(s)
 			if i < 0 {
 				emit.WriteString(s)

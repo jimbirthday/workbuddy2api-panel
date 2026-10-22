@@ -1142,12 +1142,24 @@ func (p *Panel) tasksQueueStatus(w http.ResponseWriter, r *http.Request) {
 // schoolVouchers 我的券码：逐 CN 账号查开学季 /vouchers（3 并发，与 packages
 // 同款限流），失败只在对应账号标 error。global 账号无开学季，不发上游调用。
 func (p *Panel) schoolVouchers(w http.ResponseWriter, r *http.Request) {
-	accts := p.cfg.Pool.List()
+	// 只需 uid/昵称/凭证引用与 disabled 位：用 TaskAccounts 一次性取引用，
+	// 避免为每个账号构建完整 Status（冷却/限流模型/成本台账）。
+	tas := p.cfg.Pool.TaskAccounts(true)
 	type row struct {
 		UID      string                   `json:"uid"`
 		Nickname string                   `json:"nickname"`
 		Vouchers []upstream.SchoolVoucher `json:"vouchers"`
 		Err      string                   `json:"error,omitempty"`
+	}
+	type acctRef struct {
+		UID      string
+		Nickname string
+		Disabled bool
+		Auth     *auth.Auth
+	}
+	accts := make([]acctRef, 0, len(tas))
+	for _, ta := range tas {
+		accts = append(accts, acctRef{UID: ta.UID, Nickname: ta.Auth.NicknameValue(), Disabled: ta.Disabled, Auth: ta.Auth})
 	}
 	out := make([]row, len(accts))
 	idx := make([]int, 0, len(accts))
@@ -1155,13 +1167,13 @@ func (p *Panel) schoolVouchers(w http.ResponseWriter, r *http.Request) {
 		if st.Disabled {
 			continue // 未占位，行末统一压掉
 		}
-		if a := p.cfg.Pool.AuthByUID(st.UID); a != nil {
+		if st.Auth != nil {
 			idx = append(idx, i)
 		}
 	}
 	if !p.runBackgroundBounded(3, len(idx), func(k int) {
 		i := idx[k]
-		a := p.cfg.Pool.AuthByUID(accts[i].UID)
+		a := accts[i].Auth
 		if a == nil {
 			return
 		}

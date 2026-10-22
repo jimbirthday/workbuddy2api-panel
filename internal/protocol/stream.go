@@ -3,7 +3,6 @@ package protocol
 import (
 	"bytes"
 	"encoding/json"
-	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -49,7 +48,15 @@ func (e *sseEmitter) event(name string, payload any) {
 		return
 	}
 	e.start()
-	_, e.err = fmt.Fprintf(e.w, "event: %s\ndata: %s\n\n", name, raw)
+	// 用字节拼接替代 fmt.Fprintf：event/data 是协议流最热的写出路径，
+	// fmt 的反射与宽参分配在这里是纯浪费。raw 已是 []byte，直接 append。
+	buf := make([]byte, 0, len(name)+len(raw)+16)
+	buf = append(buf, "event: "...)
+	buf = append(buf, name...)
+	buf = append(buf, "\ndata: "...)
+	buf = append(buf, raw...)
+	buf = append(buf, "\n\n"...)
+	_, e.err = e.w.Write(buf)
 	if e.err == nil && e.fl != nil {
 		e.fl.Flush()
 	}
@@ -65,7 +72,11 @@ func (e *sseEmitter) data(payload any) {
 		return
 	}
 	e.start()
-	_, e.err = fmt.Fprintf(e.w, "data: %s\n\n", raw)
+	buf := make([]byte, 0, len(raw)+10)
+	buf = append(buf, "data: "...)
+	buf = append(buf, raw...)
+	buf = append(buf, "\n\n"...)
+	_, e.err = e.w.Write(buf)
 	if e.err == nil && e.fl != nil {
 		e.fl.Flush()
 	}

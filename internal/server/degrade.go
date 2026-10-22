@@ -2,6 +2,7 @@ package server
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -15,14 +16,14 @@ import (
 // 不进降级路径）。降级期内的请求直达 Degraded，不再先撞 400。
 type degradeGate struct {
 	mu    sync.Mutex
-	until time.Time
+	until atomic.Int64 // unix 纳秒；0 = 未触发/已过期
 }
 
-// Active 当前是否处于降级期（now < until）。
+// Active 当前是否处于降级期（now < until）。每请求路径调用：用 atomic 读，
+// 不再为读一个截止时间取互斥锁。
 func (g *degradeGate) Active() bool {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	return time.Now().Before(g.until)
+	until := time.Unix(0, g.until.Load())
+	return !until.IsZero() && time.Now().Before(until)
 }
 
 // Trigger 触发降级，直到次日 00:00 CST（Asia/Shanghai）。
@@ -30,9 +31,10 @@ func (g *degradeGate) Active() bool {
 func (g *degradeGate) Trigger() {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if !time.Now().Before(g.until) {
+	until := time.Unix(0, g.until.Load())
+	if !time.Now().Before(until) {
 		// 已过期/未触发 → 设新的 until；未过期则保持原 until（不续期）。
-		g.until = nextMidnightCST(time.Now())
+		g.until.Store(nextMidnightCST(time.Now()).UnixNano())
 	}
 }
 

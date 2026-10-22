@@ -2,6 +2,7 @@ package httpauth
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
 	"net/http"
 	"strings"
@@ -34,6 +35,18 @@ type Key struct {
 	Realm   string   // "cn" / "global" / ""（不限制）
 	Models  []string // 空 = 不限制；非空时仅允许这些模型（裸名，不含 realm: 前缀）
 	Enabled bool
+	// digest 是 Key 的 SHA-256 预计算摘要。Keyring() 构造时算好，
+	// 请求路径直接比较，省去每请求每 key 一次 sha256；零值时回退现算
+	// （单 key 内联构造路径，见 VerifyBearerKey）。不导出，避免被日志/序列化触碰。
+	digest [sha256.Size]byte
+}
+
+// precomputed 报告该 key 是否已带预计算摘要。
+func (k Key) keyDigest() []byte {
+	if k.digest == ([sha256.Size]byte{}) {
+		return digest(k.Key)
+	}
+	return k.digest[:]
 }
 
 // DefaultLegacyKeyID 是顶层 api_key 兼容项的固定身份。它的语义必须与旧版完全
@@ -99,7 +112,8 @@ func matchBearer(r *http.Request, keys []Key) (Identity, bool) {
 	for _, k := range keys {
 		// 禁用/空 key 条目也参与一次摘要比较：比较次数只随配置条目数变化，
 		// 不随 enabled 状态或命中位置变化。只有 enabled 的非空 key 才能命中。
-		matched := subtleCompare(tokDigest, digest(k.Key))
+		// 摘要优先用 Keyring 预计算值，避免每请求重算全部 key 的 SHA-256。
+		matched := subtleCompare(tokDigest, k.keyDigest())
 		if matched && hasBearer && k.Enabled && strings.TrimSpace(k.Key) != "" && !found {
 			hit = Identity{ID: k.ID, Name: k.Name, Realm: k.Realm, Models: append([]string(nil), k.Models...)}
 			found = true

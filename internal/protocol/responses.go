@@ -15,6 +15,7 @@ import (
 // calls.
 type ResponsesMeta struct {
 	Model             string
+	Stream            bool
 	Tools             []any
 	ToolChoice        any
 	ParallelToolCalls any
@@ -94,6 +95,7 @@ func ResponsesToChat(body []byte) ([]byte, ResponsesMeta, error) {
 	}
 	if stream, ok := obj["stream"].(bool); ok {
 		chat["stream"] = stream
+		meta.Stream = stream
 	}
 	if text, ok := obj["text"].(map[string]any); ok {
 		if format, ok := text["format"].(map[string]any); ok {

@@ -350,6 +350,14 @@ var dynamicModelsCache struct {
 	ids      []upstream.ModelInfo
 	fetched  time.Time // 最近一次成功拉取时间
 	lastFail time.Time // 最近一次拉取失败时间（负缓存）
+	// assembled 是 modelList 组装好的基础列表缓存（与 ids 同 TTL）。/v1/models
+	// 会被客户端周期轮询，组装涉及 ContextWindow/MaxOutput/Effort 三级查找与
+	// 大量 map 分配；缓存后每次轮询只做浅拷贝 + 按 key 过滤。
+	// assembledAt 记录 assembled 所依据的 fetched 时刻：ids 与 fetched 总是
+	// 一起被替换（生产 fetchDynamicModels / 测试 setup），两者不一致即重建，
+	// 避免陈旧名单。
+	assembled   []map[string]any
+	assembledAt time.Time
 }
 
 const (
@@ -463,6 +471,19 @@ func applyModelInfoFields(entry map[string]any, mi upstream.ModelInfo) map[strin
 // 对称）；global.enabled=true 时追加 global: 前缀的国际版名单。
 // 纯动态：动态拉取失败/无号 → 该域空列表，无静态兜底。
 func (h *Handler) modelList() []map[string]any {
+	// 组装结果随动态目录同 TTL 缓存：轮询 /v1/models 时省去每模型的三级查找
+	// 与 map 分配。缓存只在 fetch 成功后刷新；失败时目录不变、缓存继续可用。
+	dynamicModelsCache.RLock()
+	fresh := len(dynamicModelsCache.ids) > 0 && time.Since(dynamicModelsCache.fetched) < dynamicModelsTTL
+	if fresh && dynamicModelsCache.assembled != nil && dynamicModelsCache.assembledAt.Equal(dynamicModelsCache.fetched) {
+		base := dynamicModelsCache.assembled
+		out := make([]map[string]any, len(base))
+		copy(out, base)
+		dynamicModelsCache.RUnlock()
+		return out
+	}
+	dynamicModelsCache.RUnlock()
+
 	out := make([]map[string]any, 0)
 	for _, mi := range h.fetchDynamicModels() {
 		entry := map[string]any{
@@ -533,6 +554,13 @@ func (h *Handler) modelList() []map[string]any {
 			out = append(out, entry)
 		}
 	}
+	// 缓存组装结果：与动态目录同一 TTL；key 过滤在 models() 里对副本做，不污染缓存。
+	dynamicModelsCache.Lock()
+	if len(dynamicModelsCache.ids) > 0 && time.Since(dynamicModelsCache.fetched) < dynamicModelsTTL {
+		dynamicModelsCache.assembled = out
+		dynamicModelsCache.assembledAt = dynamicModelsCache.fetched
+	}
+	dynamicModelsCache.Unlock()
 	return out
 }
 
@@ -917,7 +945,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 图片指纹只算一次；具体派生会话必须在选号后按 acct.UID 生成（见下方
 	// ImageSessionFor）。不能在这里用首轮选的账号做隔离段，否则限流换号后
 	// 第二个账号仍会收到带第一个账号隔离段的会话头。
-	imgFP := session.ImageFingerprint(body)
+	imgFP := session.ImageFingerprintFromMessages(envelope.turnMessages())
+	if !envelopeOK {
+		imgFP = session.ImageFingerprint(body)
+	}
 	chatMeta := upstream.ChatMeta{ConversationID: convID}
 	if v := r.Header.Get("X-Conversation-Request-ID"); v != "" {
 		chatMeta.ConversationRequestID = v

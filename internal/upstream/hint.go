@@ -149,7 +149,23 @@ func isInvalidImageData(body string) bool {
 
 // codeMarker JSON code 字段命中（`"code":N` / `"code": N` / `"code":"N"` 形态，
 // 与 IsModelBlocked 的 code 判定同容差口径）。lower 须为小写 body。
+// codeMarkerPatterns 缓存 code → 六种 JSON 空白容差形态。code 全部来自固定常量
+// 调用点（11101/11133/11135），预先拼好避免每次分类重拼 6 个字符串并分配切片。
+var codeMarkerPatterns = map[string][]string{
+	"11101": {`"code":11101`, `"code": 11101`, `"code":"11101"`, `"code": "11101"`, `"code":" 11101"`, `"code": '11101'`},
+	"11133": {`"code":11133`, `"code": 11133`, `"code":"11133"`, `"code": "11133"`, `"code":" 11133"`, `"code": '11133'`},
+	"11135": {`"code":11135`, `"code": 11135`, `"code":"11135"`, `"code": "11135"`, `"code":" 11135"`, `"code": '11135'`},
+}
+
 func codeMarker(lower, code string) bool {
+	if pats, ok := codeMarkerPatterns[code]; ok {
+		for _, v := range pats {
+			if strings.Contains(lower, v) {
+				return true
+			}
+		}
+		return false
+	}
 	for _, v := range []string{`"code":` + code, `"code": ` + code, `"code":"` + code + `"`, `"code": "` + code + `"`, `"code":" ` + code + `"`, `"code": '` + code + `'`} {
 		if strings.Contains(lower, v) {
 			return true

@@ -5,6 +5,7 @@
 package protocol
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -239,7 +240,14 @@ func firstErrorRequestID(maps ...map[string]any) string {
 // IsErrorChunk reports whether a Chat Completions chunk is an error frame.
 // It mirrors the upstream package's two real shapes: a non-nil top-level
 // error object, and a provider business envelope {code,msg} without choices.
+//
+// 绝大多数 delta 帧只有 content/tool_calls：先用字节预过滤，只有出现
+// "error"/"code" 键才做完整解码（键名可能出现在字符串内容里，命中后仍按
+// 结构判定，语义与之前完全一致）。每帧省一次 map 解码与 map/interface 分配。
 func IsErrorChunk(payload []byte) bool {
+	if !bytes.Contains(payload, []byte(`"error"`)) && !bytes.Contains(payload, []byte(`"code"`)) {
+		return false
+	}
 	var obj map[string]any
 	if json.Unmarshal(payload, &obj) != nil {
 		return false

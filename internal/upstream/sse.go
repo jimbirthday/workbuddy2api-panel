@@ -973,6 +973,18 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 		}
 		return nil
 	}
+	// writeDirectBytes 是 writeDirect 的 []byte 版本：热路径的帧已是 []byte，
+	// 直接写出避免 []byte→string 转换与一次拷贝。
+	writeDirectBytes := func(line []byte) error {
+		ensureStarted()
+		if _, werr := w.Write(line); werr != nil {
+			return werr
+		}
+		if fl != nil {
+			fl.Flush()
+		}
+		return nil
+	}
 	// emit 在客户端可见正文出现前只缓冲：role-only 首帧、心跳、空 choices 控制帧
 	// 都不能证明这是一次有效回答，先写出去就会提交 200 成功头，空流/正文前 error
 	// 帧便无法再回真实错误码。首个正文帧到达时按原顺序 flush。
@@ -989,6 +1001,23 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 	// writeSSE 把 payload 作为一帧 data 行写出并 flush（经 emit → 扣住态下先缓冲）。
 	writeSSE := func(payload string) error {
 		return emit("data: " + payload + "\n\n")
+	}
+	// writeSSEBytes 同 writeSSE，但 payload 已是 []byte：扣住态下才转成 string
+	// 入缓冲（罕见路径），正常路径直接以字节写出，避免每次帧的转换与拼接分配。
+	writeSSEBytes := func(payload []byte) error {
+		if !clientSawContent {
+			line := append(append([]byte("data: "), payload...), '\n', '\n')
+			if pendingBytes+len(line) <= maxHeldStreamBytes {
+				pending = append(pending, string(line))
+				pendingBytes += len(line)
+			}
+			return nil
+		}
+		data := make([]byte, 0, len(payload)+8)
+		data = append(data, "data: "...)
+		data = append(data, payload...)
+		data = append(data, '\n', '\n')
+		return writeDirectBytes(data)
 	}
 	flushPending := func() error {
 		if len(pending) == 0 {
@@ -1125,10 +1154,13 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 
 	// writeFrame 把 payload 按规范白名单重建后以 data: 帧写出并 flush。
 	// 只有真正可用的回答/收尾帧才计数（JSON 解析失败照常降级原样写出，但不计数）。
-	writeFrame := func(payload string) (int, error) {
+	// fastOut 复用的重建输出缓冲：fastFrame 已支持 append 进调用方缓冲，
+	// 逐帧复用避免每帧分配新 []byte。
+	var fastOut []byte
+	writeFrame := func(payload []byte) (int, error) {
 		if !repair.Enabled() {
-			payloadBytes := []byte(payload)
-			if raw, kind, ok := fastFrame(payloadBytes, &firstID, gotAnswer, nil); ok {
+			if raw, kind, ok := fastFrame(payload, &firstID, gotAnswer, fastOut); ok {
+				fastOut = raw[:0]
 				switch kind {
 				case fastFrameContent:
 					if werr := flushPending(); werr != nil {
@@ -1136,18 +1168,18 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 					}
 					clientSawContent = true
 					gotAnswer = true
-					if werr := writeSSE(string(raw)); werr != nil {
+					if werr := writeSSEBytes(raw); werr != nil {
 						return 0, werr
 					}
 					return 1, nil
 				case fastFrameFinish:
 					sawTerminal = true
-					if werr := writeSSE(string(raw)); werr != nil {
+					if werr := writeSSEBytes(raw); werr != nil {
 						return 0, werr
 					}
 					return 1, nil
 				default:
-					if werr := writeSSE(string(raw)); werr != nil {
+					if werr := writeSSEBytes(raw); werr != nil {
 						return 0, werr
 					}
 					return 0, nil
@@ -1155,9 +1187,9 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 			}
 		}
 		var obj map[string]any
-		if json.Unmarshal([]byte(payload), &obj) != nil {
+		if json.Unmarshal(payload, &obj) != nil {
 			// 非 JSON 帧：原样降级写出，不计数（与修复前一致）。扣住态下同样缓冲。
-			if werr := emit("data: " + payload + "\n\n"); werr != nil {
+			if werr := writeSSEBytes(payload); werr != nil {
 				return 0, werr
 			}
 			return 0, nil
@@ -1191,7 +1223,7 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 			// OpenAI 形态（{"error":{...}}）与业务信封形态（{"code":<非0>,"msg":...}）
 			// 都算；choices 里夹带的 error 不在此列。
 			if o.holdErrorUntilContent && !clientSawContent {
-				return 0, &ErrStreamHeld{Payload: payload}
+				return 0, &ErrStreamHeld{Payload: string(payload)}
 			}
 			// 非扣住态：先按原顺序写出此前缓冲的 role-only/注释，再透传 error 帧。
 			if werr := flushPending(); werr != nil {
@@ -1199,9 +1231,9 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 			}
 			// 旁路通知（账号处置用）：原始 payload 交给观察者，透传字节不变。
 			if o.onErrorFrame != nil {
-				o.onErrorFrame(payload)
+				o.onErrorFrame(string(payload))
 			}
-			if werr := writeRaw(payload); werr != nil {
+			if werr := writeRaw(string(payload)); werr != nil {
 				return 0, werr
 			}
 			return 1, nil
@@ -1221,7 +1253,7 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 		// 帧与 role-only 首帧不能构成一次回答。
 		usable := hasContent || (frameHasFinishReason(obj) && gotAnswer)
 		for _, ch := range repairFrame(obj) {
-			if werr := writeChunk(ch, payload); werr != nil {
+			if werr := writeChunk(ch, string(payload)); werr != nil {
 				return 0, werr
 			}
 		}
@@ -1245,7 +1277,7 @@ readLoop:
 				// [DONE] 统一在循环结束后写出，保证恰好一个。
 				break readLoop
 			}
-			n, werr := writeFrame(string(payload))
+			n, werr := writeFrame(payload)
 			validFrames += n
 			if werr != nil {
 				return werr

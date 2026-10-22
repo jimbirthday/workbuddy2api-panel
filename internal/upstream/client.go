@@ -584,8 +584,8 @@ func Classify(status int, body string) ErrKind {
 			return ErrSessionDead
 		}
 	}
-	for _, m := range accountFaultMarkers {
-		if strings.Contains(lower, strings.ToLower(m)) || strings.Contains(body, m) {
+	for _, m := range accountFaultMarkersLower {
+		if strings.Contains(lower, m) {
 			return ErrAccountFault
 		}
 	}
@@ -604,13 +604,15 @@ func Classify(status int, body string) ErrKind {
 	if status == http.StatusTooManyRequests {
 		return ErrSoftRate
 	}
-	for _, m := range hardMarkers {
-		if strings.Contains(lower, strings.ToLower(m)) || strings.Contains(body, m) {
+	// hard/soft 各含中文原文：lower(body) 对中文无变化，全表统一先转小写一次，
+	// 下面只做 lower(lower) 单通道比较，省掉每 marker 每次的 ToLower 分配。
+	for _, m := range hardMarkersLower {
+		if strings.Contains(lower, m) {
 			return ErrHardCredit
 		}
 	}
-	for _, m := range softRateMarkers {
-		if strings.Contains(lower, strings.ToLower(m)) || strings.Contains(body, m) {
+	for _, m := range softRateMarkersLower {
+		if strings.Contains(lower, m) {
 			return ErrSoftRate
 		}
 	}
@@ -618,8 +620,11 @@ func Classify(status int, body string) ErrKind {
 	// 之前——请求级语义最具体（上下文超限），须先于宽泛的状态码兜底（404 兜底会
 	// 误归 ErrNotFound 只冷却不透传；ErrClient 只换号，浪费健康号配额）。
 	if isPromptTooLongStatus(status) {
+		// promptTooLongMarkers 全为小写（code 字面形态 + "prompt is too long"），
+		// 原条件 m != ToLower(m) 恒 false，等价于仅对原文做大小写敏感匹配。
+		// 直接复用静态表，省去每 marker 每次 ToLower。
 		for _, m := range promptTooLongMarkers {
-			if strings.Contains(body, m) || (m != strings.ToLower(m) && strings.Contains(lower, strings.ToLower(m))) {
+			if strings.Contains(body, m) {
 				return ErrPromptTooLong
 			}
 		}
@@ -974,18 +979,21 @@ func (c *Client) supportedEfforts(realm, model string) []string {
 	if model == "" || model == "-" {
 		return nil
 	}
-	efforts := c.effortsSnapshot(realm)
+	// 只读单模型条目：此前先拷贝整桶再建全局合并 map，只为读一个模型。
+	// 直接在读锁内查远端桶，未命中时按 realm 静态表兜底（global 语义不变）。
+	c.effortsMu.RLock()
+	defer c.effortsMu.RUnlock()
+	if bucket := c.efforts[realmKey(realm)]; len(bucket) > 0 {
+		if supported := bucket[model]; len(supported) > 0 {
+			return supported
+		}
+	}
 	if realmKey(realm) == "global" {
-		efforts, _ = globalEffortMap(efforts, nil)
+		if cap, ok := globalEffortFallback[model]; ok {
+			return cap.efforts
+		}
 	}
-	if len(efforts) == 0 {
-		return nil
-	}
-	supported, ok := efforts[model]
-	if !ok || len(supported) == 0 {
-		return nil
-	}
-	return supported
+	return nil
 }
 
 // effortsSnapshot 返回 effort 能力缓存副本；nil 表示未知（透传不降级）。
@@ -2474,4 +2482,22 @@ func IsAlreadyCheckin(err error) bool {
 
 func truncate(s string, n int) string {
 	return logfmt.Truncate(s, n)
+}
+
+// 以下是静态 marker 表的预转小写副本（含中文原文，ToLower 对中文无变化）。
+// Classify 里 lower := strings.ToLower(body) 已把 body 统一小写，之前每个循环里
+// 还对每个静态 marker 再次 ToLower + 每 marker 分配一次临时字符串。表只读不变，
+// 一次预转小写后循环只做单通道 Contains，省去每请求数十次临时分配。
+var (
+	hardMarkersLower         = lowerAll(hardMarkers)
+	softRateMarkersLower     = lowerAll(softRateMarkers)
+	accountFaultMarkersLower = lowerAll(accountFaultMarkers)
+)
+
+func lowerAll(in []string) []string {
+	out := make([]string, len(in))
+	for i, s := range in {
+		out[i] = strings.ToLower(s)
+	}
+	return out
 }

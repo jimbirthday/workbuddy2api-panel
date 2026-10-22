@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"net/http"
 	"strings"
+	"sync"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
@@ -123,9 +124,19 @@ func (c *Client) injectDeviceToken(req *http.Request, a *auth.Auth) {
 // 与 injectDeviceToken 的 X-Device-Token 并存不冲突：那是登录时上游签发的
 // 真实设备令牌（有则发，权威）；本对头是「每账号一台固定虚拟设备」的稳定指纹，
 // 防多号被上游按设备指纹缺失/漂移关联风控。两者是不同头族，官方桌面端都发。
+// accountStableIDCache 缓存 deriveAccountStableID 的结果。派生对 (uid, purpose)
+// 恒定，出站每请求（含换号重试跳）都要算 2 次 sha256 + hex；缓存后只做一次查表。
+var accountStableIDCache sync.Map // key: uid+"\x00"+purpose -> string
+
 func deriveAccountStableID(uid, purpose string) string {
+	key := uid + "\x00" + purpose
+	if v, ok := accountStableIDCache.Load(key); ok {
+		return v.(string)
+	}
 	sum := sha256.Sum256([]byte("wb2a:" + purpose + ":" + uid))
-	return hex.EncodeToString(sum[:18]) // 36 hex chars
+	v := hex.EncodeToString(sum[:18]) // 36 hex chars
+	actual, _ := accountStableIDCache.LoadOrStore(key, v)
+	return actual.(string)
 }
 
 // injectAccountStableHeaders 在 req 注入 X-Machine-ID / X-Session-ID：按 uid 稳定

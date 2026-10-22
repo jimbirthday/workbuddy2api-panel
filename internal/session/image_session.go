@@ -134,14 +134,26 @@ func ImageFingerprint(body []byte) string {
 	if err := json.Unmarshal(body, &root); err != nil {
 		return ""
 	}
+	msgs := make([]KeyMessage, 0, len(root.Messages))
+	for _, m := range root.Messages {
+		var role string
+		_ = json.Unmarshal(m.Role, &role)
+		msgs = append(msgs, KeyMessage{Role: role, Content: m.Content})
+	}
+	return ImageFingerprintFromMessages(msgs)
+}
+
+// ImageFingerprintFromMessages 是 ImageFingerprint 的已解码版本：消费 handler
+// 已投影的 KeyMessage 视图（Content 为 json.RawMessage，零复制）。结构化解码
+// 成功时 handler 用它，避免对整份 body 再做一次完整 JSON 扫描——图片请求的
+// body 常带数百 KB base64，重复 Unmarshal 是每请求固定开销。
+func ImageFingerprintFromMessages(msgs []KeyMessage) string {
 	// 只对最后一轮 user 消息取指纹：历史轮里的图片已经属于既有会话，继续把
 	// 它们计入会让每追加一张图就换一次会话，破坏多轮图片对话。最后一轮决定
 	// 「这次要上游识别哪组图」：同轮重试稳定、换图/改图顺序变化。
 	var lastUserParts []map[string]any
-	for _, m := range root.Messages {
-		var role string
-		_ = json.Unmarshal(m.Role, &role)
-		if !strings.EqualFold(strings.TrimSpace(role), "user") {
+	for _, m := range msgs {
+		if !strings.EqualFold(strings.TrimSpace(m.Role), "user") {
 			continue
 		}
 		raw := strings.TrimSpace(string(m.Content))

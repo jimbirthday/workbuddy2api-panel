@@ -150,6 +150,18 @@ func (p *Panel) mpPaceLoop(st *mpPaceState, stop, done chan struct{}) {
 		case <-t.C:
 		}
 		p.mpPaceRunDue(st)
+		// 作业全部完成后自停：此前 running 一旦置位，ticker 会以 1s 心跳空转到
+		// 进程结束（一次 MP 任务用过之后就永远多一个每秒唤醒的 goroutine）。
+		// 自停后由 enqueueMPPace 在下一单作业登记时重启调度循环。
+		st.mu.Lock()
+		empty := len(st.jobs) == 0
+		if empty {
+			st.running = false
+		}
+		st.mu.Unlock()
+		if empty {
+			return
+		}
 	}
 }
 

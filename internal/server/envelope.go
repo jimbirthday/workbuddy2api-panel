@@ -78,6 +78,18 @@ func (e chatEnvelope) toolDecls() []upstream.ToolDecl         { return e.Tools }
 func (e chatEnvelope) functionDecls() []upstream.FunctionDecl { return e.Functions }
 
 func (e chatEnvelope) messageToolNames() []upstream.MessageToolNames {
+	// 大多数请求没有 tools/function_call：直接返回 nil 让 ToolNamesFromFields
+	// 零分配短路，省去 per-request 的 out/calls 切片与 ToolCallDecl 拷贝。
+	hasAny := false
+	for _, m := range e.Messages {
+		if len(m.ToolCalls) > 0 || m.FunctionCall != nil {
+			hasAny = true
+			break
+		}
+	}
+	if !hasAny {
+		return nil
+	}
 	totalCalls := 0
 	for _, m := range e.Messages {
 		totalCalls += len(m.ToolCalls)

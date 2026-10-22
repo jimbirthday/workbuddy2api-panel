@@ -7,23 +7,40 @@ import (
 	"strings"
 )
 
+// MessagesMeta 是 MessagesToChat 在翻译过程中已知、调用方随后还要读取的
+// 两个字段（stream/model）。返回它们避免调用方对刚 marshal 出的 chat body
+// 再做一次完整 JSON 解码。
+type MessagesMeta struct {
+	Model  string
+	Stream bool
+}
+
 // MessagesToChat translates an Anthropic Messages request into Chat Completions.
 func MessagesToChat(body []byte) ([]byte, error) {
+	out, _, err := MessagesToChatMeta(body)
+	return out, err
+}
+
+// MessagesToChatMeta 是带元信息版本的 MessagesToChat（Meta 在翻译过程中已知，
+// 无需调用方再解码一次结果）。
+func MessagesToChatMeta(body []byte) ([]byte, MessagesMeta, error) {
+	var meta MessagesMeta
 	obj, err := decodeObject(body)
 	if err != nil {
-		return nil, err
+		return nil, meta, err
 	}
-	model := stringValue(obj["model"])
-	if model == "" {
-		return nil, badRequest("invalid_request", "model is required")
+	meta.Model = stringValue(obj["model"])
+	if meta.Model == "" {
+		return nil, meta, badRequest("invalid_request", "model is required")
 	}
 	rawMessages, ok := obj["messages"].([]any)
 	if !ok {
-		return nil, badRequest("invalid_request", "messages must be a list")
+		return nil, meta, badRequest("invalid_request", "messages must be a list")
 	}
 	if len(rawMessages) == 0 {
-		return nil, badRequest("invalid_request", "messages must not be empty")
+		return nil, meta, badRequest("invalid_request", "messages must not be empty")
 	}
+	model := meta.Model
 	chat := map[string]any{"model": model, "messages": []any{}}
 	for _, key := range []string{"temperature", "top_p"} {
 		if v, ok := obj[key]; ok && v != nil {
@@ -35,6 +52,9 @@ func MessagesToChat(body []byte) ([]byte, error) {
 	}
 	if v, ok := obj["stream"]; ok && v != nil {
 		chat["stream"] = v
+		if b, ok := v.(bool); ok {
+			meta.Stream = b
+		}
 	}
 	if stops, ok := obj["stop_sequences"].([]any); ok && len(stops) > 0 {
 		chat["stop"] = stops
@@ -80,7 +100,7 @@ func MessagesToChat(body []byte) ([]byte, error) {
 	for i, raw := range rawMessages {
 		item, ok := raw.(map[string]any)
 		if !ok {
-			return nil, badRequest("invalid_request", "messages[%d] must be an object", i)
+			return nil, meta, badRequest("invalid_request", "messages[%d] must be an object", i)
 		}
 		role := strings.ToLower(stringValue(item["role"]))
 		if role == "" {
@@ -98,7 +118,7 @@ func MessagesToChat(body []byte) ([]byte, error) {
 			continue
 		}
 		if role != "user" && role != "assistant" {
-			return nil, badRequest("invalid_request", "messages[%d].role %q must be user or assistant", i, role)
+			return nil, meta, badRequest("invalid_request", "messages[%d].role %q must be user or assistant", i, role)
 		}
 		switch c := content.(type) {
 		case string:
@@ -106,7 +126,7 @@ func MessagesToChat(body []byte) ([]byte, error) {
 		case []any:
 			converted, err := anthropicBlocks(role, c)
 			if err != nil {
-				return nil, err
+				return nil, meta, err
 			}
 			messages = append(messages, converted...)
 		case nil:
@@ -118,9 +138,9 @@ func MessagesToChat(body []byte) ([]byte, error) {
 	chat["messages"] = messages
 	out, err := json.Marshal(chat)
 	if err != nil {
-		return nil, &ConvertError{Status: http.StatusInternalServerError, Code: "encode_request", Message: err.Error()}
+		return nil, meta, &ConvertError{Status: http.StatusInternalServerError, Code: "encode_request", Message: err.Error()}
 	}
-	return out, nil
+	return out, meta, nil
 }
 
 func anthropicSystemText(v any) string {
@@ -552,6 +572,11 @@ func CountMessagesTokens(body []byte) (int64, error) {
 	}
 	if stringValue(obj["model"]) == "" {
 		return 0, badRequest("invalid_request", "model is required")
+	}
+	// 与 MessagesToChat 同口径的最小结构校验（此前调用方为验证而完整翻译一遍，
+	// 结果被丢弃；这里只做判定必需的字段形状检查）。
+	if raw, ok := obj["messages"].([]any); !ok || len(raw) == 0 {
+		return 0, badRequest("invalid_request", "messages must not be empty")
 	}
 	var sb strings.Builder
 	sb.WriteString(anthropicSystemText(obj["system"]))

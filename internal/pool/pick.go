@@ -159,25 +159,29 @@ func (p *Pool) pickLocked(tried map[string]bool, reqModel, realm string) (*auth.
 
 	// 候选快照后在锁外排序；最终提交前状态若已全部失效，重拍一次快照。
 	// 重试有上限，避免账号状态剧烈变化时在选号热路径里死循环。
+	// 过期清理从选号热路径移到这里：时间节流 + 写锁一次，避免每跳选号都持写锁
+	// 全量扫描 + 逐号清理（写锁序列化是此前并发选号的最大 CPU/尾延迟来源）。
+	p.pruneExpiredIfDue(now)
 	for attempt := 0; attempt < 3; attempt++ {
-		cfg := pickConfig{}
-		p.mu.Lock()
-		cfg = pickConfig{
+		cfg := pickConfig{
 			idleWeightPerHour:   p.idleWeightPerHour,
 			idleWeightMax:       p.idleWeightMax,
 			preferExpiring:      p.preferExpiring,
 			randInt64N:          p.randInt64N,
 			costExploreInterval: p.costExploreInterval,
 		}
-		cands, bestTier, explored := p.pickSnapshotLocked(scratch, tried, reqModel, realm, now, dailyUsage, dailyOK, dailyLimit, modelLimit, &cfg)
+		// 候选快照只读，用 RLock：并发选号此前被写锁串行化（持写锁跑 470 号的
+		// 全量扫描 + 每号过期清理），现在多个请求可并行读；过期清理移到
+		// 时间节流的维护路径（pruneExpiredLocked），不再压在每跳选号上。
+		p.mu.RLock()
+		cands, bestTier, explored := p.pickSnapshotRLocked(scratch, tried, reqModel, realm, now, dailyUsage, dailyOK, dailyLimit, modelLimit, &cfg)
+		p.mu.RUnlock()
 		if len(cands) == 0 {
 			// 全冷却兜底：无 healthy 候选时，从冷却账号里选 until 最早到期的一个
 			// （熔断/冷却共用 expiry 口径，取较早截止者）。禁用的账号永不参与兜底。
 			a, eventLog := p.pickEarliestExpiryLocked(tried, now, realm, reqModel, dailyUsage, dailyOK, dailyLimit, modelLimit)
-			p.mu.Unlock()
 			return a, eventLog
 		}
-		p.mu.Unlock()
 
 		// 锁外只读快照字段：成本分层已在锁内按每个候选算好，这里做 O(n) 权重
 		// 预计算与排序。旧实现把整段排序放在池写锁内，470 号时所有并发选号被
@@ -292,9 +296,10 @@ type pickConfig struct {
 	costExploreInterval time.Duration
 }
 
-// pickSnapshotLocked 在 p.mu 写锁内筛选候选并复制排序/抽签所需的全部标量字段。
-// 调用方持有 p.mu；锁外不得再读 entry 的受保护字段。
-func (p *Pool) pickSnapshotLocked(scratch *pickScratch, tried map[string]bool, reqModel, realm string, now time.Time, dailyUsage DailyTokenUsageByUID, dailyOK bool, dailyLimit, modelLimit int64, cfg *pickConfig) ([]pickCandidate, int, bool) {
+// pickSnapshotRLocked 在 p.mu 读锁内筛选候选并复制排序/抽签所需的全部标量字段。
+// 调用方持有 p.mu.RLock；锁外不得再读 entry 的受保护字段。快照只读：过期清理
+// 交给 pruneExpiredLocked 维护路径（时间节流），本函数不再删除任何 entry 字段。
+func (p *Pool) pickSnapshotRLocked(scratch *pickScratch, tried map[string]bool, reqModel, realm string, now time.Time, dailyUsage DailyTokenUsageByUID, dailyOK bool, dailyLimit, modelLimit int64, cfg *pickConfig) ([]pickCandidate, int, bool) {
 	realmOK := func(e *entry) bool { return realm == "" || e.a.Realm() == realm }
 	healthyOf := func(e *entry) bool { return realmOK(e) && e.healthy(now) }
 	if reqModel != "" {
@@ -310,10 +315,6 @@ func (p *Pool) pickSnapshotLocked(scratch *pickScratch, tried map[string]bool, r
 		if tried != nil && tried[uid] {
 			continue
 		}
-		// 惰性清理过期的模型级冷却与成本台账（两者的 map 都不无限膨胀；
-		// status 只读遍历天然跳过过期项，但内存条目必须在此真正删除）。
-		e.pruneExpiredModelCooldowns(now)
-		e.pruneExpiredModelCosts(now)
 		if !healthyOf(e) {
 			continue
 		}
@@ -360,11 +361,17 @@ func (p *Pool) pickSnapshotLocked(scratch *pickScratch, tried map[string]bool, r
 			}
 		}
 		key := realm + "\x1f" + reqModel
-		if hasTier1 && now.Sub(p.exploreLast[key]) >= cfg.costExploreInterval {
-			p.exploreLast[key] = now
-			p.costExploreEvents++
-			bestTier = 1
-			explored = true
+		if hasTier1 {
+			// exploreLast 是探索节流状态：快照已降为读锁，这里不能与 byUID 共用
+			// p.mu，独立小锁保护（写入频率 ~30m 一次，锁外候选排序零竞争）。
+			p.exploreLock.Lock()
+			if now.Sub(p.exploreLast[key]) >= cfg.costExploreInterval {
+				p.exploreLast[key] = now
+				p.costExploreEvents++
+				bestTier = 1
+				explored = true
+			}
+			p.exploreLock.Unlock()
 		}
 	}
 	return cands, bestTier, explored
@@ -590,12 +597,15 @@ func (p *Pool) isPaidRate(rate string) bool {
 // 分级：disabled 永不参与；CoolHard（余额耗尽，等签到的号）同样排除——调了必 402，浪费轮换并产生噪音日志；
 // CoolSoft 与熔断号允许参与（可能已恢复，失败成本仅一轮换）。
 // 被 tried 排除、在途占满的账号同样跳过（维持请求级轮换 + 租约语义）。无任何可用返回 nil。
+// 本函数自取写锁（内部会推进 pickSeq/usedSeq/lastUsed）；调用方不得持锁调用。
 //
 // 积分保底同样在此生效（model 非空时）：floor 把健康号全部拦掉后 cands 为空会走到
 // 这里，若兜底不看保底，触底号会被「捞回来」继续接收费模型——表现为同一条
 // floor WARN 反复刷同一个号（实测：credits=1 < floor=150 仍持续中选）。
 // 兜底是**最后一道**选号路径，保底在它之前挡不住就等于没挡。
 func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, realm, model string, dailyUsage map[string]DailyTokenUsage, dailyOK bool, dailyLimit, modelLimit int64) (*auth.Auth, string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	var best *entry
 	for uid, e := range p.byUID {
 		if tried != nil && tried[uid] {
@@ -641,6 +651,31 @@ func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, re
 	p.pickSeq++
 	best.usedSeq = p.pickSeq
 	return best.a, eventLog
+}
+
+// pruneExpiredEvery 过期条目清理的最小间隔。清理不再是每跳选号的开销：entry 的
+// modelCooldowns / modelCost 增长受「服务过的模型名」约束（天然有界），节流到
+// 分钟级足够回收内存；读路径（healthyForModel / modelCostOf / status）本就跳过
+// 过期项，节流清理不改变任何可观察语义。
+var pruneExpiredEvery = 30 * time.Second
+
+// pruneExpiredIfDue 时间节流地回收全池过期的模型级冷却与成本台账。选号热路径
+// 只做一次原子时间戳判断；到期才取写锁做一轮全量清理（470 号 ~微秒级）。
+func (p *Pool) pruneExpiredIfDue(now time.Time) {
+	last := time.Unix(0, p.lastPrune.Load())
+	if now.Sub(last) < pruneExpiredEvery {
+		return
+	}
+	// CAS 防并发：只有一个 pick 进入清理，其余看到新时间戳直接跳过。
+	if !p.lastPrune.CompareAndSwap(last.UnixNano(), now.UnixNano()) {
+		return
+	}
+	p.mu.Lock()
+	for _, e := range p.byUID {
+		e.pruneExpiredModelCooldowns(now)
+		e.pruneExpiredModelCosts(now)
+	}
+	p.mu.Unlock()
 }
 
 // inFlightFull 报告账号是否已占满在途名额（上限按 realm 分档，见 inFlightLimit；

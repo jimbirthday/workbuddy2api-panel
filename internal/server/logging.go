@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -639,6 +640,21 @@ func logChatRow(ttfb, total time.Duration, model, mode, uid, nick string, status
 	logChatRowEx(ttfb, total, model, mode, uid, nick, status, toks, "", "", 0, 0, false, "", "", "")
 }
 
+// rowBufPool 复用流水行构建缓冲，避免每请求分配一次 strings.Builder。
+var rowBufPool = sync.Pool{New: func() any { b := strings.Builder{}; return &b }}
+
+// padInt 把 n 右对齐补零写进 buf（与 fmt "%03d" 逐字节一致，负数不作特殊处理，
+// 与既有格式语义一致：seq 恒正）。
+func padInt(buf *strings.Builder, n int64, width int) {
+	digits := strconv.FormatInt(n, 10)
+	if d := width - len(digits); d > 0 {
+		for i := 0; i < d; i++ {
+			buf.WriteByte('0')
+		}
+	}
+	buf.WriteString(digits)
+}
+
 // logChatRowEx 是带请求 ID、结果、重试、积分与调用来源字段的扩展流水行。旧调用保持
 // 原格式；requestID 非空时才追加扩展字段；来源两参均为空时不追加来源段。
 func logChatRowEx(ttfb, total time.Duration, model, mode, uid, nick string, status int, toks int,
@@ -654,19 +670,19 @@ func logChatRowEx(ttfb, total time.Duration, model, mode, uid, nick string, stat
 	tokField := "-"
 	tokpsField := "-"
 	if toks >= 0 {
-		tokField = fmt.Sprintf("%d", toks)
+		tokField = strconv.Itoa(toks)
 		// 速率与用量账本走同一个函数（扣掉 TTFB）。此前这里自己除 total，漏扣首
 		// token 等待，于是控制台流水行的 tok/s 与面板数字对不上（issue #34）——
 		// 本函数本来就收到了 ttfb，只是没拿它算速率。
 		if tps, ok := tokensPerSecond(int64(toks), total, ttfb); ok {
-			tokpsField = fmt.Sprintf("%.1ftok/s", tps)
+			tokpsField = strconv.FormatFloat(tps, 'f', 1, 64) + "tok/s"
 		} else {
 			tokpsField = "0.0tok/s"
 		}
 	}
 	ttfbMS := "-"
 	if ttfb > 0 {
-		ttfbMS = fmt.Sprintf("%dms", ttfb.Milliseconds())
+		ttfbMS = strconv.FormatInt(ttfb.Milliseconds(), 10) + "ms"
 	}
 	extra := ""
 	if requestID != "" {
@@ -678,11 +694,11 @@ func logChatRowEx(ttfb, total time.Duration, model, mode, uid, nick string, stat
 		}
 		creditField := "-"
 		if hasCredit {
-			creditField = fmt.Sprintf("%.4f", credit)
+			creditField = strconv.FormatFloat(credit, 'f', 4, 64)
 		}
-		extra = fmt.Sprintf(" rid=%s | out=%s | try=%d | credit=%s |", requestID, outcome, attempts, creditField)
+		extra = " rid=" + requestID + " | out=" + outcome + " | try=" + strconv.Itoa(attempts) + " | credit=" + creditField + " |"
 		if keyID != "" {
-			extra += fmt.Sprintf(" key=%s |", keyID)
+			extra += " key=" + keyID + " |"
 		}
 	}
 	// 调用来源：IP 用可解析的裸值（便于 grep），UA 用 ShortUA 压缩后的客户端标签
@@ -694,22 +710,38 @@ func logChatRowEx(ttfb, total time.Duration, model, mode, uid, nick string, stat
 		if s := logfmt.ShortUA(userAgent); s != "" {
 			ua = `"` + s + `"`
 		}
-		src = fmt.Sprintf(" src=%s ua=%s |", dashIfEmpty(clientIP), ua)
+		src = " src=" + dashIfEmpty(clientIP) + " ua=" + ua + " |"
 	}
-	fmt.Fprintf(chatLogOut, "| #%03d | %s | %s | %s | %d | %s | TTFB=%s | tok=%s | %s | total=%.1fs |%s%s\n",
-		seq,
-		time.Now().Format("15:04:05"),
-		model,
-		mode,
-		status,
-		acct,
-		logfmt.Pad(ttfbMS, chatTTFBWidth),
-		logfmt.Pad(tokField, chatTokWidth),
-		logfmt.Pad(tokpsField, chatRateWidth),
-		total.Seconds(),
-		extra,
-		src,
-	)
+	// 用 strings.Builder + strconv 逐段拼装：每请求行此前有约 7 次 fmt 反射分配，
+	// 生产环境 chatLog 常开，这是每请求固定支出。输出字节与旧 fmt 逐字节一致。
+	buf := rowBufPool.Get().(*strings.Builder)
+	buf.Reset()
+	buf.WriteString("| #")
+	padInt(buf, seq, 3)
+	buf.WriteString(" | ")
+	buf.WriteString(time.Now().Format("15:04:05"))
+	buf.WriteString(" | ")
+	buf.WriteString(model)
+	buf.WriteString(" | ")
+	buf.WriteString(mode)
+	buf.WriteString(" | ")
+	buf.WriteString(strconv.Itoa(status))
+	buf.WriteString(" | ")
+	buf.WriteString(acct)
+	buf.WriteString(" | TTFB=")
+	buf.WriteString(logfmt.Pad(ttfbMS, chatTTFBWidth))
+	buf.WriteString(" | tok=")
+	buf.WriteString(logfmt.Pad(tokField, chatTokWidth))
+	buf.WriteString(" | ")
+	buf.WriteString(logfmt.Pad(tokpsField, chatRateWidth))
+	buf.WriteString(" | total=")
+	buf.WriteString(strconv.FormatFloat(total.Seconds(), 'f', 1, 64))
+	buf.WriteString("s |")
+	buf.WriteString(extra)
+	buf.WriteString(src)
+	buf.WriteByte('\n')
+	_, _ = io.WriteString(chatLogOut, buf.String())
+	rowBufPool.Put(buf)
 }
 
 // cacheMissSignal 低命中率告警信号（issue #92 P1 轻量化）：同一模型此前观测到过

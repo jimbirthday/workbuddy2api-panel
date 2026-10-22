@@ -28,18 +28,14 @@ func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
 		writeProtocolConvertError(w, protoResponses, err)
 		return
 	}
-	var peek struct {
-		Stream bool   `json:"stream"`
-		Model  string `json:"model"`
-	}
-	_ = json.Unmarshal(chatBody, &peek)
-	if !h.checkProtocolModel(w, protoResponses, r, peek.Model) {
+	// meta.Stream 在翻译过程中已知，省去对 chatBody 的二次 JSON 解码。
+	if !h.checkProtocolModel(w, protoResponses, r, meta.Model) {
 		return
 	}
 	next := r.Clone(r.Context())
 	next.Body = io.NopCloser(bytes.NewReader(chatBody))
 	next.ContentLength = int64(len(chatBody))
-	if peek.Stream {
+	if meta.Stream {
 		pw := newProtocolStreamWriter(w, protoResponses, meta)
 		h.chatCompletions(pw, next)
 		pw.Finish()
@@ -77,31 +73,27 @@ func (h *Handler) messages(w http.ResponseWriter, r *http.Request) {
 		writeProtocolError(w, protoMessages, http.StatusBadRequest, "invalid_request", "read body: "+err.Error())
 		return
 	}
-	chatBody, err := protocol.MessagesToChat(body)
+	chatBody, meta, err := protocol.MessagesToChatMeta(body)
 	if err != nil {
 		writeProtocolConvertError(w, protoMessages, err)
 		return
 	}
-	var peek struct {
-		Stream bool   `json:"stream"`
-		Model  string `json:"model"`
-	}
-	_ = json.Unmarshal(chatBody, &peek)
-	if !h.checkProtocolModel(w, protoMessages, r, peek.Model) {
+	// meta.Model/Stream 在翻译过程中已知，省去对 chatBody 的二次 JSON 解码。
+	if !h.checkProtocolModel(w, protoMessages, r, meta.Model) {
 		return
 	}
 	next := r.Clone(r.Context())
 	next.Body = io.NopCloser(bytes.NewReader(chatBody))
 	next.ContentLength = int64(len(chatBody))
-	if peek.Stream {
-		pw := newProtocolStreamWriter(w, protoMessages, peek.Model)
+	if meta.Stream {
+		pw := newProtocolStreamWriter(w, protoMessages, meta.Model)
 		h.chatCompletions(pw, next)
 		pw.Finish()
 		return
 	}
 	cap := &captureResponseWriter{header: http.Header{}}
 	h.chatCompletions(cap, next)
-	writeProtocolNonStream(w, protoMessages, cap.status, cap.header, cap.buf.Bytes(), peek.Model)
+	writeProtocolNonStream(w, protoMessages, cap.status, cap.header, cap.buf.Bytes(), meta.Model)
 }
 
 // countMessagesTokens answers POST /v1/messages/count_tokens locally. The
@@ -122,10 +114,9 @@ func (h *Handler) countMessagesTokens(w http.ResponseWriter, r *http.Request) {
 	if !h.checkProtocolModel(w, protoMessages, r, obj.Model) {
 		return
 	}
-	if _, err := protocol.MessagesToChat(body); err != nil {
-		writeProtocolConvertError(w, protoMessages, err)
-		return
-	}
+	// CountMessagesTokens 自带 decodeObject 与结构校验；此前先跑一次完整
+	// MessagesToChat（decode + re-marshal）只为验证，结果被丢弃。这里改为
+	// 直接统计，结构错误由 CountMessagesTokens 返回的 ConvertError 承载。
 	n, err := protocol.CountMessagesTokens(body)
 	if err != nil {
 		writeProtocolConvertError(w, protoMessages, err)

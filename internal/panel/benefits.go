@@ -378,8 +378,11 @@ func (p *Panel) welfareGrantRows() welfareGrantSnapshot {
 	out := welfareGrantSnapshot{rows: make([]benefitGrantRow, 0, 16), available: true}
 	accounts := make(map[string]*auth.Auth)
 	if p.cfg.Pool != nil {
-		for _, st := range p.cfg.Pool.List() {
-			accounts[st.UID] = p.cfg.Pool.AuthByUID(st.UID)
+		// 只需 uid→Auth 投影（判断企业/国际过滤），不必构建完整 Status。
+		// List() 会为每个账号算冷却/限流模型/成本台账（470 号约 250KiB 分配），
+		// 这里是页面加载的每请求固定支出；TaskAccounts 一次读锁给全量引用。
+		for _, ta := range p.cfg.Pool.TaskAccounts(true) {
+			accounts[ta.UID] = ta.Auth
 		}
 	}
 	for _, snap := range snaps {
@@ -570,7 +573,11 @@ func (p *Panel) benefitsLog(w http.ResponseWriter, r *http.Request) {
 	}
 	uid := strings.TrimSpace(q.Get("uid"))
 	if ref := strings.TrimSpace(q.Get("ref")); ref != "" {
-		p.rememberBenefitRefs(p.cfg.Pool.List())
+		// 引用表随每次快照刷新（benefitsOverview/tasksOverview）整体重建；这里只
+		// 做一次轻量校验，避免为解析一个短引用重建全池 Status。
+		if p.benefitUIDForRef(ref) == "" {
+			p.rememberBenefitRefs(p.cfg.Pool.List())
+		}
 		fullUID := p.benefitUIDForRef(ref)
 		if fullUID == "" {
 			writeErr(w, http.StatusBadRequest, "unknown account reference")

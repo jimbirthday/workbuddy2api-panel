@@ -1519,7 +1519,21 @@ func (p *Panel) usageSave(w http.ResponseWriter, r *http.Request) {
 // 逐个账号向上游查（并发有上限，避免瞬时打满上游限流），失败只在对应账号上
 // 标 error，不影响其它账号——一个号 token 失效不该让整页空白。
 func (p *Panel) packages(w http.ResponseWriter, r *http.Request) {
-	accts := p.cfg.Pool.List()
+	// 只需 uid/昵称/realm 与凭证引用：用 TaskAccounts 一次性取引用，避免为每个
+	// 账号构建完整 Status（冷却/限流模型/成本台账，470 号约 250KiB 分配）。
+	tas := p.cfg.Pool.TaskAccounts(true)
+	accts := make([]struct {
+		UID      string
+		Nickname string
+		Realm    string
+	}, 0, len(tas))
+	for _, ta := range tas {
+		accts = append(accts, struct {
+			UID      string
+			Nickname string
+			Realm    string
+		}{ta.UID, ta.Auth.NicknameValue(), ta.Auth.Realm()})
+	}
 	type row struct {
 		UID      string                   `json:"uid"`
 		Nickname string                   `json:"nickname"`

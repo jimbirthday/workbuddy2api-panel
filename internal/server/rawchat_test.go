@@ -39,7 +39,7 @@ func (rt *rawTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	}, nil
 }
 
-// TestRawChatPassthroughByteForByte POST /v2/chat 的上游响应必须逐字节透传：
+// TestRawChatPassthroughByteForByte POST /v2/chat/completions 的上游响应必须逐字节透传：
 // 状态码、自定义响应头、body 都不能被网关转换。body 用非 OpenAI 兼容的
 // 原始 JSON（含 reasoning_content 等上游原字段），验证网关不做任何重建。
 func TestRawChatPassthroughByteForByte(t *testing.T) {
@@ -60,7 +60,7 @@ func TestRawChatPassthroughByteForByte(t *testing.T) {
 
 	in := `{"model":"kimi-k3.1-pro","stream":false,"messages":[{"role":"user","content":"你是谁"}]}`
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest("POST", "/v2/chat", strings.NewReader(in))
+	req := httptest.NewRequest("POST", "/v2/chat/completions", strings.NewReader(in))
 	h.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
@@ -97,7 +97,7 @@ func TestRawChatUpstreamBusinessErrorPassthrough(t *testing.T) {
 	h := NewHandler(Config{Pool: p, Upstream: up})
 
 	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v2/chat", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v2/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body.String())
 	}
@@ -115,7 +115,7 @@ func TestRawChatTransportErrorCountsFailure(t *testing.T) {
 	h := NewHandler(Config{Pool: p, Upstream: up})
 
 	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v2/chat", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v2/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
 	if rec.Code != http.StatusBadGateway {
 		t.Fatalf("code=%d body=%s (transport error must be 502)", rec.Code, rec.Body.String())
 	}
@@ -144,7 +144,7 @@ func TestRawChatStripsConnectionNominatedHopHeaders(t *testing.T) {
 	h := NewHandler(Config{Pool: p, Upstream: up})
 
 	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v2/chat", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v2/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body.String())
 	}

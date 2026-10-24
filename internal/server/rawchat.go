@@ -1,4 +1,4 @@
-// rawchat.go 「完全透传」聊天端点：POST /v2/chat。
+// rawchat.go 「完全透传」聊天端点：POST /v2/chat/completions。
 //
 // 与 /v1/chat/completions 的本质区别：
 //   - 请求体不做任何改写（不注入 prompt_cache_key、不规范化 effort/role、不重写
@@ -27,7 +27,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
-// rawChat 处理 POST /v2/chat：选号后把请求原样转发上游，响应原样透传。
+// rawChat 处理 POST /v2/chat/completions：选号后把请求原样转发上游，响应原样透传。
 func (h *Handler) rawChat(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	clientIP := upstream.ExtractClientIP(r)

@@ -144,7 +144,7 @@ func NewHandler(cfg Config) *Handler {
 	}
 	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
-	h.mux.HandleFunc("POST /v2/chat", h.withAuth(h.rawChat))
+	h.mux.HandleFunc("POST /v2/chat/completions", h.withAuth(h.rawChat))
 	h.mux.HandleFunc("POST /v1/responses", h.withProtocolAuth(protoResponses, h.responses))
 	h.mux.HandleFunc("POST /v1/messages", h.withProtocolAuth(protoMessages, h.messages))
 	h.mux.HandleFunc("POST /v1/messages/count_tokens", h.withProtocolAuth(protoMessages, h.countMessagesTokens))

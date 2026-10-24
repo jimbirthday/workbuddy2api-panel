@@ -2,6 +2,7 @@ package reqlog
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"math/rand"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 func TestRecorderMetricsAndRecent(t *testing.T) {
@@ -745,5 +747,120 @@ func TestReadArchiveFastPathFallsBackOnNonASCIIField(t *testing.T) {
 		if got[i].RequestID != want[i].RequestID {
 			t.Fatalf("row[%d]=%s want %s", i, got[i].RequestID, want[i].RequestID)
 		}
+	}
+}
+
+// TestEventErrorFieldsJSONRoundTrip 排障字段必须按 JSON tag 序列化且零值省略，
+// 归档读取后原样恢复（ErrorMsg 在 Record 入队前已截断到 300 字节）。
+func TestEventErrorFieldsJSONRoundTrip(t *testing.T) {
+	full := Event{
+		ErrorCode:      "rate_limit_exceeded",
+		ErrorKind:      "soft_rate",
+		UpstreamStatus: 429,
+		ErrorMsg:       "upstream says slow down",
+		ModelBlocked:   true,
+	}
+	raw, err := json.Marshal(full)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"error_code", "error_kind", "upstream_status", "error_msg", "model_blocked"} {
+		if _, ok := got[key]; !ok {
+			t.Fatalf("field %s omitted: %s", key, raw)
+		}
+	}
+	if got["error_code"] != "rate_limit_exceeded" || got["error_kind"] != "soft_rate" ||
+		got["upstream_status"] != float64(429) || got["model_blocked"] != true {
+		t.Fatalf("roundtrip values = %v", got)
+	}
+
+	// 零值字段全部省略。
+	zero, err := json.Marshal(Event{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"error_code", "error_kind", "upstream_status", "error_msg", "model_blocked"} {
+		if bytes.Contains(zero, []byte(`"`+key+`"`)) {
+			t.Fatalf("zero-value %s should be omitted: %s", key, zero)
+		}
+	}
+
+	// 归档往返：写入文件再读出，字段保持一致。
+	dir := t.TempDir()
+	path := filepath.Join(dir, "requests-2026-10-24.jsonl")
+	line, _ := json.Marshal(full)
+	if err := os.WriteFile(path, append(line, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := readFileLimit(path, Filter{}, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].ErrorCode != full.ErrorCode || rows[0].ErrorKind != full.ErrorKind ||
+		rows[0].UpstreamStatus != full.UpstreamStatus || rows[0].ErrorMsg != full.ErrorMsg || !rows[0].ModelBlocked {
+		t.Fatalf("archive roundtrip = %+v", rows)
+	}
+}
+
+// TestRecorderTruncatesErrorMsg 超长错误原文在 Record 入队/落盘前按 UTF-8 rune
+// 边界截断到 300 字节，不能切出半截多字节序列。
+func TestRecorderTruncatesErrorMsg(t *testing.T) {
+	// 350 个 3 字节汉字 + 尾标：确保截断点落在多字节字符中间。
+	long := strings.Repeat("错", 350)
+	r := New(Config{Enabled: true, Dir: t.TempDir(), MaxBytes: 1 << 20, RetentionDays: 7})
+	r.Record(Event{RequestID: "long", Status: 500, Outcome: OutcomeHTTPError, ErrorCode: "upstream_parse", ErrorMsg: long})
+	r.Close()
+
+	rows, err := r.ReadArchive(10, Filter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("rows=%d want 1", len(rows))
+	}
+	got := rows[0].ErrorMsg
+	if len(got) > 300 {
+		t.Fatalf("error_msg len=%d want <=300", len(got))
+	}
+	if !strings.HasPrefix(long, got) {
+		t.Fatalf("error_msg must be a prefix of the original: %q", got)
+	}
+	if !utf8.ValidString(got) {
+		t.Fatalf("error_msg is not valid UTF-8: %q", got)
+	}
+	// 内存指标同样存截断后的值。
+	recent := r.Snapshot().Recent
+	if len(recent) != 1 || recent[0].ErrorMsg != got {
+		t.Fatalf("recent error_msg not truncated: %+v", recent)
+	}
+}
+
+// TestArchiveFilterByErrorCode error_code 支持包含匹配（大小写不敏感）。
+func TestArchiveFilterByErrorCode(t *testing.T) {
+	dir := t.TempDir()
+	r := New(Config{Enabled: true, Dir: dir, MaxBytes: 1 << 20, RetentionDays: 7})
+	base := time.Now().Add(-time.Minute)
+	r.Record(Event{Time: base, RequestID: "rate", Outcome: OutcomeHTTPError, Status: 429, ErrorCode: "rate_limit_exceeded"})
+	r.Record(Event{Time: base.Add(time.Second), RequestID: "blocked", Outcome: OutcomeHTTPError, Status: 400, ErrorCode: "content_blocked"})
+	r.Close()
+
+	got, err := r.ReadArchive(10, Filter{ErrorCode: "rate"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].RequestID != "rate" {
+		t.Fatalf("error_code filter = %+v", got)
+	}
+	// 大小写不敏感。
+	got, err = r.ReadArchive(10, Filter{ErrorCode: "RATE_LIMIT"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].RequestID != "rate" {
+		t.Fatalf("case-insensitive error_code filter = %+v", got)
 	}
 }

@@ -20,6 +20,7 @@ func requestLogFilter(r *http.Request) reqlog.Filter {
 		Model:     q.Get("model"),
 		ClientIP:  q.Get("client_ip"),
 		UserAgent: q.Get("user_agent"),
+		ErrorCode: q.Get("error_code"),
 		From:      parseTimeParam(q.Get("from")),
 		To:        parseTimeParam(q.Get("to")),
 	}

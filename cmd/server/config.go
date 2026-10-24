@@ -48,6 +48,19 @@ type Config struct {
 	} `json:"panel"`
 
 	Logging struct {
+		// Level 日志级别：debug|info|warn|error，缺省 info；非法值回落 info。
+		// 面板保存配置后经 livecfg 快照热生效（logx.SetLevel）。
+		Level string `json:"level"`
+		// File 持久化日志文件路径；空 = 仅 stdout/stderr（面板镜像仍照常）。
+		// 非空时标准 log 与 chat 表格日志双路追加到该文件并按大小轮转。
+		File string `json:"file"`
+		// FileMaxMB 持久化日志单文件大小上限（MiB），缺省 16；<=0 回落默认。
+		FileMaxMB int `json:"file_max_mb"`
+		// DebugEnabled 请求级脱敏抓包开关，缺省 false；命中请求把入站/错误帧/
+		// 修复片段写到独立文件（按 rid 定位），零命中时零开销。
+		DebugEnabled bool `json:"debug_enabled"`
+		// DebugUID 只抓该 uid（支持 8 位前缀或完整 uid）；空 = 全部。
+		DebugUID string `json:"debug_uid"`
 		// RequestArchiveEnabled 请求元数据 JSONL 归档开关，缺省 true。
 		RequestArchiveEnabled bool `json:"request_archive_enabled"`
 		// RequestRetentionDays 归档保留天数，缺省 7；<=0 回落默认。
@@ -282,6 +295,8 @@ func Default() *Config {
 	c.Cooldown.SoftRateMax = "2h"
 	c.Server.ReadTimeout = "300s"
 	c.Panel.PackageDetailLimit = 5
+	c.Logging.Level = "info"
+	c.Logging.FileMaxMB = 16
 	c.Logging.RequestArchiveEnabled = true
 	c.Logging.RequestRetentionDays = 7
 	c.Logging.RequestArchiveMaxMB = 100
@@ -449,6 +464,15 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("WB2A_STATE_FILE"); v != "" {
 		c.StateFile = v
 	}
+	if v := os.Getenv("WB2A_LOG_LEVEL"); v != "" {
+		c.Logging.Level = v
+	}
+	if v := os.Getenv("WB2A_LOG_FILE"); v != "" {
+		c.Logging.File = v
+	}
+	if v := os.Getenv("WB2A_DEBUG_UID"); v != "" {
+		c.Logging.DebugUID = v
+	}
 	if v := os.Getenv("WB2A_SOFT_RATE"); v != "" {
 		c.Cooldown.SoftRate = v
 	}
@@ -519,6 +543,10 @@ func (c *Config) normalize() error {
 	if c.Panel.PackageDetailLimit <= 0 {
 		c.Panel.PackageDetailLimit = 5
 	}
+	if c.Logging.FileMaxMB <= 0 {
+		c.Logging.FileMaxMB = 16
+	}
+	c.Logging.Level = normalizeLogLevel(c.Logging.Level)
 	if c.Logging.RequestRetentionDays <= 0 {
 		c.Logging.RequestRetentionDays = 7
 	}
@@ -812,4 +840,19 @@ func checkHourRange(field, switchKey string, hours []int) error {
 		}
 	}
 	return nil
+}
+
+// normalizeLogLevel 把日志级别归一化到 debug/info/warn/error 之一；空串或非法值
+// 回落 info（与 Default() 的缺省一致）。级别仅作日志过滤，不因拼写错误让启动失败。
+func normalizeLogLevel(level string) string {
+	switch strings.ToLower(strings.TrimSpace(level)) {
+	case "debug":
+		return "debug"
+	case "warn", "warning":
+		return "warn"
+	case "error":
+		return "error"
+	default:
+		return "info"
+	}
 }

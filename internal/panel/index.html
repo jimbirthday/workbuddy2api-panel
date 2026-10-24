@@ -203,18 +203,51 @@ body {
   border: 1px solid var(--line); border-radius: 7px; color: var(--ink);
   font: 550 12px var(--sans); padding: 3px 24px 3px 9px; cursor: pointer;
 }
-.qprog { display: flex; align-items: center; gap: 12px; padding: 12px 16px 0; }
-.qprog .qbar { flex: 1; height: 4px; border-radius: 3px; background: var(--surface-2); overflow: hidden; }
-.qprog .qbar i { display: block; height: 100%; width: 0; background: var(--accent); border-radius: 3px; transition: width .5s ease; }
-.qprog .note { font-variant-numeric: tabular-nums; white-space: nowrap; }
+/* 进度条改成「条在上、文案在下」两行网格：旧的一行 flex 里 bar 是 flex:1，
+   进度文案每拍都在变长变短（执行中 N / M、当前账号、剩余秒数），条的实际长度
+   就跟着一起伸缩，视觉上像在抖动。分离成两行后 bar 恒为满宽，只有填充比例变。
+   transition 也从 .5s ease 降到 .25s linear：扫描是 500ms 一拍，.5s 缓动意味着
+   条永远处于动画中途，形成持续晃动。 */
+.qprog { display: grid; grid-template-columns: minmax(0, 1fr); gap: 6px; padding: 12px 16px 0; }
+.qprog .qbar { width: 100%; height: 4px; border-radius: 3px; background: var(--surface-2); overflow: hidden; }
+.qprog .qbar i { display: block; height: 100%; width: 0; background: var(--accent); border-radius: 3px;
+  transition: width .25s linear; }
+@media (prefers-reduced-motion: reduce) { .qprog .qbar i { transition: none; } }
+/* 文案固定单行 + 省略号：折行会把进度区高度顶来顶去，多行文本还会挤走下方的列表。 */
+.qprog .note { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-variant-numeric: tabular-nums; }
+.qprog .note[data-warn] { color: var(--warn); }
+/* 队列筛选条：账号多时队列动辄上千行，必须有「只看失败 / 只看未完成」的入口。 */
+.qfilter { display: flex; align-items: center; gap: 6px; padding: 10px 16px 0; flex-wrap: wrap; }
+.qfilter .grow { flex: 1; }
+.qfilter input[type=search] { width: auto; flex: 0 1 200px; padding: 4px 9px; font-size: 12px; border-radius: 6px; }
+.qfilter button[data-qf] {
+  border: 1px solid var(--line-soft); background: var(--surface); color: var(--ink-3);
+  border-radius: 7px; padding: 3px 10px; font: 550 12px var(--sans); cursor: pointer;
+}
+.qfilter button[data-qf]:hover { color: var(--ink); border-color: var(--line-hover); }
+.qfilter button[data-qf][aria-pressed="true"] { background: var(--accent-soft); color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 30%, transparent); }
+/* 队列视口：固定高度内滚动，账号分组头吸顶。此前 #qcList 直接铺在页面里，
+   470 号 × 若干待办会把整页拉到几万像素——既看不完也找不到失败项。 */
+.qviewport { max-height: clamp(320px, 58vh, 760px); overflow: auto; overscroll-behavior: contain;
+  scrollbar-width: thin; outline: none; margin-top: 8px; }
+.qviewport:focus-visible { box-shadow: inset 0 0 0 2px var(--accent); }
 .qgroup { padding: 4px 0 10px; }
 .qgroup + .qgroup { border-top: 1px solid var(--line-soft); }
 .qgroup header {
   display: flex; align-items: baseline; gap: 9px; padding: 10px 16px 6px;
-  background: none; border: none; box-shadow: none;
+  background: var(--surface); border: none; box-shadow: none;
+  position: sticky; top: 0; z-index: 2; cursor: pointer; user-select: none;
 }
+.qgroup header:hover .nm { color: var(--accent); }
+.qgroup header:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.qgroup header .caret { color: var(--ink-3); font-size: 10px; width: 10px; flex: none; }
 .qgroup header .nm { font-weight: 600; font-size: 13.5px; }
 .qgroup header .cnt { font-size: 12px; color: var(--ink-3); font-variant-numeric: tabular-nums; }
+.qgroup.collapsed .qrow { display: none; }
+/* 筛选后一行都没有：给一条解释，不能复用「今日无待办」空态。 */
+.qfilter-empty { padding: 30px 16px; text-align: center; color: var(--ink-3); font-size: 13px; }
 .qrow {
   display: grid; grid-template-columns: 118px 1fr 52px 84px minmax(120px, 240px);
   gap: 10px; align-items: center; padding: 7.5px 16px; font-size: 13px;
@@ -227,6 +260,19 @@ body {
 .qrow .st { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
 .qrow .msg { font-size: 12px; color: var(--ink-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .qrow .msg:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; white-space: normal; overflow: visible; text-overflow: clip; }
+/* 窄屏：五列网格会把任务名压成几个字。改成两行——码/名/状态一行，进度与
+   消息换到下一行；视口高度也收一点，避免小屏一屏只剩三行。 */
+@media (max-width: 760px) {
+  .qrow { grid-template-columns: 88px minmax(0, 1fr) 62px; grid-template-areas: "code name st" "prog prog msg"; row-gap: 3px; padding: 8px 12px; }
+  .qrow .code { grid-area: code; }
+  .qrow .name { grid-area: name; }
+  .qrow .prog { grid-area: prog; text-align: left; color: var(--ink-3); }
+  .qrow .st { grid-area: st; justify-self: end; }
+  .qrow .msg { grid-area: msg; text-align: right; }
+  .qviewport { max-height: 52vh; }
+  .qgroup header { padding: 9px 12px 5px; }
+  .qfilter { padding: 9px 12px 0; }
+}
 .qdot { width: 7px; height: 7px; border-radius: 50%; flex: none; }
 .qdot.done { background: var(--ok); }
 .qdot.run { background: var(--accent); animation: qpulse 1.2s ease-in-out infinite; }
@@ -1360,6 +1406,16 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <div class="qbar"><i id="qBarFill"></i></div>
           <span class="note" id="qProgText"></span>
         </div>
+        <div class="qfilter" id="qcFilters" role="group" aria-label="筛选队列条目" hidden>
+          <input id="qcQ" type="search" placeholder="搜索账号 / 任务" aria-label="搜索队列条目">
+          <button type="button" data-qf="all" aria-pressed="true">全部</button>
+          <button type="button" data-qf="active" aria-pressed="false">未完成</button>
+          <button type="button" data-qf="fail" aria-pressed="false">失败</button>
+          <button type="button" data-qf="done" aria-pressed="false">已完成</button>
+          <span class="grow"></span>
+          <span class="note" id="qcFilterNote" role="status" aria-live="polite"></span>
+          <button type="button" class="xs ghost" id="btnQcCollapseAll" title="折叠/展开所有账号分组">全部折叠</button>
+        </div>
         <div class="hint" id="qcScanFail" role="alert" hidden style="padding: 8px 16px 0; color: var(--bad)"></div>
         <div class="tc-empty" id="tcEmpty">
           <svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
@@ -1370,7 +1426,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <div class="t">还没有扫描过</div>
           <div class="d">扫描已启用的国内个人账号，查看可自动完成的成长任务，再按队列执行。</div>
         </div>
-        <div id="qcList"></div>
+        <div class="qviewport" id="qcScroll" tabindex="0" aria-label="成长任务队列，可上下滚动">
+          <div id="qcList"></div>
+        </div>
       </div>
 
       <div class="box benefits-batches">
@@ -2028,6 +2086,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             <option value="stream_error">流错误</option>
             <option value="interrupted">中断</option>
           </select>
+          <input id="reqErrorCode" type="search" placeholder="按错误码过滤" aria-label="按错误码过滤">
           <span class="trange" id="reqRange"></span>
           <select id="reqLimit" aria-label="读取条数">
             <option value="100" selected>最近 100 条</option>
@@ -2051,7 +2110,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <div class="tbl-wrap req-wrap">
           <table class="acc req cardify">
             <thead><tr>
-              <th>时间</th><th>结果</th><th>Key</th><th>模型</th><th>账号</th>
+              <th>时间</th><th>结果</th><th>错误</th><th>Key</th><th>模型</th><th>账号</th>
               <th>来源 IP</th><th>User-Agent</th>
               <th class="num">耗时</th><th class="num">Token</th><th class="num">积分</th><th>请求 ID</th>
             </tr></thead>

@@ -19,6 +19,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
 )
 
 const (
@@ -96,6 +98,14 @@ type Event struct {
 	CacheMissTokens int64  `json:"cache_miss_tokens,omitempty"`
 	ClientIP        string `json:"client_ip,omitempty"`
 	UserAgent       string `json:"user_agent,omitempty"`
+	// ErrorCode / ErrorKind / UpstreamStatus / ErrorMsg 是请求失败时的排障上下文：
+	// OpenAI 风格错误码、upstream 错误类别、上游 HTTP 状态码与脱敏截断后的错误原文。
+	// ModelBlocked 记录模型级阻塞（pool.ModelBlockStatus.Blocked）。
+	ErrorCode      string `json:"error_code,omitempty"`
+	ErrorKind      string `json:"error_kind,omitempty"`
+	UpstreamStatus int    `json:"upstream_status,omitempty"`
+	ErrorMsg       string `json:"error_msg,omitempty"`
+	ModelBlocked   bool   `json:"model_blocked,omitempty"`
 }
 
 // Filter 用于从归档中筛选最近记录。字符串字段一律「包含」匹配（大小写不敏感），
@@ -108,6 +118,7 @@ type Filter struct {
 	Model     string
 	ClientIP  string
 	UserAgent string
+	ErrorCode string
 	From      time.Time
 	To        time.Time
 }
@@ -115,7 +126,7 @@ type Filter struct {
 // asciiFastPath 判断过滤条件能否走按字节预筛。strings.ToLower 对非 ASCII
 // 字符做 Unicode 映射（长度可能变化），此时必须回退完整解码后比较。
 func (f Filter) asciiFastPath() bool {
-	for _, s := range []string{f.KeyID, f.Account, f.Model, f.ClientIP, f.UserAgent} {
+	for _, s := range []string{f.KeyID, f.Account, f.Model, f.ClientIP, f.UserAgent, f.ErrorCode} {
 		for i := 0; i < len(s); i++ {
 			if s[i] >= 0x80 {
 				return false
@@ -241,6 +252,11 @@ func (r *Recorder) Record(e Event) {
 		} else {
 			e.Outcome = OutcomeHTTPError
 		}
+	}
+	// 错误原文脱敏后仍然可能很长（上游 body 片段）；入队落盘前按 UTF-8 rune 边界
+	// 截断到 300 字节，避免单条错误把归档行撑大。
+	if e.ErrorMsg != "" {
+		e.ErrorMsg = logfmt.Truncate(e.ErrorMsg, 300)
 	}
 	r.mu.Lock()
 	if r.inFlight > 0 {
@@ -417,6 +433,8 @@ func archiveReadCacheKey(limit int, filter Filter) string {
 	b.WriteString(f.ClientIP)
 	b.WriteByte('|')
 	b.WriteString(f.UserAgent)
+	b.WriteByte('|')
+	b.WriteString(f.ErrorCode)
 	b.WriteByte('|')
 	b.WriteString(f.From.UTC().Format(time.RFC3339Nano))
 	b.WriteByte('|')
@@ -980,14 +998,16 @@ type archiveLineFields struct {
 	model     []byte
 	clientIP  []byte
 	userAgent []byte
+	errorCode []byte
 
-	atSet       bool
-	outcomeSet  bool
-	keyIDSet    bool
-	accountSet  bool
-	modelSet    bool
-	clientIPSet bool
-	uaSet       bool
+	atSet        bool
+	outcomeSet   bool
+	keyIDSet     bool
+	accountSet   bool
+	modelSet     bool
+	clientIPSet  bool
+	uaSet        bool
+	errorCodeSet bool
 }
 
 // archiveMatch 表示预筛结果。fallback 意味着该行必须交给 encoding/json
@@ -1083,6 +1103,13 @@ func parseArchiveLineFields(raw []byte) (archiveLineFields, bool) {
 			}
 			out.userAgent, out.uaSet = s, true
 			seen |= 1 << 6
+		case "error_code":
+			s, ok := unquoteSimple(val)
+			if !ok {
+				return archiveLineFields{}, false
+			}
+			out.errorCode, out.errorCodeSet = s, true
+			seen |= 1 << 7
 		}
 		rest = bytesTrimSpace(rest[n:])
 		if len(rest) == 0 {
@@ -1170,6 +1197,17 @@ func (f Filter) matchArchiveFields(v archiveLineFields) archiveMatch {
 			return archiveMatchFallback
 		}
 		if !containsFoldLowerASCII(v.userAgent, f.UserAgent) {
+			return archiveMatchNo
+		}
+	}
+	if f.ErrorCode != "" {
+		if !v.errorCodeSet {
+			return archiveMatchNo
+		}
+		if !isASCII(v.errorCode) {
+			return archiveMatchFallback
+		}
+		if !containsFoldLowerASCII(v.errorCode, f.ErrorCode) {
 			return archiveMatchNo
 		}
 	}
@@ -1371,6 +1409,7 @@ func (f Filter) normalized() Filter {
 	f.Model = strings.ToLower(f.Model)
 	f.ClientIP = strings.ToLower(f.ClientIP)
 	f.UserAgent = strings.ToLower(f.UserAgent)
+	f.ErrorCode = strings.ToLower(f.ErrorCode)
 	return f
 }
 
@@ -1400,6 +1439,9 @@ func (f Filter) matchNormalized(e Event) bool {
 		return false
 	}
 	if !containsFoldLower(e.UserAgent, f.UserAgent) {
+		return false
+	}
+	if !containsFoldLower(e.ErrorCode, f.ErrorCode) {
 		return false
 	}
 	if !f.From.IsZero() && e.Time.Before(f.From) {

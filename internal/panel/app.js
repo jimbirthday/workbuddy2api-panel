@@ -41,7 +41,7 @@ let refTimer = null;
 /* 视图级筛选状态（模块级声明放在文件顶部，避免顶层 go() 早于声明执行时踩 TDZ）。 */
 let mdFilter = { q: '', realm: '', cap: '', effort: '', promo: '', sort: 'default' };
 let mdAll = [], mdProbes = {}, mdProbeOf = () => undefined;
-let reqFilter = { q: '', outcome: '', key: '' };
+let reqFilter = { q: '', outcome: '', key: '', error_code: '' };
 let reqEntries = [];
 let reqPage = 1, reqPageSize = 50;
 // 过滤结果缓存挂在函数属性上：区域切片测试只求值 renderRequestTable，
@@ -2127,6 +2127,10 @@ function reqMatch(e, f) {
     const key = String(e && e.key_id || '');
     if (f.key === '__empty__' ? key !== '' : key !== f.key) return false;
   }
+  if (f.error_code) {
+    const code = String(e && e.error_code || '');
+    if (!code.toLowerCase().includes(String(f.error_code).toLowerCase())) return false;
+  }
   if (f.q) {
     const text = [e && e.client_ip, e && e.user_agent, e && e.model, e && e.account, e && e.request_id]
       .filter(Boolean).join(' ').toLowerCase();
@@ -2167,7 +2171,7 @@ function renderRequestTable() {
     renderRequestTable.cache = null;
   }
   renderRequestTable.src = reqEntries;
-  const fsig = (reqEntries || []).length + '|' + reqFilter.q + '|' + reqFilter.outcome + '|' + reqFilter.key;
+  const fsig = (reqEntries || []).length + '|' + reqFilter.q + '|' + reqFilter.outcome + '|' + reqFilter.key + '|' + reqFilter.error_code;
   if (!renderRequestTable.cache || fsig !== renderRequestTable.cache.sig) {
     renderRequestTable.cache = { sig: fsig, rows: reqEntries.filter(e => reqMatch(e)) };
   }
@@ -2184,7 +2188,7 @@ function renderRequestTable() {
   if (errors.metrics || errors.archive) {
     const msg = [errors.metrics && '指标读取失败：' + errors.metrics.message,
       errors.archive && '归档读取失败：' + errors.archive.message].filter(Boolean).join('；');
-    tb.innerHTML = '<tr><td colspan="11" class="empty err">' + esc(msg) + '</td></tr>';
+    tb.innerHTML = '<tr><td colspan="12" class="empty err">' + esc(msg) + '</td></tr>';
     if ($('reqCount')) { $('reqCount').textContent = msg; $('reqCount').className = 'note err'; }
     syncRequestKeyOptions();
     return;
@@ -2197,6 +2201,7 @@ function renderRequestTable() {
     return '<tr title="' + esc(requestLogText(e)) + '">' +
       '<td class="num" data-label="时间">' + esc(when) + '</td>' +
       '<td data-label="结果">' + reqOutcomeTag(e) + '</td>' +
+      '<td data-label="错误">' + reqErrorCell(e) + '</td>' +
       '<td data-label="Key">' + reqKeyText(e) + '</td>' +
       '<td data-label="模型">' + esc(e && e.model || '—') + '</td>' +
       '<td data-label="账号">' + esc(e && e.account || '—') + '</td>' +
@@ -2207,7 +2212,7 @@ function renderRequestTable() {
       '<td class="num" data-label="积分">' + reqCreditCell(e) + '</td>' +
       '<td data-label="请求 ID">' + (rid ? '<span class="clip rid" title="' + esc(rid) + '">' + esc(rid) + '</span>' : '<span class="muted">—</span>') + '</td>' +
       '</tr>';
-  }).join('') || '<tr><td colspan="11" class="empty">' +
+  }).join('') || '<tr><td colspan="12" class="empty">' +
       (reqEntries.length ? '没有符合当前筛选条件的请求记录' : '暂无请求记录') + '</td></tr>';
 
   const filtered = list.length !== reqEntries.length;
@@ -2227,6 +2232,16 @@ function renderRequestTable() {
   const sizeSel = $('reqPageSize');
   if (sizeSel) sizeSel.value = String(reqPageSize);
   syncRequestKeyOptions();
+}
+
+/* 错误列显示 error_code（无则回落 error_kind）；有 error_msg 时悬停显示完整原文。 */
+function reqErrorCell(e) {
+  const code = e && e.error_code || '';
+  const kind = e && e.error_kind || '';
+  const label = code || kind;
+  if (!label) return '<span class="muted">-</span>';
+  const msg = e && e.error_msg ? String(e.error_msg) : '';
+  return '<span class="tag bad"' + (msg ? ' title="' + esc(msg) + '"' : '') + '>' + esc(label) + '</span>';
 }
 
 /* Key 列只显示归档里的 key_id（身份标签），从不读取或回显密钥原文。 */
@@ -2265,6 +2280,12 @@ const reqQEl = $('reqQ');
 if (reqQEl) reqQEl.oninput = () => {
   clearTimeout(reqQTimer);
   reqQTimer = setTimeout(() => { reqFilter.q = reqQEl.value.trim(); reqPage = 1; renderRequestTable(); }, 150);
+};
+let reqErrorTimer = null;
+const reqErrorEl = $('reqErrorCode');
+if (reqErrorEl) reqErrorEl.oninput = () => {
+  clearTimeout(reqErrorTimer);
+  reqErrorTimer = setTimeout(() => { reqFilter.error_code = reqErrorEl.value.trim(); reqPage = 1; renderRequestTable(); }, 150);
 };
 const reqOutcomeEl = $('reqOutcome');
 if (reqOutcomeEl) reqOutcomeEl.onchange = () => {
@@ -2360,6 +2381,7 @@ function requestExportQuery() {
   q.set('limit', (limitEl && limitEl.value) || 100);
   if (reqFilter.outcome) q.set('outcome', reqFilter.outcome);
   if (reqFilter.key) q.set('key_id', reqFilter.key === '__empty__' ? '' : reqFilter.key);
+  if (reqFilter.error_code) q.set('error_code', reqFilter.error_code);
   return q;
 }
 if ($('btnReqExportCsv')) $('btnReqExportCsv').onclick = () => withExportBusy($('btnReqExportCsv'), async () => {
@@ -3623,6 +3645,31 @@ let scanReqSeq = 0;
 // lastScanRenderSeq 记录本页已渲染的扫描结果代次：reattach 每 5 秒访问
 // scan_status 时，同一结果只渲染一次，避免滚动位置丢失和重复 toast。
 let lastScanRenderSeq = null;
+/* setQBar 是进度条唯一写入口。
+   抖动根因有两类，都在这里收口：
+   1) 同一轮里分子分母会换口径（预扫 3/10 → 执行 0/250；scan_status 与
+      tasks/queue 两路轮询交替上报），宽度于是 30% → 0% → 2% 来回跳。给每轮
+      一个 key，同 key 内只增不减。
+   2) 百分比相同也重写 style.width 会重启 CSS 过渡，视觉上一直「在动」。
+      相同值直接跳过。 */
+let qBarKey = '', qBarPct = -1;
+// 一位小数、整数不带小数点：两位小数会让条在 0.01% 级别持续微动，整数又
+// 让 470 个账号的进度看起来一跳 1%（长时间不动）。
+function qBarText(pct) {
+  const r = Math.round(pct * 10) / 10;
+  return (Number.isInteger(r) ? String(r) : r.toFixed(1)) + '%';
+}
+function setQBar(pct, key) {
+  const fill = $('qBarFill');
+  const next = Math.max(0, Math.min(100, Number(pct) || 0));
+  if (key !== qBarKey) { qBarKey = key; qBarPct = -1; }
+  const shown = Math.max(qBarPct, next);
+  qBarPct = shown;
+  const txt = qBarText(shown);
+  if (fill && fill.style && fill.style.width !== txt) fill.style.width = txt;
+}
+function resetQBar() { qBarKey = ''; qBarPct = -1; }
+
 // 扫描结果 → 分组条目（无执行状态）
 function groupItems(d) {
   const groups = [];
@@ -3679,14 +3726,13 @@ function renderScanResult(d) {
 // 耗时；进度文本必须常驻在页面上（不能只放按钮 title，触屏无法悬停）。
 function setScanProgress(d, running) {
   const prog = $('qProg');
-  const bar = $('qBarFill');
   const text = $('qProgText');
   if (!prog) return;
   prog.hidden = !running;
-  if (!running) return;
+  if (!running) { resetQBar(); return; }
   const done = Number(d.done || 0), total = Number(d.total || 0);
-  const pct = total ? Math.min(100, Math.max(0, done / total * 100)) : 0;
-  if (bar && bar.style) bar.style.width = pct.toFixed(1) + '%';
+  // 扫描轮次的 key 用 seq：重扫是新的一轮，进度条必须能从 0 重新长起来。
+  setQBar(total ? done / total * 100 : 0, 'scan:' + String(d.seq || ''));
   if (!text) return;
   const cur = String(d.current_uid || '');
   const sec = Number(d.elapsed_sec || 0);
@@ -3705,7 +3751,7 @@ function startScanPolling() {
   if (!b) return;
   // 已有排队中的轮询链时不要重复开链；在途请求可能是上一代（已 stop），
   // 允许新代次继续，旧响应会由 scanPollSeq 丢弃。
-  if (scanTimer) return;
+  if (typeof scanTimer !== 'undefined' && scanTimer) return;
   b.disabled = true; b.textContent = '扫描中…';
   stopScanPolling();
   const seq = scanPollSeq;
@@ -3865,6 +3911,93 @@ function queueSig(groups) {
   return parts.join('\x1f');
 }
 let queueRenderSig = '';
+// 队列视图状态：筛选 + 折叠。账号多时一轮队列就是几千行，全靠滚动「看不完」；
+// 筛选只影响 DOM，不重算队列——服务端 items 才是权威数据。
+let queueFilter = 'all';
+// queueQuery 是筛选条搜索词（只影响视图，不发请求）。
+let queueQuery = '';
+// lastQueueGroups / lastQueueProgress 保存最近一次完整数据：筛选按钮与折叠
+// 只改视图，必须能就地重绘而不重新请求（轮询期间的点击否则会丢一拍照）。
+let lastQueueGroups = [];
+let lastQueueProgress = null;
+// queueCollapsed 记录被折叠的账号分组（uid）。默认全展开：折叠是压缩视图的
+// 手段，不该成为第二次打开页面时的意外状态。
+const queueCollapsed = new Set();
+const QF_LABEL = { all: '全部', active: '未完成', fail: '失败', done: '已完成' };
+// 搜索词按空格分词 AND，匹配任务码、展示名与失败原因：470 个账号要找某一条
+// 失败，只有状态筛选仍然要翻很多屏。
+function qMatchQuery(it, words) {
+  if (!words.length) return true;
+  const text = [it.code, GROWTH_TITLES[it.code] || '', it.message || '', it.nick || '']
+    .join(' ').toLowerCase();
+  return words.every(w => text.indexOf(w) >= 0);
+}
+function qFilterMatch(it, words) {
+  if (queueFilter === 'active') { if (it.status === 'done' || it.status === 'skipped') return false; }
+  else if (queueFilter === 'fail') { if (it.status !== 'error') return false; }
+  else if (queueFilter === 'done') { if (it.status !== 'done' && it.status !== 'skipped') return false; }
+  return qMatchQuery(it, words || []);
+}
+// qFilteredGroups 按当前筛选裁掉行与空分组。返回 {groups, shown, total}：
+// 两个计数都要给 UI——只报「命中 N 项」而不给分母，用户仍不知道还剩多少没看。
+function qFilteredGroups(groups) {
+  const total = groups.reduce((n, g) => n + g.rows.length, 0);
+  const words = String(queueQuery || '').toLowerCase().split(/\s+/).filter(Boolean);
+  if (queueFilter === 'all' && !words.length) return { groups, shown: total, total };
+  let shown = 0;
+  const out = [];
+  for (const g of groups) {
+    // 账号名本身命中时保留该账号的全部条目：搜索「某人」的意图是看他所有待办，
+    // 而不是只留下昵称字段能匹配上的行。
+    const nickHit = words.length && g.nick && words.every(w => String(g.nick).toLowerCase().indexOf(w) >= 0);
+    const rows = nickHit ? g.rows.slice() : g.rows.filter(it => qFilterMatch(it, words));
+    if (!rows.length) continue;
+    shown += rows.length;
+    out.push({ uid: g.uid, nick: g.nick, rows });
+  }
+  return { groups: out, shown, total };
+}
+function qGroupHTML(g) {
+  const collapsed = queueCollapsed.has(g.uid);
+  const uid = String(g.uid || '');
+  return '<div class="qgroup' + (collapsed ? ' collapsed' : '') + '" data-qgroup="' + esc(uid) + '">' +
+    '<header tabindex="0" role="button" aria-expanded="' + (collapsed ? 'false' : 'true') + '"' +
+    ' title="点击折叠/展开该账号">' +
+    '<span class="caret" aria-hidden="true">' + (collapsed ? '▸' : '▾') + '</span>' +
+    '<span class="nm">' + esc(g.nick || uid.slice(0, 12)) + '</span>' +
+    '<span class="cnt">' + g.rows.length + ' 项待办</span></header>' +
+    g.rows.map(qrowHTML).join('') + '</div>';
+}
+// qViewSig 是「本次应渲染成什么样」的签名：数据 + 筛选 + 折叠三者任一变化才
+// 需要重写列表。折叠/筛选都只改视图，不参与后端数据比较。
+function qViewSig(groups) {
+  return queueSig(groups) + '\x1e' + queueFilter + '\x1e' + queueQuery + '\x1e' +
+    Array.from(queueCollapsed).sort().join(',');
+}
+// qCountsAndUI 由 lastQueueGroups 现算计数并刷新筛选条：折叠一条分组不需要
+// 任何数据变化，但也必须让「显示 N / M」与按钮态跟上。
+function qCountsAndUI() {
+  const f = qFilteredGroups(lastQueueGroups);
+  setText('qcSummary', f.total + ' 项');
+  syncQcFilterUI(f.shown, f.total);
+}
+// syncQcFilterUI 只改按钮的按下态与计数文案，不碰列表（列表由 renderQueue 写）。
+function syncQcFilterUI(shown, total) {
+  if (typeof document !== 'undefined' && document && typeof document.querySelectorAll === 'function') {
+    document.querySelectorAll('#qcFilters button[data-qf]').forEach(b => {
+      b.setAttribute('aria-pressed', b.dataset.qf === queueFilter ? 'true' : 'false');
+    });
+  }
+  const note = $('qcFilterNote');
+  if (note) {
+    const narrowed = queueFilter !== 'all' || !!queueQuery;
+    note.textContent = narrowed
+      ? '显示 ' + shown + ' / ' + total + ' 项' + (queueFilter === 'all' ? '' : '（' + QF_LABEL[queueFilter] + '）')
+      : shown + ' 项';
+  }
+  const btn = $('btnQcCollapseAll');
+  if (btn) btn.textContent = queueCollapsed.size ? '全部展开' : '全部折叠';
+}
 function renderQueue(groups, progress, emptyTitle, emptyDesc) {
   groups = Array.isArray(groups) ? groups : [];
   const empty = $('tcEmpty'), list = $('qcList');
@@ -3881,20 +4014,37 @@ function renderQueue(groups, progress, emptyTitle, emptyDesc) {
     if (list) list.innerHTML = '';
     const prog = $('qProg'); if (prog) prog.hidden = true;
     setText('qcSummary', '');
+    // 空队列时收起筛选条与视口：没有条目可筛，留着只会和空态文案抢注意力。
+    const flt = $('qcFilters'); if (flt) flt.hidden = true;
+    const vp = $('qcScroll'); if (vp) vp.hidden = true;
+    lastQueueGroups = [];
+    lastQueueProgress = null;
     queueRenderSig = '';
     return;
   }
   if (empty) empty.style.display = 'none';
-  const sig = queueSig(groups);
-  const total = groups.reduce((n, g) => n + g.rows.length, 0);
+  const fltBar = $('qcFilters'); if (fltBar) fltBar.hidden = false;
+  const vpBox = $('qcScroll'); if (vpBox) vpBox.hidden = false;
+  lastQueueGroups = groups;
+  lastQueueProgress = progress || null;
+  const f = qFilteredGroups(groups);
+  const sig = qViewSig(groups);
   if (list && (sig !== queueRenderSig || !list.childNodes || !list.childNodes.length)) {
-    list.innerHTML = groups.map(g => {
-      return '<div class="qgroup"><header><span class="nm">' + esc(g.nick || String(g.uid || '').slice(0, 12)) + '</span><span class="cnt">' + g.rows.length + ' 项待办</span></header>' +
-        g.rows.map(qrowHTML).join('') + '</div>';
-    }).join('');
+    // 3 秒轮询里任何一行状态变化都会走到这里整块重写；写之前记下滚动位置，
+    // 否则执行中的队列每拍都把视口弹回顶部（看起来像列表在「跳动」）。
+    const box = $('qcScroll');
+    // 只接受真实数值：旧骨架缺 #qcScroll 时 $() 可能返回空/占位对象，
+    // Number(占位) 会抛 "Cannot convert object to primitive value"。
+    const keepTop = box && typeof box.scrollTop === 'number' && box.scrollTop > 0 ? box.scrollTop : 0;
+    list.innerHTML = f.groups.length
+      ? f.groups.map(qGroupHTML).join('')
+      : '<div class="qfilter-empty">当前筛选下没有条目；点「全部」查看完整队列。</div>';
+    if (box && keepTop > 0) { try { box.scrollTop = keepTop; } catch (e) { /* ignore */ } }
     queueRenderSig = sig;
   }
-  setText('qcSummary', total + ' 项');
+  // 顶栏永远报全量（筛选是视图态，不该改变「这一轮要做多少」的口径）；
+  // 「命中 / 总数」放在筛选条上，避免两个数字在同一处互相打架。
+  qCountsAndUI();
   updateProgress(progress);
 }
 // setQueueRunBusy 统一维护「执行全部待办」的禁用态。队列是后台任务：
@@ -3908,28 +4058,35 @@ function setQueueRunBusy(busy) {
 }
 function updateProgress(q) {
   const prog = $('qProg');
-  if (!q) { if (prog) prog.hidden = true; return; }
+  if (!q) { if (prog) prog.hidden = true; resetQBar(); return; }
+  // #qProg 是扫描与队列共用的一个进度条。手动「扫描待办」期间队列轮询可能
+  // 被 reattach 重新拉起来，两路交替写同一个条就成了肉眼可见的来回跳。
+  // 扫描在前台时由它独占，队列只更新列表与计数。
+  if (typeof scanTimer !== 'undefined' && scanTimer) return;
   // 执行队列的预扫阶段：items 尚未产生，进度来自 pre_done/pre_total。
   // 旧实现看到空 items 就直接隐藏进度条，用户会误以为扫描卡住。
+  //
+  // 预扫与执行映射到同一条 0–100%：预扫占前 50%、执行占后 50%。两段各自
+  // 从 0 开始的话，预扫跑到 100% 后执行又从 0% 起步，用户看到的是「进度
+  // 归零」——这是最容易被当成故障的一种跳动。整轮队列用同一个 key（seq），
+  // 配合 setQBar 的单调钳制，任何一拍照都不会回退。
   if (q.phase === 'scan' && Number(q.pre_total || 0) > 0) {
     const pd = Number(q.pre_done || 0), pt = Number(q.pre_total || 0);
     if (prog) prog.hidden = false;
-    const fill = $('qBarFill');
-    if (fill && fill.style) fill.style.width = Math.min(100, Math.round(pd / pt * 100)) + '%';
+    setQBar(pt ? pd / pt * 50 : 0, 'queue:' + String(q.seq || ''));
     const progText = $('qProgText');
     if (progText) progText.textContent = '正在扫描账号 ' + pd + ' / ' + pt + '（读取任务列表）' +
       (q.pre_warn ? ' · ' + q.pre_warn : '');
     return;
   }
   const items = Array.isArray(q.items) ? q.items : null;
-  if (!items) { if (prog) prog.hidden = true; return; }
+  if (!items) { if (prog) prog.hidden = true; resetQBar(); return; }
   const total = items.length;
   const ok = items.filter(it => it.status === 'done').length;
   const bad = items.filter(it => it.status === 'error' || it.status === 'skipped').length;
   const finished = ok + bad;
   if (prog) prog.hidden = false;
-  const fill = $('qBarFill');
-  if (fill && fill.style) fill.style.width = (total ? Math.round(finished / total * 100) : 0) + '%';
+  setQBar(50 + (total ? finished / total * 50 : 0), 'queue:' + String(q.seq || ''));
   const progText = $('qProgText');
   if (!progText) return;
   progText.textContent = (q.running ? '执行中 ' : '已结束 ') +
@@ -3964,6 +4121,64 @@ function groupsFromQueue(items) {
   }
   return Array.from(by.values());
 }
+// 队列筛选 / 折叠的事件委托：列表每次都整块重写，逐个行绑监听会在每拍泄漏；
+// 统一挂在容器上按 data-qf / .qgroup 分发。
+if ($('qcFilters')) $('qcFilters').addEventListener('click', ev => {
+  const btn = ev.target && ev.target.closest ? ev.target.closest('button[data-qf]') : null;
+  if (!btn) return;
+  const next = String(btn.dataset.qf || 'all');
+  if (next === queueFilter) return;
+  queueFilter = next;
+  // 强制重绘：筛选变化时行集合变了，即使 queueSig 未变也必须重写列表。
+  queueRenderSig = '';
+  renderQueue(lastQueueGroups, lastQueueProgress);
+});
+if ($('qcQ')) {
+  // 输入即筛（本地过滤，无需防抖：最多几千行，一次 filter 远快于一次渲染）。
+  $('qcQ').addEventListener('input', ev => {
+    queueQuery = String((ev.target && ev.target.value) || '').trim();
+    queueRenderSig = '';
+    renderQueue(lastQueueGroups, lastQueueProgress);
+  });
+}
+if ($('btnQcCollapseAll')) $('btnQcCollapseAll').onclick = () => {
+  // 一次性折叠/展开全部：展开的判定用「当前有没有折叠项」，与按钮文案同源。
+  if (queueCollapsed.size) queueCollapsed.clear();
+  else for (const g of lastQueueGroups) queueCollapsed.add(g.uid);
+  queueRenderSig = '';
+  renderQueue(lastQueueGroups, lastQueueProgress);
+};
+if ($('qcList')) $('qcList').addEventListener('click', ev => {
+  // 用 closest('.qgroup') 而不是选择器组合 '.qgroup > header'：后者依赖完整
+  // 选择器解析，且行内按钮若嵌进 header 后续会被误判；这里只认同级 header。
+  const grp = ev.target && ev.target.closest ? ev.target.closest('.qgroup') : null;
+  if (!grp) return;
+  const head = grp.firstElementChild;
+  if (!head || !head.matches || !head.matches('header')) return;
+  const uid = grp.dataset ? String(grp.dataset.qgroup || '') : '';
+  if (!uid) return;
+  if (queueCollapsed.has(uid)) queueCollapsed.delete(uid); else queueCollapsed.add(uid);
+  // 只改当前分组，不重排整棵列表：折叠一个大账号时整表重建会让视口跳位。
+  const collapsed = queueCollapsed.has(uid);
+  if (grp.classList) grp.classList.toggle('collapsed', collapsed);
+  head.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+  const caret = head.querySelector ? head.querySelector('.caret') : null;
+  if (caret) caret.textContent = collapsed ? '▸' : '▾';
+  // 签名与 DOM 同步推进：否则下一拍轮询会认为「列表变了」而整块重写，
+  // 刚折叠好的状态虽然能保住，视口位置却会被写回顶部。
+  queueRenderSig = qViewSig(lastQueueGroups);
+  qCountsAndUI();
+});
+// 折叠/展开也支持键盘（header 是 role=button + tabindex=0）。
+if ($('qcList')) $('qcList').addEventListener('keydown', ev => {
+  if (ev.key !== 'Enter' && ev.key !== ' ') return;
+  const grp = ev.target && ev.target.closest ? ev.target.closest('.qgroup') : null;
+  const head = grp && grp.firstElementChild;
+  if (!head || head !== ev.target) return; // 只在分组头本身聚焦时响应
+  ev.preventDefault();
+  head.click();
+});
+
 function stopQueuePolling(silent) {
   queuePollSeq++;
   queueReqInFlight = false;

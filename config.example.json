@@ -20,6 +20,16 @@
     "package_detail_limit": 5
   },
   "logging": {
+    
+    "level": "info",
+    
+    "file": "",
+    
+    "file_max_mb": 16,
+    
+    "debug_enabled": false,
+    
+    "debug_uid": "",
     "request_archive_enabled": true,
     "request_retention_days": 7,
     "request_archive_max_mb": 100,

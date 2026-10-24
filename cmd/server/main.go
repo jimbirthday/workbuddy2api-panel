@@ -22,6 +22,8 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/activity"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/logfile"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/logx"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/panel"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/redisstore"
@@ -261,9 +263,14 @@ func main() {
 		SoftCooldown:          cfg.SoftRateDur,
 		SanitizeFingerprints:  cfg.Features.SanitizeBlacklistFingerprints,
 		RecordClientInfo:      cfg.Logging.RequestClientInfo,
+		LogLevel:              cfg.Logging.Level,
 		BackgroundModelNames:  cfg.BackgroundModels.Names,
 		BackgroundModelTarget: cfg.BackgroundModels.Target,
 	})
+	// 日志级别（debug/info/warn/error）：装配期读一次，面板保存配置时经 saveConfig
+	// 热生效（logx.SetLevel）。默认 info，debug 打开各包低价值打点。
+	logx.SetLevel(cfg.Logging.Level)
+
 	// 用量记录器：与 state 文件同目录，随 state_file 配置一起搬移。
 	// datapath 由 state 文件路径推出，避免再加一个配置项。
 	usagePath := usagePathFor(cfg.StateFile)
@@ -289,6 +296,25 @@ func main() {
 			rs.Dir, cfg.Logging.RequestRetentionDays, cfg.Logging.RequestArchiveMaxMB)
 	} else {
 		log.Printf("[reqlog] 请求指标已启用；JSONL 归档已关闭")
+	}
+
+	// 请求级脱敏抓包（logging.debug_enabled / debug_uid）：仅命中请求把入站/错误帧/
+	// 修复片段写到独立文件，排查偶发坏流时按 rid 定位。默认关闭，零开销。
+	debugLog := server.NewDebugLog(stateSibling(cfg.StateFile, "debug-logs"), cfg.Logging.DebugUID, cfg.Logging.DebugEnabled)
+
+	// 持久化日志文件（logging.file 非空才启用）：标准 log + chat 表格日志双路追加
+	// 到该文件并按大小轮转（logging.file_max_mb）。装配期打开句柄，进程退出 defer Close。
+	var logFileOut io.Writer
+	if cfg.Logging.File != "" {
+		lf, lerr := logfile.New(cfg.Logging.File, int64(cfg.Logging.FileMaxMB)<<20, 3)
+		if lerr != nil {
+			log.Printf("WARN: 持久化日志文件不可用，回落仅控制台/面板: %v", lerr)
+		} else {
+			logFileOut = lf
+			defer lf.Close()
+			log.Printf("[logging] 持久化日志已启用: %s（单文件上限 %d MiB，保留 3 份轮转）",
+				cfg.Logging.File, cfg.Logging.FileMaxMB)
+		}
 	}
 
 	pn := panel.New(panel.Config{
@@ -318,8 +344,13 @@ func main() {
 	// 成长任务队列每日自动执行（与「执行全部待办」同管线）：Sequential 族零点解锁后
 	// 无需手动扫描；hook 返回即启动（异步执行），已在跑时内部跳过。
 	sch.SetGrowthHook(pn.RunGrowthQueueOnce)
-	log.SetOutput(io.MultiWriter(os.Stderr, pn.Logs()))
-	server.SetChatLogOutput(io.MultiWriter(os.Stdout, pn.Logs()))
+	if logFileOut != nil {
+		log.SetOutput(io.MultiWriter(os.Stderr, pn.Logs(), logFileOut))
+		server.SetChatLogOutput(io.MultiWriter(os.Stdout, pn.Logs(), logFileOut))
+	} else {
+		log.SetOutput(io.MultiWriter(os.Stderr, pn.Logs()))
+		server.SetChatLogOutput(io.MultiWriter(os.Stdout, pn.Logs()))
+	}
 
 	h := server.NewHandler(server.Config{
 		Pool:         p,
@@ -340,6 +371,7 @@ func main() {
 		RecordClientInfo: cfg.Logging.RequestClientInfo,
 		// handler 侧第三道闸（global realm）：false（显式逃生门）时不列 global: 模型名。
 		GlobalEnabled: cfg.Global.Enabled,
+		DebugLog:      debugLog,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -559,9 +591,12 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 		SoftCooldown:          newCfg.SoftRateDur,
 		SanitizeFingerprints:  newCfg.Features.SanitizeBlacklistFingerprints,
 		RecordClientInfo:      newCfg.Logging.RequestClientInfo,
+		LogLevel:              newCfg.Logging.Level,
 		BackgroundModelNames:  newCfg.BackgroundModels.Names,
 		BackgroundModelTarget: newCfg.BackgroundModels.Target,
 	})
+	// 日志级别热生效：装配期 log.SetOutput 镜像与 chat 表格输出都不变，只换级别过滤。
+	logx.SetLevel(newCfg.Logging.Level)
 	up.SanitizeFingerprints.Store(newCfg.Features.SanitizeBlacklistFingerprints)
 	p.SetBreaker(newCfg.Pool.BreakerThreshold, newCfg.BreakerCooldownDur, newCfg.BreakerCooldownMaxD)
 	p.SetMaxInFlight(newCfg.Pool.MaxInFlight)

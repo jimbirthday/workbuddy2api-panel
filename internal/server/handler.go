@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"os"
@@ -20,6 +19,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/logx"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/prompt"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
@@ -77,6 +77,10 @@ type Config struct {
 	// 来自 logging.request_client_info（缺省 true）；关闭时 reqlog 事件的来源字段
 	// 保持为空，归档与面板都不出现来源信息。
 	RecordClientInfo bool
+
+	// DebugLog 请求级脱敏抓包器（可选；nil = 关）。开启时只在错误/修复相关
+	// 挂载点落盘，不抓正常出站正文。
+	DebugLog *DebugLog
 }
 
 // loadLive 返回当前运行期快照；Live 为 nil 时用静态字段合成。
@@ -728,7 +732,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				if envelopeOK {
 					envelope.Model = rw.Target
 				}
-				log.Printf("INFO: [server] background model alias: %s -> %s", originalModel, rw.Target)
+				logx.Infof("[server] background model alias: %s -> %s", originalModel, rw.Target)
 			}
 		}
 	}
@@ -749,8 +753,14 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		// 来源在 ServeHTTP 入口采集（此时才知道开关与请求头），此处转交给统计对象，
 		// 让 stdout 流水行与归档事件共用同一份来源值，两处不会漂移。
 		st.clientIP, st.userAgent = tr.clientIP, tr.userAgent
+		st.rid = tr.id
 	}
 	defer st.done()
+
+	// debug 抓包：入站 body（脱敏后）只按需落盘，不抓正常出站正文。
+	if h.cfg.DebugLog != nil && h.cfg.DebugLog.Enabled() {
+		h.cfg.DebugLog.Capture(st.rid, "req_in", body)
+	}
 
 	tried := map[string]bool{}
 	var lastErr error
@@ -1044,7 +1054,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 			if err := acct.SaveAtomic(); err != nil {
 				// 刷新成功但落盘失败：下次启动会用旧 token，必须暴露
-				log.Printf("ERR: [server] chat refresh acct=%s: save auth failed: %v", logfmt.Label(acct.UID, acct.Nickname), err)
+				st.logf("error", "[server] chat refresh acct=%s: save auth failed: %v", logfmt.Label(acct.UID, acct.Nickname), err)
 			}
 		}
 
@@ -1081,7 +1091,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, false, false, attemptStarted, 0)
 				st.status = http.StatusServiceUnavailable
 				lastErr = fmt.Errorf("%w: %v", errUpstreamTimeout, terr)
-				log.Printf("WARN: [server] upstream timeout acct=%s: %v (rotation stopped, account not penalized)",
+				st.logf("warn", "[server] upstream timeout acct=%s: %v (rotation stopped, account not penalized)",
 					logfmt.Label(acct.UID, acct.Nickname), terr)
 				break
 			}
@@ -1096,7 +1106,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 不是账号的问题——喂连败计数会让健康号 5 次后被临时踢出选号池 10 分钟，
 			// 多号池表现成「可用号越来越少」。跳过 NoteFailures 与粘性解绑，直接止损。
 			if r.Context().Err() != nil {
-				log.Printf("INFO: [server] client gone acct=%s: %v (account not penalized)",
+				st.logf("info", "[server] client gone acct=%s: %v (account not penalized)",
 					logfmt.Label(acct.UID, acct.Nickname), terr)
 				break
 			}
@@ -1129,7 +1139,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				degradedApplied = true
 				delete(tried, acct.UID) // 单账号池也能拿到重试机会（降级重试占一次名额）
 				releaseHeld()
-				log.Printf("content-blocked (likely fingerprint false positive) -> degraded prompt retry")
+				st.logf("info", "content-blocked (likely fingerprint false positive) -> degraded prompt retry")
 				continue
 			}
 			if kind == upstream.ErrContentBlocked {
@@ -1171,7 +1181,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
 				fail(acct.UID)
 				if summary := session.ImageSummary(body); summary != "" {
-					log.Printf("WARN: [server] image rejected acct=%s model=%s conv=%q %s upstream=%s",
+					st.logf("warn", "[server] image rejected acct=%s model=%s conv=%q %s upstream=%s",
 						logfmt.Label(acct.UID, acct.Nickname), bareModel, logfmt.Truncate(convID, 48),
 						summary, logfmt.Truncate(string(respBody), 200))
 				}
@@ -1237,7 +1247,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			st.status = http.StatusBadGateway
 			st.outcome = reqlog.OutcomeHTTPError
 			lastErr = &upstream.Error{Kind: upstream.ErrServer, Status: http.StatusBadGateway, Msg: "upstream returned an empty response"}
-			log.Printf("WARN: [server] upstream returned status %d with empty body acct=%s model=%s body=%s",
+			st.logf("warn", "[server] upstream returned status %d with empty body acct=%s model=%s body=%s",
 				status, logfmt.Label(acct.UID, acct.Nickname), bareModel, logfmt.Truncate(string(respBody), 200))
 			break
 		}
@@ -1249,6 +1259,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 流式：透传结束后立即关闭上游 body，避免 defer 在轮转场景下堆积 fd。
 			st.status = http.StatusOK
 			stats := newChatStatsReaderSince(rc, st.start)
+			stats.setDebugCapture(st.rid, h.cfg.DebugLog)
 			// gateway_hint（SSE）：成功状态 200 已开流，中途 error 帧透传时附加
 			// hint 字段（hintFn 惰性求值——正常流零开销，只有真撞到 error 帧才
 			// 组装请求上下文做判定）。
@@ -1273,6 +1284,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			if held, ok := sErr.(*upstream.ErrStreamHeld); ok {
 				rc.Close()
 				kind := upstream.FrameKind(held.Payload)
+				st.errKind = kind.String()
+				if h.cfg.DebugLog != nil {
+					h.cfg.DebugLog.Capture(st.rid, "upstream_error", []byte(held.Payload))
+				}
 				h.applyErrorPolicy(acct.UID, kind, held.Payload, bareModel, nil)
 				recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, false, false, attemptStarted, 0)
 				fail(acct.UID)
@@ -1286,7 +1301,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 					body = prompt.Rewrite(body, prompt.Degraded)
 					degradedApplied = true
 					delete(tried, acct.UID) // 单账号池也能拿到重试机会（降级重试占一次名额）
-					log.Printf("WARN: [server] stream content-blocked before content -> degraded prompt retry")
+					st.logf("warn", "[server] stream content-blocked before content -> degraded prompt retry")
 					if !rotateBackoff(rotates, r.Context()) {
 						break
 					}
@@ -1295,7 +1310,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				}
 				if kind == upstream.ErrSoftRate && h.poolHasRotatable(tried, bareModel, realm) {
 					lastRateLimited = true
-					log.Printf("WARN: [server] stream acct=%s model=%s: rate-limit frame before content, rotating",
+					st.logf("warn", "[server] stream acct=%s model=%s: rate-limit frame before content, rotating",
 						logfmt.Label(acct.UID, acct.Nickname), bareModel)
 					if !rotateBackoff(rotates, r.Context()) {
 						lastErr = &upstream.Error{Kind: kind, Status: http.StatusTooManyRequests, Msg: held.Payload}
@@ -1304,7 +1319,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 					rotates++
 					continue
 				}
-				log.Printf("WARN: [server] stream acct=%s model=%s: error frame before content kind=%s (no rotate) payload=%s",
+				st.logf("warn", "[server] stream acct=%s model=%s: error frame before content kind=%s (no rotate) payload=%s",
 					logfmt.Label(acct.UID, acct.Nickname), bareModel, kind, logfmt.Truncate(held.Payload, 200))
 				// 正文前且无可换账号：客户端一个字节都还没收到（StreamHint 现在
 				// 延迟提交 200），返回真实状态码 + 上游原文，而不是 200 SSE error 帧
@@ -1343,13 +1358,17 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				st.outcome = reqlog.OutcomeStreamError
 				attemptOK = false
 				writeOpenAIError(w, http.StatusBadGateway, "upstream_parse", "upstream returned an empty stream")
-				log.Printf("WARN: [server] stream acct=%s model=%s: empty upstream stream (200+0 frames)", logfmt.Label(acct.UID, acct.Nickname), bareModel)
+				st.logf("warn", "[server] stream acct=%s model=%s: empty upstream stream (200+0 frames)", logfmt.Label(acct.UID, acct.Nickname), bareModel)
 			case errFrame != "":
 				// 上游以 error 帧报错（6004 限流 / 内容拦截 / 审核）：按帧内容分类并
 				// 处置账号——**不记成功、不清 11102 负缓存、不绑粘性**。此前这些动作
 				// 在流开始前就做了，于是一个正在限流的号被当成健康号，粘性还会把
 				// 整个会话钉在它身上，后续每轮都失败。
 				kind := upstream.FrameKind(errFrame)
+				st.errKind = kind.String()
+				if h.cfg.DebugLog != nil {
+					h.cfg.DebugLog.Capture(st.rid, "upstream_error", []byte(errFrame))
+				}
 				h.applyErrorPolicy(acct.UID, kind, errFrame, bareModel, nil)
 				// 正文已经写出，不能换号；但本次尝试的租约必须释放，且若失败的正是
 				// 粘性号，必须解绑——否则下一轮仍会被 ResolveForModel 钉在这个号上
@@ -1358,7 +1377,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				st.status = http.StatusServiceUnavailable
 				st.outcome = reqlog.OutcomeStreamError
 				attemptOK = false
-				log.Printf("WARN: [server] stream acct=%s model=%s: upstream error frame kind=%s payload=%s",
+				st.logf("warn", "[server] stream acct=%s model=%s: upstream error frame kind=%s payload=%s",
 					logfmt.Label(acct.UID, acct.Nickname), bareModel, kind, logfmt.Truncate(errFrame, 200))
 			case upstream.IsStreamReadError(sErr):
 				// 读上游失败（连接中断 / 空闲看门狗掐流 / 读超时）：**不是**客户端写失败。
@@ -1377,11 +1396,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 					st.outcome = reqlog.OutcomeInterrupted
 					// 客户端已断连不是账号失败：与下面的写失败分支一致，usage 不记错误。
 					attemptOK = true
-					log.Printf("INFO: [server] client gone during stream acct=%s: %v (account not penalized)",
+					st.logf("info", "[server] client gone during stream acct=%s: %v (account not penalized)",
 						logfmt.Label(acct.UID, acct.Nickname), sErr)
 				} else {
 					h.cfg.Pool.NoteFailures(acct.UID)
-					log.Printf("WARN: [server] stream acct=%s model=%s: upstream read error: %v",
+					st.logf("warn", "[server] stream acct=%s model=%s: upstream read error: %v",
 						logfmt.Label(acct.UID, acct.Nickname), bareModel, sErr)
 				}
 			case sErr != nil:
@@ -1416,12 +1435,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			if n := repair.Converted(); n > 0 {
 				// 修复命中：上游本来会把工具调用吐成正文标记，这里已还原成 tool_calls。
 				// 打一行便于运维确认「这次不再空转」以及统计发生率。
-				log.Printf("INFO: [server] stream acct=%s model=%s: repaired %d native tool call(s) from assistant text (tool names known=%d)",
+				st.logf("info", "[server] stream acct=%s model=%s: repaired %d native tool call(s) from assistant text (tool names known=%d)",
 					logfmt.Label(acct.UID, acct.Nickname), bareModel, n, len(declaredTools))
+				stats.flushDebugDSML()
 			} else if m := repair.Seen(); m > 0 {
 				// 识别到标记却没还原：说明判定没过（工具名不合规 / 块内夹带正文 /
 				// 参数畸形）。单独记一行，排障时能一眼区分「没识别到」与「识别到但拒绝」。
-				log.Printf("WARN: [server] stream acct=%s model=%s: saw %d native tool call block(s) but repaired none (tool names known=%d)",
+				st.logf("warn", "[server] stream acct=%s model=%s: saw %d native tool call block(s) but repaired none (tool names known=%d)",
 					logfmt.Label(acct.UID, acct.Nickname), bareModel, m, len(declaredTools))
 			}
 			st.ttfb = stats.TTFB()
@@ -1454,6 +1474,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if payload, isFrame := upstream.IsErrorFrameError(err); isFrame {
 			recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, false, false, attemptStarted, 0)
 			kind := upstream.FrameKind(payload)
+			st.errKind = kind.String()
+			if h.cfg.DebugLog != nil {
+				h.cfg.DebugLog.Capture(st.rid, "upstream_error", []byte(payload))
+			}
 			h.applyErrorPolicy(acct.UID, kind, payload, bareModel, nil)
 			releaseHeld()
 			fail(acct.UID)
@@ -1467,7 +1491,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				body = prompt.Rewrite(body, prompt.Degraded)
 				degradedApplied = true
 				delete(tried, acct.UID) // 单账号池也能拿到重试机会（降级重试占一次名额）
-				log.Printf("WARN: [server] non-stream content-blocked -> degraded prompt retry")
+				st.logf("warn", "[server] non-stream content-blocked -> degraded prompt retry")
 				if !rotateBackoff(rotates, r.Context()) {
 					break
 				}
@@ -1476,7 +1500,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 			if kind == upstream.ErrSoftRate && h.poolHasRotatable(tried, bareModel, realm) {
 				lastRateLimited = true
-				log.Printf("WARN: [server] non-stream acct=%s model=%s: error frame kind=%s before content, rotating",
+				st.logf("warn", "[server] non-stream acct=%s model=%s: error frame kind=%s before content, rotating",
 					logfmt.Label(acct.UID, acct.Nickname), bareModel, kind)
 				if !rotateBackoff(rotates, r.Context()) {
 					lastErr = &upstream.Error{Kind: kind, Status: http.StatusTooManyRequests, Msg: payload}
@@ -1488,7 +1512,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			st.status = http.StatusServiceUnavailable
 			st.outcome = reqlog.OutcomeHTTPError
 			lastErr = &upstream.Error{Kind: kind, Status: http.StatusServiceUnavailable, Msg: payload}
-			log.Printf("WARN: [server] non-stream acct=%s model=%s: error frame kind=%s (no rotate) payload=%s",
+			st.logf("warn", "[server] non-stream acct=%s model=%s: error frame kind=%s (no rotate) payload=%s",
 				logfmt.Label(acct.UID, acct.Nickname), bareModel, kind, logfmt.Truncate(payload, 200))
 			break
 		}
@@ -1505,10 +1529,16 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		// 名单为空时走弱判定（tools 声明在中转环节丢失是常态）。
 		mrepair := upstream.RepairAggregatedResponse(resp, declaredTools, true)
 		if n := mrepair.Converted(); n > 0 {
-			log.Printf("INFO: [server] non-stream model=%s: repaired %d native tool call(s) from assistant text (tool names known=%d)",
+			st.logf("info", "[server] non-stream model=%s: repaired %d native tool call(s) from assistant text (tool names known=%d)",
 				bareModel, n, len(declaredTools))
+			// debug 抓包：只落「这次真的修到了什么」的正文片段（脱敏后），不抓正常正文。
+			if h.cfg.DebugLog != nil && n > 0 {
+				if frag := dsmlRepairFragment(resp); len(frag) > 0 {
+					h.cfg.DebugLog.Capture(st.rid, "dsml_repair", frag)
+				}
+			}
 		} else if m := mrepair.Seen(); m > 0 {
-			log.Printf("WARN: [server] non-stream model=%s: saw %d native tool call block(s) but repaired none (tool names known=%d)",
+			st.logf("warn", "[server] non-stream model=%s: saw %d native tool call block(s) but repaired none (tool names known=%d)",
 				bareModel, m, len(declaredTools))
 		}
 		credit, total, hasCredit := usageCreditTotal(resp)
@@ -1563,6 +1593,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	upstreamMsgPassed := false
 	var ue *upstream.Error
 	if errors.As(lastErr, &ue) {
+		st.errKind = ue.Kind.String()
+		st.upstreamStatus = ue.Status
+		st.errMsg = ue.Msg
 		hint = h.hintOf(ue.Kind, ue.Msg, bareModel, reqHasImage, ue)
 		switch ue.Kind {
 		case upstream.ErrSoftRate:
@@ -1606,6 +1639,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 用 400 而非 503：这是"你选的这个模型当前不可用"，不是"服务端暂时过载"。
 	// 换号重试必然同样失败，客户端不该按可重试错误处理。
 	if modelBlock.Blocked {
+		st.modelBlocked = true
+		if s := strings.TrimSpace(modelBlock.Reason); s != "" && st.errMsg == "" {
+			st.errMsg = s
+		}
 		code = "model_unavailable"
 		// 有上游原文时保留它（含 requestId，用户要拿去向上游反馈），只把"有几个号
 		// 被挡、最早何时解封"这类本地调度信息放进 gateway_hint。
@@ -1624,6 +1661,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	writeOpenAIErrorHint(w, status, code, msg, hint)
 	st.status = status
 	st.outcome = reqlog.OutcomeHTTPError
+	st.errCode = code
+	if st.errMsg == "" {
+		st.errMsg = msg
+	}
 }
 
 // tokensPerSecond 计算吐字速率（token/s），返回 (速率, 是否有意义)。
@@ -1745,7 +1786,7 @@ func rotateBackoff(i int, ctx context.Context) bool {
 		return ctx.Err() == nil
 	}
 	if !sleepCtx(ctx, d) {
-		log.Printf("WARN: [server] rotate backoff aborted: ctx cancelled")
+		logx.Warnf("[server] rotate backoff aborted: ctx cancelled")
 		return false
 	}
 	return true

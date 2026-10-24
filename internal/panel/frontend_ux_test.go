@@ -1128,7 +1128,7 @@ const ctx = {
   reqEntries: [], reqFilter: {}, reqPage: 1, reqPageSize: 50,
   lastLogErrors: {metrics: null, archive: new Error('<img src=x onerror=alert(1)>')},
   esc: s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])),
-  reqMatch: () => true, reqKeyText: () => '', reqOutcomeTag: () => '', reqTokenCell: () => '—', reqCreditCell: () => '—',
+  reqMatch: () => true, reqKeyText: () => '', reqOutcomeTag: () => '', reqErrorCell: () => '', reqTokenCell: () => '—', reqCreditCell: () => '—',
   fmtLogTime: () => '', requestLogText: () => '', fmtMs: () => '—', syncRequestKeyOptions: () => {},
   Date, Number, String, Math, Array, Object,
 };
@@ -1165,7 +1165,7 @@ const ctx = {
   $: id => sinks[id] || (sinks[id] = mk()),
   reqEntries: [], reqFilter: {}, reqPage: 1, reqPageSize: 50,
   lastLogErrors: {}, esc: s => String(s == null ? '' : s),
-  reqMatch: e => e.keep, reqKeyText: () => '', reqOutcomeTag: () => '',
+  reqMatch: e => e.keep, reqKeyText: () => '', reqOutcomeTag: () => '', reqErrorCell: () => '',
   reqTokenCell: () => '—', reqCreditCell: () => '—', fmtLogTime: () => '',
   requestLogText: e => e.request_id, fmtMs: () => '—', syncRequestKeyOptions: () => {},
   Date, Number, String, Math, Array, Object,
@@ -1212,7 +1212,11 @@ const groupEnd = src.indexOf('function groupsFromQueue', groupStart);
 const queueStart = src.indexOf('function renderQueue');
 const queueEnd = src.indexOf('// setQueueRunBusy', queueStart);
 if (groupStart < 0 || groupEnd < 0 || queueStart < 0 || queueEnd < 0) throw new Error('scan render helpers not found');
-vm.runInContext(src.slice(start, end) + src.slice(groupStart, groupEnd) + src.slice(queueStart, queueEnd) + '\nthis.reattachScanView=reattachScanView;', ctx);
+// 进度条写入器（setQBar/qBarText）是 setScanProgress 的依赖，切片里要一并带上。
+const barStart = src.indexOf("let qBarKey = ''");
+const barEnd = src.indexOf('// 扫描结果 → 分组条目', barStart);
+if (barStart < 0 || barEnd < 0) throw new Error('progress bar helpers not found');
+vm.runInContext(src.slice(barStart, barEnd) + src.slice(start, end) + src.slice(groupStart, groupEnd) + src.slice(queueStart, queueEnd) + '\nthis.reattachScanView=reattachScanView;', ctx);
 (async () => {
   ctx.reattachScanView();
   for (let i = 0; i < 30; i++) await Promise.resolve();
@@ -1279,7 +1283,9 @@ const ctx = {
   renderScanResult: () => {}, renderQueue: () => {}, Promise, Array, Number, String, Object,
 };
 vm.createContext(ctx);
-vm.runInContext(src.slice(start, end) + '\nthis.startScanPolling=startScanPolling;', ctx);
+const barStart = src.indexOf("let qBarKey = ''");
+const barEnd = src.indexOf('// 扫描结果 → 分组条目', barStart);
+vm.runInContext(src.slice(barStart, barEnd) + src.slice(start, end) + '\nthis.startScanPolling=startScanPolling;', ctx);
 (async () => {
   ctx.startScanPolling();
   for (let i = 0; i < 10; i++) await Promise.resolve();
@@ -2312,12 +2318,89 @@ const end = src.indexOf('function groupsFromQueue', start);
 const rq = src.indexOf('function renderQueue');
 const rqe = src.indexOf('// setQueueRunBusy', rq);
 if (start < 0 || end < 0 || rq < 0 || rqe < 0) throw new Error('queue progress helpers not found');
-vm.runInContext(src.slice(rq, rqe) + src.slice(start, end) + '\nthis.updateProgress=updateProgress;', ctx);
+const barStart = src.indexOf("let qBarKey = ''");
+const barEnd = src.indexOf('// 扫描结果 → 分组条目', barStart);
+if (barStart < 0 || barEnd < 0) throw new Error('progress bar helpers not found');
+vm.runInContext(src.slice(barStart, barEnd) + src.slice(rq, rqe) + src.slice(start, end) + '\nthis.updateProgress=updateProgress;', ctx);
 ctx.updateProgress({phase: 'scan', pre_done: 3, pre_total: 10, items: []});
 process.stdout.write(JSON.stringify({hidden: el('qProg').hidden, width: el('qBarFill').style.width, text: el('qProgText').textContent}));`
 	out := runNodeScript(t, "queue-prescan", script, appJSPath(t))
-	if !strings.Contains(out, `"hidden":false`) || !strings.Contains(out, `"width":"30%"`) || !strings.Contains(out, "正在扫描账号 3 / 10") {
+	// 预扫映射到进度条的前 50%（3/10 → 15%），执行接在后面；两段共用一条 0–100%，
+	// 避免「预扫跑满 100% 后执行又从 0% 起步」被当成进度归零。
+	if !strings.Contains(out, `"hidden":false`) || !strings.Contains(out, `"width":"15%"`) || !strings.Contains(out, "正在扫描账号 3 / 10") {
 		t.Fatalf("pre-scan progress=%s", out)
+	}
+}
+
+// TestAppJSQueueProgressMonotonic 进度条不能来回跳。
+// 现场问题：预扫 3/10（30%）→ 执行 0/250（0%）→ 2% → 预扫又报 40%…
+// 用户看到的是条反复回退。setQBar 按轮次 key 单调钳制：同 key 内只增不减，
+// 且相同值不重写 style.width（避免重启 CSS 过渡）。这里直接求值进度条写入器。
+func TestAppJSQueueProgressMonotonic(t *testing.T) {
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf("let qBarKey = ''");
+const end = src.indexOf('// 扫描结果 → 分组条目', start);
+if (start < 0 || end < 0) throw new Error('progress bar helpers not found');
+const out = {};
+const el = id => (out[id] = out[id] || {style: {}});
+const ctx = {
+  $: id => id === 'qBarFill' ? el('qBarFill') : el(id),
+  Math, Number, String, Object,
+};
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, end) + '\nthis.setQBar=setQBar;this.qBarText=qBarText;', ctx);
+ctx.setQBar(30, 'queue:7');
+ctx.setQBar(15, 'queue:7'); // 同轮回退 → 钳住
+const held = el('qBarFill').style.width;
+ctx.setQBar(40, 'queue:7');
+const grew = el('qBarFill').style.width;
+ctx.setQBar(0, 'queue:8'); // 新一轮 → 允许从 0 重新长
+const reset = el('qBarFill').style.width;
+process.stdout.write(JSON.stringify({held, grew, reset}));`
+	out := runNodeScript(t, "queue-progress-monotonic", script, appJSPath(t))
+	const want = `{"held":"30%","grew":"40%","reset":"0%"}`
+	if out != want {
+		t.Fatalf("progress monotonic=%s want %s", out, want)
+	}
+}
+
+// TestIndexQueueIsScrollableAndFilterable 队列列表必须有固定高度视口 + 筛选条。
+// 此前 #qcList 直接铺在页面里，470 个账号会把页面拉到几万像素，既看不完
+// 也找不到失败项。
+func TestIndexQueueIsScrollableAndFilterable(t *testing.T) {
+	raw, err := os.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(raw)
+	for _, want := range []string{
+		`id="qcScroll"`, `id="qcFilters"`, `id="qcQ"`, `id="qcFilterNote"`, `id="btnQcCollapseAll"`,
+	} {
+		if !strings.Contains(html, want) {
+			t.Errorf("index.html missing %s", want)
+		}
+	}
+	// #qcList 必须在视口内，否则滚动条长在整页上（没意义）。
+	vi := strings.Index(html, `id="qcScroll"`)
+	li := strings.Index(html, `id="qcList"`)
+	if vi < 0 || li < 0 || li < vi {
+		t.Error("#qcList must be nested inside the #qcScroll viewport")
+	}
+	if !strings.Contains(html, `.qviewport {`) {
+		t.Error("missing .qviewport CSS (fixed-height scroll container)")
+	}
+	// 进度条不能再是一行 flex（条会随文案伸缩而抖动），也不该用 .5s 缓动
+	// 配合 500ms 轮询（永远停在动画中途）。
+	if strings.Contains(html, ".qprog { display: flex;") {
+		t.Error("progress bar must not be a single flex row: the bar length follows the changing text")
+	}
+	if !strings.Contains(html, ".qprog { display: grid;") {
+		t.Error("progress bar should stack bar above text (grid)")
+	}
+	if strings.Contains(html, "transition: width .5s ease") {
+		t.Error("progress bar transition must not be .5s ease: 500ms polling keeps it mid-animation")
 	}
 }
 
@@ -2350,7 +2433,10 @@ const end = src.indexOf('function groupsFromQueue', start);
 const rq = src.indexOf('function renderQueue');
 const rqe = src.indexOf('// setQueueRunBusy', rq);
 if (start < 0 || end < 0 || rq < 0 || rqe < 0) throw new Error('queue helpers not found');
-vm.runInContext(src.slice(rq, rqe) + src.slice(start, end) + '\nthis.updateProgress=updateProgress;', ctx);
+const barStart = src.indexOf("let qBarKey = ''");
+const barEnd = src.indexOf('// 扫描结果 → 分组条目', barStart);
+if (barStart < 0 || barEnd < 0) throw new Error('progress bar helpers not found');
+vm.runInContext(src.slice(barStart, barEnd) + src.slice(rq, rqe) + src.slice(start, end) + '\nthis.updateProgress=updateProgress;', ctx);
 ctx.updateProgress({running: true, pre_warn: '2 个账号任务查询失败，本轮可能漏扫；可稍后重试', items: [{status: 'done'}, {status: 'pending'}]});
 const warnSet = (attrs.qProgText || {}).warn;
 const firstText = el('qProgText').textContent;
@@ -3577,5 +3663,40 @@ func TestIndexHintNoiseRemoved(t *testing.T) {
 		if !strings.Contains(html, keep) {
 			t.Errorf("removing hints must not delete %s", keep)
 		}
+	}
+}
+
+// TestAppJSQueueFilterLocal 队列筛选只在本地过滤，不发请求。
+// 失败筛选只保留 status==='error' 的行；「未完成」= 除 done/skipped 外的一切。
+func TestAppJSQueueFilterLocal(t *testing.T) {
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('let queueFilter =');
+const end = src.indexOf('function groupsFromQueue', start);
+if (start < 0 || end < 0) throw new Error('queue filter helpers not found');
+const ctx = { GROWTH_TITLES: {}, queueFilter: 'all', queueQuery: '', queueCollapsed: new Set(), QF_LABEL: {}, esc: s => String(s == null ? '' : s), String, Number, Object, Array, Set };
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, end) + '\nthis.qFilteredGroups=qFilteredGroups;', ctx);
+const groups = [
+  { uid: 'u1', nick: '甲', rows: [
+    { code: 'a', status: 'done', message: '' },
+    { code: 'b', status: 'error', message: 'boom' },
+  ] },
+  { uid: 'u2', nick: '乙', rows: [
+    { code: 'c', status: 'pending', message: '' },
+  ] },
+];
+const pick = q => { vm.runInContext('queueFilter = ' + JSON.stringify(q || 'all') + '; queueQuery = \'\';', ctx); const r = ctx.qFilteredGroups(groups); return {shown: r.shown, total: r.total, groups: r.groups.length}; };
+process.stdout.write(JSON.stringify({
+  all: pick('all'),
+  fail: pick('fail'),
+  active: pick('active'),
+  done: pick('done'),
+}));`
+	out := runNodeScript(t, "queue-filter-local", script, appJSPath(t))
+	const want = `{"all":{"shown":3,"total":3,"groups":2},"fail":{"shown":1,"total":3,"groups":1},"active":{"shown":2,"total":3,"groups":2},"done":{"shown":1,"total":3,"groups":1}}`
+	if out != want {
+		t.Fatalf("queue filter=%s want %s", out, want)
 	}
 }

@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/logx"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
@@ -30,6 +31,11 @@ const maxUserAgentLen = 200
 
 // chatSeq 进程级请求序号。
 var chatSeq atomic.Int64
+
+// dsmlMarkerBytes 是 DSML 原生工具调用标记的分隔符（两个全角竖线 U+FF5C，
+// 与 upstream/dsml.go 的 markupPipe 一致）。debug 抓包用它判断一帧是否与
+// DSML 修复相关，避免把正常正文累积进内存。
+var dsmlMarkerBytes = []byte("｜｜")
 
 // chatLogEnabled 聊天表格日志总开关。生产恒 true；
 // 测试包经 TestMain 置 false 关闭 stdout 噪音，需要断言行输出的测试用 withChatLog 临时开启（R5）。
@@ -73,6 +79,15 @@ type chatStat struct {
 	clientIP  string
 	userAgent string
 
+	// 错误观测（字段名与 reqlog.Event 保持一致，见 requestTrace.event 的映射）：
+	// 各错误路径填充，成功路径保持零值。
+	rid            string
+	errCode        string
+	errKind        string
+	errMsg         string
+	upstreamStatus int
+	modelBlocked   bool
+
 	logged bool
 }
 
@@ -98,14 +113,34 @@ func newChatStatWithModel(now time.Time, model string, stream bool) *chatStat {
 	return &chatStat{start: now, model: model, mode: mode, toks: -1}
 }
 
+// logf 按级别输出一条带 [rid=...] 前缀的请求级日志（rid 为空则不带）。
+// level 取 logx 的级别名（"debug"|"info"|"warn"|"error"），大小写不敏感。
+func (s *chatStat) logf(level, format string, args ...any) {
+	prefix := ""
+	if s != nil && s.rid != "" {
+		prefix = "[rid=" + s.rid + "] "
+	}
+	switch level {
+	case "debug":
+		logx.Debugf("%s"+format, append([]any{prefix}, args...)...)
+	case "warn":
+		logx.Warnf("%s"+format, append([]any{prefix}, args...)...)
+	case "error":
+		logx.Errorf("%s"+format, append([]any{prefix}, args...)...)
+	default:
+		logx.Infof("%s"+format, append([]any{prefix}, args...)...)
+	}
+}
+
 // done 幂等落一行表格日志。
 func (s *chatStat) done() {
 	if s.logged {
 		return
 	}
 	s.logged = true
-	logChatRowEx(s.ttfb, time.Since(s.start), s.model, s.mode, s.uid, s.nick, s.status, s.toks,
-		s.requestID, s.outcome, s.attempts, s.credit, s.hasCredit, s.clientIP, s.userAgent, s.keyID)
+	logChatRowExErr(s.ttfb, time.Since(s.start), s.model, s.mode, s.uid, s.nick, s.status, s.toks,
+		s.requestID, s.outcome, s.attempts, s.credit, s.hasCredit, s.clientIP, s.userAgent, s.keyID,
+		s.errKind, s.errMsg)
 }
 
 // chatStatsReader 在流式透传时抓取 SSE 末帧的 usage.completion_tokens 精确值，
@@ -132,14 +167,37 @@ type chatStatsReader struct {
 	cacheHit     int
 	cacheMiss    int
 	hasCacheMiss bool
-	pend         []byte // 已读未返回的行缓存
-	lineBuf      []byte // 超长 SSE 行的拼接缓冲（仅 ErrBufferFull 时复用）
-	readBuf      []byte // 批量 Read 的暂存缓冲（仅单次无法填满调用方 p 时使用）
+	// debug 抓包（可选）：只累积出现 DSML 标记的原始 data 帧，供修复命中时落盘；
+	// nil 时零开销。正常出站正文不进缓冲。
+	debug   *DebugLog
+	rid     string
+	dsmlBuf []byte
+	pend    []byte // 已读未返回的行缓存
+	lineBuf []byte // 超长 SSE 行的拼接缓冲（仅 ErrBufferFull 时复用）
+	readBuf []byte // 批量 Read 的暂存缓冲（仅单次无法填满调用方 p 时使用）
 }
 
 // newChatStatsReaderSince 以 since 为 TTFB 计时起点（通常是请求进入 handler 的时刻）。
 func newChatStatsReaderSince(r io.Reader, since time.Time) *chatStatsReader {
 	return &chatStatsReader{br: bufio.NewReaderSize(r, 64*1024), start: since}
+}
+
+// setDebugCapture 挂上请求级脱敏抓包器；只累积带 DSML 标记的帧，其余字节原样透传。
+func (s *chatStatsReader) setDebugCapture(rid string, d *DebugLog) {
+	if d == nil || !d.Enabled() {
+		return
+	}
+	s.rid = rid
+	s.debug = d
+}
+
+// flushDebugDSML 把累积到的 DSML 标记帧落盘（仅在修复命中后由 handler 调用）。
+func (s *chatStatsReader) flushDebugDSML() {
+	if s.debug == nil || len(s.dsmlBuf) == 0 {
+		return
+	}
+	s.debug.Capture(s.rid, "dsml_repair", s.dsmlBuf)
+	s.dsmlBuf = nil
 }
 
 // TTFB 返回首个 data 帧到达耗时；无帧时为 0。
@@ -180,6 +238,11 @@ func (s *chatStatsReader) parseSSELineBytes(line []byte) {
 	}
 	if bytes.Equal(payload, []byte("[DONE]")) {
 		return
+	}
+	// debug 抓包：只收集带全角竖线（DSML 标记）的帧，修复命中时再落盘；不抓正文。
+	if s.debug != nil && bytes.Contains(payload, dsmlMarkerBytes) {
+		s.dsmlBuf = append(s.dsmlBuf, payload...)
+		s.dsmlBuf = append(s.dsmlBuf, '\n')
 	}
 	if !s.seen {
 		s.seen = true
@@ -569,6 +632,11 @@ func (t *requestTrace) event(status int) reqlog.Event {
 		e.HasCredit = s.hasCredit
 		e.CacheHitTokens = s.cacheHit
 		e.CacheMissTokens = s.cacheMiss
+		e.ErrorCode = s.errCode
+		e.ErrorKind = s.errKind
+		e.UpstreamStatus = s.upstreamStatus
+		e.ErrorMsg = s.errMsg
+		e.ModelBlocked = s.modelBlocked
 	}
 	e.ClientIP = t.clientIP
 	e.UserAgent = t.userAgent
@@ -660,6 +728,15 @@ func padInt(buf *strings.Builder, n int64, width int) {
 func logChatRowEx(ttfb, total time.Duration, model, mode, uid, nick string, status int, toks int,
 	requestID, outcome string, attempts int, credit float64, hasCredit bool,
 	clientIP, userAgent, keyID string) {
+	logChatRowExErr(ttfb, total, model, mode, uid, nick, status, toks,
+		requestID, outcome, attempts, credit, hasCredit, clientIP, userAgent, keyID, "", "")
+}
+
+// logChatRowExErr 是 logChatRowEx 的扩展：末尾追加 err=<errKind> 与
+// errmsg=<Truncate(errMsg,120)>（仅非空时），供错误观测字段随流水行落盘。
+func logChatRowExErr(ttfb, total time.Duration, model, mode, uid, nick string, status int, toks int,
+	requestID, outcome string, attempts int, credit float64, hasCredit bool,
+	clientIP, userAgent, keyID, errKind, errMsg string) {
 	if !chatLogEnabled {
 		return
 	}
@@ -739,6 +816,14 @@ func logChatRowEx(ttfb, total time.Duration, model, mode, uid, nick string, stat
 	buf.WriteString("s |")
 	buf.WriteString(extra)
 	buf.WriteString(src)
+	if errKind != "" {
+		buf.WriteString(" err=")
+		buf.WriteString(errKind)
+	}
+	if errMsg != "" {
+		buf.WriteString(" errmsg=")
+		buf.WriteString(logfmt.Truncate(errMsg, 120))
+	}
 	buf.WriteByte('\n')
 	_, _ = io.WriteString(chatLogOut, buf.String())
 	rowBufPool.Put(buf)

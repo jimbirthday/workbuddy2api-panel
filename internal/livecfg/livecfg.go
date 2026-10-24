@@ -24,6 +24,9 @@ type Snapshot struct {
 	SoftCooldown         time.Duration // 429 软冷却基数（<=0 时调用方回退内置默认）
 	SanitizeFingerprints bool          // 出站请求体指纹脱敏
 	RecordClientInfo     bool          // 请求日志是否记录调用来源（客户端 IP / UA）
+	// LogLevel 日志级别（debug/info/warn/error）：main 装配与面板保存配置时
+	// 经快照热生效（logx.SetLevel），无需重启。
+	LogLevel string
 	// BackgroundModels 客户端后台任务模型重定向（空名单/空目标 = 关闭）。
 	// 与鉴权同一次快照读取，保存配置后无需重启；重定向发生在 Key 的模型白名单
 	// 校验之后，不会让受限 Key 通过别名访问白名单外的模型。

@@ -29,12 +29,16 @@ func VerifyBearer(r *http.Request, key string) bool {
 // Key 是一个可鉴权的 API key 定义。Key 为明文，只在进程内存中用于校验；
 // 任何 REST/归档/日志输出都必须使用 ID/Name，绝不能回显 Key 字段。
 type Key struct {
-	ID      string
-	Name    string
-	Key     string
-	Realm   string   // "cn" / "global" / ""（不限制）
-	Models  []string // 空 = 不限制；非空时仅允许这些模型（裸名，不含 realm: 前缀）
-	Enabled bool
+	ID     string
+	Name   string
+	Key    string
+	Realm  string   // "cn" / "global" / ""（不限制）
+	Models []string // 空 = 不限制；非空时仅允许这些模型（裸名，不含 realm: 前缀）
+	// Passthrough 为真时，用该 key 请求 /v1/chat/completions 走「完全透传」：
+	// 请求体原样出站、响应（状态码/头/body）逐字节透传，不做任何 OpenAI 兼容
+	// 转换。false（缺省）走主链路。由配置 api_keys[].passthrough 控制。
+	Passthrough bool
+	Enabled     bool
 	// digest 是 Key 的 SHA-256 预计算摘要。Keyring() 构造时算好，
 	// 请求路径直接比较，省去每请求每 key 一次 sha256；零值时回退现算
 	// （单 key 内联构造路径，见 VerifyBearerKey）。不导出，避免被日志/序列化触碰。
@@ -59,6 +63,8 @@ type Identity struct {
 	Name   string
 	Realm  string
 	Models []string
+	// Passthrough 来自命中 key：true = 该请求走完全透传链路。
+	Passthrough bool
 }
 
 // AllowsModel 判断身份是否允许 bareModel。空 Models = 不限制；非空时按
@@ -115,7 +121,7 @@ func matchBearer(r *http.Request, keys []Key) (Identity, bool) {
 		// 摘要优先用 Keyring 预计算值，避免每请求重算全部 key 的 SHA-256。
 		matched := subtleCompare(tokDigest, k.keyDigest())
 		if matched && hasBearer && k.Enabled && strings.TrimSpace(k.Key) != "" && !found {
-			hit = Identity{ID: k.ID, Name: k.Name, Realm: k.Realm, Models: append([]string(nil), k.Models...)}
+			hit = Identity{ID: k.ID, Name: k.Name, Realm: k.Realm, Models: append([]string(nil), k.Models...), Passthrough: k.Passthrough}
 			found = true
 		}
 	}

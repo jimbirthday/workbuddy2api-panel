@@ -11,6 +11,8 @@ type KeySpec struct {
 	Realm   string
 	Models  []string
 	Enabled bool
+	// Passthrough 透传到 Key：该 key 的请求走完全透传链路（见 Key.Passthrough）。
+	Passthrough bool
 	// Legacy 为真时 key 为空不代表“脏条目”，而是“旧配置未启用鉴权”的兼容项。
 	Legacy bool
 }
@@ -28,13 +30,14 @@ func Keyring(legacy string, specs []KeySpec) []Key {
 			continue
 		}
 		out = append(out, Key{
-			ID:      s.ID,
-			Name:    s.Name,
-			Key:     s.Key,
-			Realm:   s.Realm,
-			Models:  append([]string(nil), s.Models...),
-			Enabled: s.Enabled,
-			digest:  sha256.Sum256([]byte(s.Key)),
+			ID:          s.ID,
+			Name:        s.Name,
+			Key:         s.Key,
+			Realm:       s.Realm,
+			Models:      append([]string(nil), s.Models...),
+			Enabled:     s.Enabled,
+			Passthrough: s.Passthrough,
+			digest:      sha256.Sum256([]byte(s.Key)),
 		})
 	}
 	return out

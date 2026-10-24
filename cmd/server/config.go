@@ -27,6 +27,9 @@ type APIKeyConfig struct {
 	Realm   string   `json:"realm,omitempty"` // "" / "cn" / "global"
 	Models  []string `json:"models,omitempty"`
 	Enabled *bool    `json:"enabled,omitempty"` // 缺省 true；指针区分缺省与显式 false
+	// Passthrough 为真时，用该 key 请求 /v1/chat/completions 走「完全透传」：
+	// 请求体原样出站、响应逐字节透传，不做 OpenAI 兼容转换。
+	Passthrough bool `json:"passthrough,omitempty"`
 }
 
 // IsEnabled 把缺省 true 的语义集中在一处。
@@ -771,12 +774,13 @@ func (c *Config) keyring() []httpauth.Key {
 	specs := make([]httpauth.KeySpec, 0, len(c.APIKeys))
 	for _, k := range c.APIKeys {
 		specs = append(specs, httpauth.KeySpec{
-			ID:      k.ID,
-			Name:    k.Name,
-			Key:     k.Key,
-			Realm:   k.Realm,
-			Models:  append([]string(nil), k.Models...),
-			Enabled: k.IsEnabled(),
+			ID:          k.ID,
+			Name:        k.Name,
+			Key:         k.Key,
+			Realm:       k.Realm,
+			Models:      append([]string(nil), k.Models...),
+			Enabled:     k.IsEnabled(),
+			Passthrough: k.Passthrough,
 		})
 	}
 	return httpauth.Keyring(c.APIKey, specs)

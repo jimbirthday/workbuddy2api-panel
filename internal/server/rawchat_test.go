@@ -10,10 +10,11 @@ import (
 	"testing"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
-// rawTransport 捕获出站请求体/头并返回固定响应，供透传端点断言用。
+// rawTransport 捕获出站请求体/头并返回固定响应，供透传链路断言用。
 type rawTransport struct {
 	capturedBody []byte
 	capturedAuth string
@@ -39,9 +40,14 @@ func (rt *rawTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	}, nil
 }
 
-// TestRawChatPassthroughByteForByte POST /v2/chat/completions 的上游响应必须逐字节透传：
-// 状态码、自定义响应头、body 都不能被网关转换。body 用非 OpenAI 兼容的
-// 原始 JSON（含 reasoning_content 等上游原字段），验证网关不做任何重建。
+// ptKey 返回一个 Passthrough=true 的客户端 key。
+func ptKey() httpauth.Key {
+	return httpauth.Key{ID: "pt", Key: "pt-key-123", Enabled: true, Passthrough: true}
+}
+
+// TestRawChatPassthroughByteForByte 透传 key 走 /v1/chat/completions 时，
+// 上游响应必须逐字节透传：状态码、自定义响应头、body 都不能被网关转换。
+// body 用非 OpenAI 兼容的原始 JSON（含 reasoning_content 等上游原字段）。
 func TestRawChatPassthroughByteForByte(t *testing.T) {
 	raw := `{"id":"chatcmpl-bf369aad2c18","object":"chat.completion","model":"kimi-k3.1-pro","choices":[{"index":0,"message":{"role":"assistant","content":"你好","reasoning_content":"思考链原文"}}],"usage":{"prompt_tokens":115,"completion_tokens":701,"total_tokens":816,"credit":1.19}}`
 	rt := &rawTransport{
@@ -56,11 +62,12 @@ func TestRawChatPassthroughByteForByte(t *testing.T) {
 	}
 	up := &upstream.Client{HTTP: &http.Client{Transport: rt}, ChatBaseCN: "https://fake.example"}
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
-	h := NewHandler(Config{Pool: p, Upstream: up})
+	h := NewHandler(Config{Pool: p, Upstream: up, APIKeys: []httpauth.Key{ptKey()}})
 
 	in := `{"model":"kimi-k3.1-pro","stream":false,"messages":[{"role":"user","content":"你是谁"}]}`
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest("POST", "/v2/chat/completions", strings.NewReader(in))
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(in))
+	req.Header.Set("Authorization", "Bearer pt-key-123")
 	h.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
@@ -87,17 +94,19 @@ func TestRawChatPassthroughByteForByte(t *testing.T) {
 	}
 }
 
-// TestRawChatUpstreamBusinessErrorPassthrough 上游 4xx/5xx 的响应体同样原样透传
-// （不读 body 分类、不重写成 OpenAI error 形态）。
+// TestRawChatUpstreamBusinessErrorPassthrough 透传 key 下上游 4xx/5xx 的响应体
+// 同样原样透传（不读 body 分类、不重写成 OpenAI error 形态）。
 func TestRawChatUpstreamBusinessErrorPassthrough(t *testing.T) {
 	raw := `{"code":11101,"msg":"Unmarshal chat params failed with error: unexpected EOF"}`
 	rt := &rawTransport{status: 400, header: http.Header{"Content-Type": []string{"application/json"}}, body: raw}
 	up := &upstream.Client{HTTP: &http.Client{Transport: rt}, ChatBaseCN: "https://fake.example"}
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
-	h := NewHandler(Config{Pool: p, Upstream: up})
+	h := NewHandler(Config{Pool: p, Upstream: up, APIKeys: []httpauth.Key{ptKey()}})
 
 	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v2/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`))
+	req.Header.Set("Authorization", "Bearer pt-key-123")
+	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body.String())
 	}
@@ -106,16 +115,18 @@ func TestRawChatUpstreamBusinessErrorPassthrough(t *testing.T) {
 	}
 }
 
-// TestRawChatTransportErrorCountsFailure transport 层失败走 502，且按主链路口径
-// 记一次连败失败（NoteFailures），好号快速换走。
+// TestRawChatTransportErrorCountsFailure 透传链路 transport 层失败走 502，且按
+// 主链路口径记一次连败失败（NoteFailures），好号快速换走。
 func TestRawChatTransportErrorCountsFailure(t *testing.T) {
 	rt := &rawTransport{err: errors.New("dial tcp: connection refused")}
 	up := &upstream.Client{HTTP: &http.Client{Transport: rt}, ChatBaseCN: "https://fake.example"}
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
-	h := NewHandler(Config{Pool: p, Upstream: up})
+	h := NewHandler(Config{Pool: p, Upstream: up, APIKeys: []httpauth.Key{ptKey()}})
 
 	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v2/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`))
+	req.Header.Set("Authorization", "Bearer pt-key-123")
+	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusBadGateway {
 		t.Fatalf("code=%d body=%s (transport error must be 502)", rec.Code, rec.Body.String())
 	}
@@ -125,8 +136,8 @@ func TestRawChatTransportErrorCountsFailure(t *testing.T) {
 	}
 }
 
-// TestRawChatStripsConnectionNominatedHopHeaders 上游 Connection 头点名的额外
-// 逐跳头必须一并剔除（RFC 7230 §6.1），其余自定义头保留。
+// TestRawChatStripsConnectionNominatedHopHeaders 透传链路下，上游 Connection 头
+// 点名的额外逐跳头必须一并剔除（RFC 7230 §6.1），其余自定义头保留。
 func TestRawChatStripsConnectionNominatedHopHeaders(t *testing.T) {
 	raw := `{"ok":true}`
 	rt := &rawTransport{
@@ -141,10 +152,12 @@ func TestRawChatStripsConnectionNominatedHopHeaders(t *testing.T) {
 	}
 	up := &upstream.Client{HTTP: &http.Client{Transport: rt}, ChatBaseCN: "https://fake.example"}
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
-	h := NewHandler(Config{Pool: p, Upstream: up})
+	h := NewHandler(Config{Pool: p, Upstream: up, APIKeys: []httpauth.Key{ptKey()}})
 
 	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v2/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`))
+	req.Header.Set("Authorization", "Bearer pt-key-123")
+	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body.String())
 	}
@@ -156,5 +169,33 @@ func TestRawChatStripsConnectionNominatedHopHeaders(t *testing.T) {
 	}
 	if got := rec.Header().Get("X-Keep-Header"); got != "keep" {
 		t.Errorf("non-hop header must be kept, got %q", got)
+	}
+}
+
+// TestRawChatNonPassthroughKeyUsesMainPipeline 非透传 key 必须照常走主链路
+// （不是透传）：出站 body 会被注入 prompt_cache_key。
+func TestRawChatNonPassthroughKeyUsesMainPipeline(t *testing.T) {
+	rt := &rawTransport{
+		status: 200,
+		header: http.Header{"Content-Type": []string{"application/json"}},
+		body:   sseOK,
+	}
+	up := &upstream.Client{HTTP: &http.Client{Transport: rt}, ChatBaseCN: "https://fake.example"}
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up, APIKeys: []httpauth.Key{
+		{ID: "normal", Key: "normal-key-123", Enabled: true},
+	}})
+
+	in := `{"model":"glm-5.2","stream":true,"messages":[{"role":"user","content":"hi"}]}`
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(in))
+	req.Header.Set("Authorization", "Bearer normal-key-123")
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	// 主链路会注入 prompt_cache_key；透传则不会。
+	if !bytes.Contains(rt.capturedBody, []byte("prompt_cache_key")) {
+		t.Errorf("non-passthrough key must go through main pipeline (expect prompt_cache_key injected)")
 	}
 }

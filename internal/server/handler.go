@@ -144,7 +144,6 @@ func NewHandler(cfg Config) *Handler {
 	}
 	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
-	h.mux.HandleFunc("POST /v2/chat/completions", h.withAuth(h.rawChat))
 	h.mux.HandleFunc("POST /v1/responses", h.withProtocolAuth(protoResponses, h.responses))
 	h.mux.HandleFunc("POST /v1/messages", h.withProtocolAuth(protoMessages, h.messages))
 	h.mux.HandleFunc("POST /v1/messages/count_tokens", h.withProtocolAuth(protoMessages, h.countMessagesTokens))
@@ -701,6 +700,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if !keyID.AllowsModel(bareModel) {
 			writeOpenAIError(w, http.StatusBadRequest, "model_not_allowed",
 				"api key "+keyID.ID+" is not allowed to use model "+bareModel)
+			return
+		}
+		// 透传 key：白名单校验通过后直接走完全透传链路（请求体原样出站、
+		// 响应逐字节透传）。必须放在所有改写（后台模型重定向/会话粘性/
+		// 轮转换号）之前，保证「透传」不掺任何网关转换。
+		if keyID.Passthrough {
+			h.rawChatBody(w, r, body, realm, bareModel, clientIP)
 			return
 		}
 	}

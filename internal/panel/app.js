@@ -2530,6 +2530,7 @@ function apiKeyRows(list) {
         API_KEY_REALMS.map(([v, label]) => '<option value="' + v + '"' + (String(k.realm || '') === v ? ' selected' : '') + '>' + label + '</option>').join('') +
       '</select></td>' +
       '<td data-label="模型白名单"><input class="ki-models" value="' + esc(apiKeyModelsText(k.models)) + '" placeholder="留空 = 不限模型" aria-label="模型白名单"></td>' +
+      '<td data-label="透传"><input class="ki-passthrough" type="checkbox"' + (!!k.passthrough ? ' checked' : '') + ' aria-label="完全透传" title="勾选后该 Key 请求不做任何网关转换"></td>' +
       '<td data-label="启用"><input class="ki-enabled" type="checkbox"' + (enabled ? ' checked' : '') + ' aria-label="启用"></td>' +
     '</tr>';
   }).join('');
@@ -2538,18 +2539,20 @@ function apiKeyRows(list) {
 function renderAPIKeys(list) {
   const body = $('apiKeysBody');
   if (!body) return;
-  body.innerHTML = apiKeyRows(list) || '<tr><td colspan="7" class="empty">还没有客户端 Key；点击「添加 Key」创建</td></tr>';
+  body.innerHTML = apiKeyRows(list) || '<tr><td colspan="8" class="empty">还没有客户端 Key；点击「添加 Key」创建</td></tr>';
 }
 
 function apiKeyRowValues(row) {
   const val = sel => { const el = row.querySelector(sel); return el ? el.value.trim() : ''; };
   const keyEl = row.querySelector('.ki-key');
   const enabledEl = row.querySelector('.ki-enabled');
+  const ptEl = row.querySelector('.ki-passthrough');
   const rawKey = keyEl ? keyEl.value.trim() : '';
   const hadKey = row.dataset.keySet === '1';
   return {
     id: val('.ki-id'), name: val('.ki-name'), realm: val('.ki-realm'),
     modelsRaw: val('.ki-models'), enabled: enabledEl ? !!enabledEl.checked : true,
+    passthrough: ptEl ? !!ptEl.checked : false,
     key: rawKey, hadKey,
   };
 }
@@ -2585,6 +2588,7 @@ function collectAPIKeys() {
     return {
       id: r.id, name: r.name, realm: r.realm, models,
       enabled: r.enabled,
+      passthrough: r.passthrough,
       // 留空且已有 key → 提交哨兵并由后端保留原值；新行无 key 已在上面拒绝。
       key: r.hadKey && !r.key ? MASKED_SECRET : r.key,
     };

@@ -1840,12 +1840,12 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <header>
             <h3>客户端 API Key <span class="hint">仅业务鉴权</span></h3>
             <span class="grow"></span>
-            <span class="note">可限制 realm / 模型；密钥回显为 ***，留空表示保持不变</span>
+            <span class="note">可限制 realm / 模型；勾选「透传」则该 Key 请求不做任何网关转换</span>
             <button type="button" class="xs" id="btnAddAPIKey">添加 Key</button>
           </header>
           <div class="tbl-wrap">
             <table class="acc md cardify" id="apiKeysTable">
-              <thead><tr><th class="k-act">操作</th><th class="k-id">ID</th><th>名称</th><th>Key</th><th>Realm</th><th>模型白名单</th><th>启用</th></tr></thead>
+              <thead><tr><th class="k-act">操作</th><th class="k-id">ID</th><th>名称</th><th>Key</th><th>Realm</th><th>模型白名单</th><th>透传</th><th>启用</th></tr></thead>
               <tbody id="apiKeysBody"></tbody>
             </table>
           </div>

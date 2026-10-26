@@ -391,9 +391,39 @@ type MarketExpert struct {
 // MarketExpertList 拉取专家市场真实专家列表（expertType: "agent" 单专家 / "team" 专家团）。
 // expert_actual_use 的判据校验要求 id 是平台上真实存在的专家（编造 id 不计数）。
 func (c *Client) MarketExpertList(a *auth.Auth, expertType string) ([]MarketExpert, error) {
-	body := map[string]any{"page": 1, "page_size": 20, "sort_by": "reco_rank", "sort_order": "desc"}
+	return c.marketExpertList(a, expertType, "", 20)
+}
+
+// MarketExpertSearch 按关键词检索专家市场（同一端点，keyword 过滤）。
+// 指定专家任务（expert_use_*）的上游判据是「召唤该 expert_id 并完成一次对话」，
+// 而推荐列表首屏 50 条未必包含目标专家，必须用关键词精确命中。
+func (c *Client) MarketExpertSearch(a *auth.Auth, keyword string) ([]MarketExpert, error) {
+	return c.marketExpertList(a, "", keyword, 20)
+}
+
+// MarketExpertByID 按 expert_id 精确定位专家（关键词检索 + id 过滤）；
+// 命中返回完整条目（version/categories 用于事件载荷），未命中返回 nil。
+func (c *Client) MarketExpertByID(a *auth.Auth, expertType, keyword, expertID string) (*MarketExpert, error) {
+	list, err := c.marketExpertList(a, expertType, keyword, 20)
+	if err != nil {
+		return nil, err
+	}
+	for i := range list {
+		if list[i].ExpertID == expertID {
+			return &list[i], nil
+		}
+	}
+	return nil, nil
+}
+
+// marketExpertList 专家市场列表请求公共实现。
+func (c *Client) marketExpertList(a *auth.Auth, expertType, keyword string, pageSize int) ([]MarketExpert, error) {
+	body := map[string]any{"page": 1, "page_size": pageSize, "sort_by": "reco_rank", "sort_order": "desc"}
 	if expertType != "" {
 		body["expert_type"] = expertType
+	}
+	if keyword != "" {
+		body["keyword"] = keyword
 	}
 	raw, err := json.Marshal(body)
 	if err != nil {
@@ -567,6 +597,17 @@ func DesktopExpertActualUseEvent(e MarketExpert, conversationID, requestID strin
 	ev := desktopExpertActualUse(e, conversationID, requestID)
 	ev["mode"] = "craft"
 	return ev
+}
+
+// DesktopDesignatedExpertSequence 构造「指定专家召唤 + 对话 + 使用」完整事件组。
+// 用于 expert_use_<id> 系列任务（体验指定专家一次）：判据与 expert_5 同构，
+// 但任务绑定唯一 expert_id（来自任务 jump_url 的 expertId 参数），
+// 因此只发该专家的事件链，不再走「随便挑 5 个专家」的批量逻辑。
+// summon 与 use 分两批上报（先召唤、再真实对话、最后使用），与客户端节奏一致。
+func DesktopDesignatedExpertSequence(e MarketExpert, conversationID, requestID string) []DesktopEvent {
+	msgID := "msg-" + requestID[len(requestID)-8:]
+	events := DesktopChatSequence(conversationID, requestID, msgID, "fast-model", "fast-model")
+	return append(events, DesktopExpertActualUseEvent(e, conversationID, requestID))
 }
 
 // DesktopExpertActualUseLocal mode:"LOCAL" 变体（Expert_lighthouse 判据要求 LOCAL，

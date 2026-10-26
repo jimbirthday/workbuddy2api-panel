@@ -94,14 +94,22 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 | `Hp_Appearance` | +100c +5e | 主题设置 + 皮肤生效事件 |
 | `Expert_lighthouse` | +100c +5e | 轻量云专家召唤+使用链（真实对话 requestId，**可免费领一个月轻量服务器**） |
 | `skill_1` | +100c +5e | 真实对话 + 技能加载事件（skill_info） |
+| `WorkBuddy_Valorant` | +100c +5e | 召唤「无畏契约拼豆专家」(`ex_xQHHD1u5Jkua`) + 真实对话 |
+| `expert_use_maidehao` | +50c +5e | 召唤「中国电商运营专家」(`ex_GDl31WahyIH0`) + 真实对话 |
+| `expert_use_douyinyin` | +50c +5e | 召唤「抖音策略师」(`ex_FbY5nlWTqDod`) + 真实对话 |
+| `expert_use_shangjia_xuanchuan` | +50c +5e | 召唤「商家宣传页与海报设计师」(`ex_Weo3x2EZuSDm`) + 真实对话 |
+| `expert_use_bowangwang` | +50c +5e | 召唤「直播电商教练」(`ex_WZY136wV5aMt`) + 真实对话 |
 
-**全新账号一键全做完 ≈ +1950 credits +78 能量**，其中仅数个任务涉及真实对话（`Model_chat_GLM5.2` 一条、`expert_5`/`Expert_team_use_3`/`skill_1` 各数条 fast-model 短对话），其余全部为行为事件上报，零对话消耗。
+**全新账号一键全做完 ≈ +2250 credits +103 能量**，其中仅数个任务涉及真实对话（`Model_chat_GLM5.2` 一条、`expert_5`/`Expert_team_use_3`/`skill_1`/指定专家类 5 条各一条 fast-model 短对话），其余全部为行为事件上报，零对话消耗。
 
-### 不可自动的 1 个
+> 指定专家类任务（`expert_use_*` / `WorkBuddy_Valorant`）的 expert_id 取自任务 `jump_url` 的 `expertId` 参数；执行时按专家名检索市场补全 version/categories，再发「召唤链 + 带 `X-Expert-Id` 的真实对话 + `expert_actual_use`」。2026-10-27 单账号实测 5/5 全部点亮并领奖（+300c +25e）。
+
+### 不可自动的 2 个
 
 | 任务 | 原因 |
 |---|---|
 | `Expert_Philanthropy` | 需真实捐款（服务端领奖时校验捐赠回执，已实测无法绕过） |
+| `wb_wechat_oa_subscribe_task` | 需微信真实关注官方公众号满 24 小时（判据在微信侧订阅关系，API 侧无对应上报事件，已实测 7 种事件码均不计分） |
 
 ### 实现原理（简述）
 

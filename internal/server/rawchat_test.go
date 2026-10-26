@@ -85,9 +85,12 @@ func TestRawChatPassthroughByteForByte(t *testing.T) {
 	if got := rec.Header().Get("Transfer-Encoding"); got != "" {
 		t.Errorf("hop-by-hop Transfer-Encoding must be stripped, got %q", got)
 	}
-	// 请求侧也必须原样出站：不注入 prompt_cache_key、不改写 model。
-	if rt.capturedBody == nil || !bytes.Equal(rt.capturedBody, []byte(in)) {
-		t.Errorf("outbound body not byte-for-byte:\n got=%s\nwant=%s", rt.capturedBody, in)
+	// 请求侧：不注入 prompt_cache_key、不改写 model；唯一改写是强制 stream=true。
+	if !bytes.Contains(rt.capturedBody, []byte(`"stream":true`)) {
+		t.Errorf("outbound body must force stream=true:\n got=%s", rt.capturedBody)
+	}
+	if bytes.Contains(rt.capturedBody, []byte("prompt_cache_key")) {
+		t.Errorf("passthrough must not inject prompt_cache_key:\n got=%s", rt.capturedBody)
 	}
 	if rt.capturedAuth != "Bearer at1" {
 		t.Errorf("Authorization not injected, got %q", rt.capturedAuth)

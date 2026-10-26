@@ -9,6 +9,7 @@ package upstream
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"net/http"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
@@ -34,6 +35,9 @@ func (c *Client) RawChat(ctx context.Context, a *auth.Auth, body []byte, clientI
 		panic("unreachable: chatPaths is never empty")
 	}
 	endpoint := c.chatBase(a) + paths[0]
+	// 透传链路的唯一改写：强制 stream=true（见 ensureStream 注释）。非流式必被
+	// 上游 400 拒绝，这是「让请求能通过」的最低限度修正，与主链路同口径。
+	body = ensureStream(body)
 	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
@@ -48,4 +52,34 @@ func (c *Client) RawChat(ctx context.Context, a *auth.Auth, body []byte, clientI
 		return nil, err
 	}
 	return resp, nil
+}
+
+// ensureStream 透传链路的唯一改写：强制 stream=true。
+//
+// 上游（CN /v2 与 global /console 同源）拒绝非流式请求，返回
+// "Non-stream chat request is currently not supported"（code 11101）。
+// 透传 key 本应「客户端发什么上游就收到什么」，但非流式必然 400——
+// 这里只做「让请求能通过」的最低限度修正，与主链路 payload.go 的
+// normalizeBodyObject obj["stream"]=true 同口径。
+//
+// 关键：已是流式的请求（stream==true）直接原样返回，不做 marshal——
+// 保证真正透传的请求一个字节都不变；只有缺 stream / stream=false 才改写。
+// 解析失败 / 非 JSON 对象 body 原样返回，绝不二次错误化。
+func ensureStream(body []byte) []byte {
+	if len(body) == 0 {
+		return body
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(body, &obj); err != nil {
+		return body
+	}
+	if s, ok := obj["stream"].(bool); ok && s {
+		return body
+	}
+	obj["stream"] = true
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return body
+	}
+	return out
 }

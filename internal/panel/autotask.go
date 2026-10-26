@@ -130,6 +130,31 @@ var autoActions = []autoAction{
 		run:      runExpertLighthouse,
 	},
 	{
+		TaskCode: "WorkBuddy_Valorant",
+		Desc:     "召唤「无畏契约拼豆专家」并真实对话（ex_xQHHD1u5Jkua）",
+		run:      runDesignatedExpert("ex_xQHHD1u5Jkua", "无畏契约拼豆专家"),
+	},
+	{
+		TaskCode: "expert_use_maidehao",
+		Desc:     "召唤「中国电商运营专家」并真实对话（ex_GDl31WahyIH0）",
+		run:      runDesignatedExpert("ex_GDl31WahyIH0", "中国电商运营专家"),
+	},
+	{
+		TaskCode: "expert_use_douyinyin",
+		Desc:     "召唤「抖音策略师」并真实对话（ex_FbY5nlWTqDod）",
+		run:      runDesignatedExpert("ex_FbY5nlWTqDod", "抖音策略师"),
+	},
+	{
+		TaskCode: "expert_use_shangjia_xuanchuan",
+		Desc:     "召唤「商家宣传页与海报设计师」并真实对话（ex_Weo3x2EZuSDm）",
+		run:      runDesignatedExpert("ex_Weo3x2EZuSDm", "商家宣传页与海报设计师"),
+	},
+	{
+		TaskCode: "expert_use_bowangwang",
+		Desc:     "召唤「直播电商教练」并真实对话（ex_WZY136wV5aMt）",
+		run:      runDesignatedExpert("ex_WZY136wV5aMt", "直播电商教练"),
+	},
+	{
 		TaskCode: "black_cat",
 		Desc:     "夜猫子：23:00–08:00 窗口内 glm-5.2 对话补足（窗口外提示稍后再试）",
 		Attempt:  true,
@@ -1106,6 +1131,35 @@ const expertSummonGap = 6 * time.Second
 // 自造专家 id 或自造 requestId 均不计数。
 func runExpertUse(p *Panel, a *auth.Auth) (string, error) {
 	return runExpertBatch(p, a, "agent", 5)
+}
+
+// runDesignatedExpert 返回「体验指定专家」任务的执行函数。
+// 判据（2026-10-27 实测 ex_GDl31WahyIH0）：召唤链 + 带 X-Expert-Id 的真实对话
+// （服务端 requestId）+ expert_actual_use，一组即点亮 +50c/+100c。
+// 专家 id 由任务 jump_url 的 expertId 参数给出；市场条目只用于补全 name/version/
+// categories 载荷，检索不到时按任务标题兜底（上游只校验 id 真实性）。
+func runDesignatedExpert(expertID, expertName string) func(*Panel, *auth.Auth) (string, error) {
+	return func(p *Panel, a *auth.Auth) (string, error) {
+		e := upstream.MarketExpert{
+			ExpertID: expertID, ExpertType: "agent",
+			DisplayNameZH: expertName, ProfessionZH: expertName, Version: "1.0.0",
+		}
+		// 关键词用专家标题：市场检索是按名称/职业匹配，命中后再按 id 精确取。
+		if hit, err := p.cfg.Upstream.MarketExpertByID(a, "agent", expertName, expertID); err == nil && hit != nil {
+			e = *hit
+		}
+		if err := p.cfg.Upstream.ReportDesktopEvent(a, upstream.DesktopExpertSummonSequence(e)...); err != nil {
+			return "", fmt.Errorf("召唤链: %w", err)
+		}
+		conv, req, err := p.cfg.Upstream.DesktopChatWithExpert(a, expertID)
+		if err != nil {
+			return "", fmt.Errorf("真实对话: %w", err)
+		}
+		if err := p.cfg.Upstream.ReportDesktopEvent(a, upstream.DesktopDesignatedExpertSequence(e, conv, req)...); err != nil {
+			return "", fmt.Errorf("使用事件: %w", err)
+		}
+		return fmt.Sprintf("已召唤「%s」并完成一次真实对话（requestId %s）", e.DisplayNameZH, req), nil
+	}
 }
 
 // runExpertTeamUse 完成 Expert_team_use_3（使用 3 个专家团，expertType=team）。

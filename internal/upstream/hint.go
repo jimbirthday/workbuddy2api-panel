@@ -109,6 +109,10 @@ func FrameKind(payload string) ErrKind {
 	if IsModelRateLimit(payload) || IsModelQueueFull(payload) {
 		return ErrSoftRate
 	}
+	// 11148 帧以完整 JSON 到达时按结构化 code 判定，避免丢 code 只按 msg 文本误判为 ErrClient。
+	if IsToolSequenceBroken(payload) {
+		return ErrToolSequence
+	}
 	var f struct {
 		Error struct {
 			Message string `json:"message"`

@@ -239,6 +239,25 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 				e.modelCooldowns[m] = modelCooldown{Until: mc.Until, ResetAt: mc.ResetAt, Reason: mc.Reason, AuditOnly: mc.AuditOnly}
 			}
 		}
+		// 模型级连败降权：未达阈的 Fails 进度与未过期的 Until 都保留。Until 过期时
+		// 若 Fails>0 则只保留在途计数（Until 置零），否则整条跳过（零进度不复活）。
+		if len(s.ModelDegrades) > 0 {
+			for m, md := range s.ModelDegrades {
+				if md.Fails <= 0 && md.Until.IsZero() {
+					continue
+				}
+				if !md.Until.IsZero() && !now.Before(md.Until) {
+					if md.Fails <= 0 {
+						continue
+					}
+					md.Until = time.Time{}
+				}
+				if e.modelDegrades == nil {
+					e.modelDegrades = map[string]modelDegrade{}
+				}
+				e.modelDegrades[m] = modelDegrade{Fails: md.Fails, Until: md.Until}
+			}
+		}
 		// 成本账本：惰性过滤过期（modelCostTTL 外不恢复）+ 剔除结构破损条目
 		// （负 per1k / 零 LastSeen——上游异常或旧文件手改产生的脏数据）。
 		if len(s.ModelCosts) > 0 {
@@ -538,6 +557,18 @@ func (p *Pool) stateOverviewLocked() stateFile {
 					s.ModelCooldowns = map[string]stateModelCooldown{}
 				}
 				s.ModelCooldowns[m] = stateModelCooldown{Until: mc.Until, ResetAt: mc.ResetAt, Reason: mc.Reason, AuditOnly: mc.AuditOnly}
+			}
+		}
+		// 模型级连败降权：跳过 Fails<=0 且 Until 为零的空条目；其余原样落盘。
+		if len(e.modelDegrades) > 0 {
+			for m, md := range e.modelDegrades {
+				if md.Fails <= 0 && md.Until.IsZero() {
+					continue
+				}
+				if s.ModelDegrades == nil {
+					s.ModelDegrades = map[string]stateModelDegrade{}
+				}
+				s.ModelDegrades[m] = stateModelDegrade{Fails: md.Fails, Until: md.Until}
 			}
 		}
 		// 成本账本：惰性过滤过期观测（modelCostTTL 外不写——陈旧价格不复活）。

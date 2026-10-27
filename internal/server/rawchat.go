@@ -51,8 +51,9 @@ func (h *Handler) rawChatBody(w http.ResponseWriter, r *http.Request, body []byt
 
 	resp, err := h.cfg.Upstream.RawChat(r.Context(), acct, body, clientIP, upstream.ChatMeta{})
 	if err != nil {
-		// transport 层失败：与主链路同口径记一次账号失败，让池子尽快把坏号换走。
-		h.cfg.Pool.NoteFailures(acct.UID, bareModel)
+		// transport 层失败：传输层失败是账号级信号，喂账号级连败（model=""），
+		// 不按单模型降权——整号网络故障不应只降权命中的那个模型。
+		h.cfg.Pool.NoteFailures(acct.UID, "")
 		logx.Warnf("[server] rawchat acct=%s model=%s: upstream transport error: %v",
 			logfmt.Label(acct.UID, acct.Nickname), bareModel, err)
 		writeOpenAIError(w, http.StatusBadGateway, "upstream_transport", err.Error())
@@ -60,11 +61,16 @@ func (h *Handler) rawChatBody(w http.ResponseWriter, r *http.Request, body []byt
 	}
 	defer resp.Body.Close()
 
-	// 成功记账：上游已受理（含 4xx/5xx 业务响应——透传链路不分类，只记「请求送达
-	// 且拿到响应」这一层健康）。4xx/5xx 是客户端/上游业务问题，不罚号。
-	if resp.StatusCode < 500 {
+	// 成功记账：上游已受理（含 4xx 业务响应——透传链路不分类，只记「请求送达
+	// 且拿到响应」这一层健康）。4xx 是客户端/上游业务问题，不罚号。
+	if resp.StatusCode < 400 {
+		// 真成功（2xx/3xx）才清模型级连败：429/400 只代表请求已送达，不代表该模型
+		// 恢复健康，若一并 ClearModelDegrade 会把模型级降权提前洗掉。
 		h.cfg.Pool.NoteSuccess(acct.UID)
 		h.cfg.Pool.ClearModelDegrade(acct.UID, bareModel)
+	} else if resp.StatusCode < 500 {
+		// 4xx 沿用透传链路「请求已送达即健康」旧语义记 NoteSuccess，但不 ClearModelDegrade。
+		h.cfg.Pool.NoteSuccess(acct.UID)
 	}
 	logx.Infof("[server] rawchat acct=%s model=%s upstream_status=%d dur=%s body=%dB",
 		logfmt.Label(acct.UID, acct.Nickname), bareModel, resp.StatusCode,

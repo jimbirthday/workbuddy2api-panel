@@ -185,6 +185,21 @@ func TestFrameKindQueueFullIsSoftRate(t *testing.T) {
 	}
 }
 
+func TestFrameKindToolSequenceBroken(t *testing.T) {
+	cases := []struct {
+		name    string
+		payload string
+	}{
+		{"顶层 code+msg", `{"code":11148,"msg":"tool calls and tool results do not match, please start a new conversation and retry"}`},
+		{"error 信封 code+message", `{"error":{"code":"11148","message":"tool calls and tool results do not match"}}`},
+	}
+	for _, c := range cases {
+		if got := FrameKind(c.payload); got != ErrToolSequence {
+			t.Errorf("%s: FrameKind=%v want ErrToolSequence", c.name, got)
+		}
+	}
+}
+
 func TestModelQueueRetryAfterUsesRetryAfterNotEstimatedWait(t *testing.T) {
 	body := `{"code":6020,"msg":"queue.waiting.title","data":{"queue_position":4714,"queue_size":"999+","retry_after":40,"estimated_wait":23570}}`
 	d, ok := ModelQueueRetryAfter(body)

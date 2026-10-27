@@ -1354,6 +1354,9 @@ func TestChatTransportErrorDoesNotPenalize(t *testing.T) {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
 	}
 	st, _ := p.Status("u1")
+	if st.ConsecutiveFails != 1 {
+		t.Fatalf("transport error should feed account-scoped consecutive failure: %+v", st)
+	}
 	if st.Cooling || st.ErrTotal != 0 {
 		t.Fatalf("transport error should not penalize account: %+v", st)
 	}

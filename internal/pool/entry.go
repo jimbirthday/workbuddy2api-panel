@@ -267,8 +267,8 @@ type entry struct {
 	modelCooldowns map[string]modelCooldown
 	// modelDegrades 模型级连败降权表：model → 该模型的连败计数与降权截止。
 	// 与 modelCooldowns 同哲学：单模型连败不冻结整个账号的调度（其他模型仍可选）。
-	// 运行态，不持久化（重启清零，与 modelCooldowns 同口径；持久化见 stateAccount 的
-	// 扩展点时再补，当前用户诉求是单模型隔离语义优先）。
+	// 现已持久化到 stateAccount.ModelDegrades（与 modelCooldowns 同口径：未达阈的
+	// Fails 进度与未过期的 Until 都保留，重启后连败进度与降权期不失忆）。
 	modelDegrades map[string]modelDegrade
 	// sessionDeadFails 连续 12153（ErrSessionDead）计数。12153 在真实环境会被临时性触发
 	// （网络抖动/上游闪断/refresh 竞态），一次失败就永久禁用太粗暴——连续达到阈值才判死。
@@ -443,10 +443,12 @@ func (e *entry) pruneExpiredModelCooldowns(now time.Time) {
 	}
 }
 
-// pruneExpiredModelDegrades 删除 modelDegrades 中已到期的条目（惰性清理，同
-// pruneExpiredModelCooldowns 口径）。连败计数（Fails>0 但 Until 为零）是运行态进度，
-// 成功会清、达阈会转 Until，到期后 Until 失效；为防模型名只增不减，与 modelCooldowns
-// 一并按节流回收。调用方必须已持有 p.mu 写锁。
+// pruneExpiredModelDegrades 删除 modelDegrades 中已到期的降权条目（惰性清理，同
+// pruneExpiredModelCooldowns 口径）。注意：未达阈的连败进度（Fails>0 且 Until 为零）
+// 是**有意保留**的——与账号级 consecutiveFails 同语义，成功（NoteSuccess）或达阈
+// 转 Until 时会清，数量有界于目录模型数，不会无限增长到不可控；本函数只回收
+// Until 已过期且无在途计数的条目（过期但仍有 Fails 的进度保留、Until 置零）。
+// 调用方必须已持有 p.mu 写锁。
 func (e *entry) pruneExpiredModelDegrades(now time.Time) {
 	if len(e.modelDegrades) == 0 {
 		return
@@ -561,6 +563,10 @@ type stateAccount struct {
 	// 跨重启是常态；不持久化会导致 healthyForModel 重启失忆、重新踩雷区。
 	// 恢复时惰性过滤已过期条目。
 	ModelCooldowns map[string]stateModelCooldown `json:"model_cooldowns,omitempty"`
+	// ModelDegrades 模型级连败降权表（model → 连败计数与降权截止，见 entry.modelDegrades）。
+	// 持久化口径与 modelCooldowns 相同：未达阈的连败进度（Fails>0、Until 零）保留，
+	// 重启后连败进度继续累计；Until 未过期保留、过期后仅保留在途 Fails 进度。
+	ModelDegrades map[string]stateModelDegrade `json:"model_degrades,omitempty"`
 	// ModelCosts 实测扣费账本（model → 单价观测，见 entry.modelCost）。持久化
 	// （P1-anti-monopoly）：重启后成本知识保留，限免/夜间免费的跨重启窗口不再
 	// 重新付学费探测。落盘/恢复均按 modelCostTTL 惰性过滤（6h 外不写不恢复——
@@ -592,6 +598,13 @@ type stateModelCooldown struct {
 	ResetAt   time.Time `json:"reset_at,omitempty"`
 	Reason    string    `json:"reason,omitempty"`
 	AuditOnly bool      `json:"audit_only,omitempty"`
+}
+
+// stateModelDegrade 单个 (账号, 模型) 的模型级连败降权持久化记录，与运行态
+// modelDegrade 同构（Fails/Until 字段名与语义对齐），落盘/恢复往返无损。
+type stateModelDegrade struct {
+	Fails int       `json:"fails,omitempty"`
+	Until time.Time `json:"until,omitempty"`
 }
 
 // stateModelCost 单个 (账号, 模型) 的成本观测持久化记录，与运行态 modelCostEntry

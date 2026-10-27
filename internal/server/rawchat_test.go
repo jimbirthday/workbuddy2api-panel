@@ -119,7 +119,7 @@ func TestRawChatUpstreamBusinessErrorPassthrough(t *testing.T) {
 }
 
 // TestRawChatTransportErrorCountsFailure 透传链路 transport 层失败走 502，且按
-// 主链路口径记一次连败失败（NoteFailures），好号快速换走。
+// 主链路口径记一次账号级连败失败（NoteFailures，model=""），好号快速换走。
 func TestRawChatTransportErrorCountsFailure(t *testing.T) {
 	rt := &rawTransport{err: errors.New("dial tcp: connection refused")}
 	up := &upstream.Client{HTTP: &http.Client{Transport: rt}, ChatBaseCN: "https://fake.example"}
@@ -134,8 +134,11 @@ func TestRawChatTransportErrorCountsFailure(t *testing.T) {
 		t.Fatalf("code=%d body=%s (transport error must be 502)", rec.Code, rec.Body.String())
 	}
 	st, _ := p.Status("u1")
-	if len(st.DegradedModels) != 1 || st.DegradedModels[0].Model != "glm-5.2" || st.DegradedModels[0].Fails != 1 {
-		t.Errorf("DegradedModels=%+v want [glm-5.2 fails=1] (transport failure must feed model-scoped NoteFailures)", st.DegradedModels)
+	if st.ConsecutiveFails != 1 {
+		t.Errorf("ConsecutiveFails=%d want 1 (transport failure must feed account-scoped NoteFailures)", st.ConsecutiveFails)
+	}
+	if len(st.DegradedModels) != 0 {
+		t.Errorf("DegradedModels=%+v want empty (transport failure must not feed model-scoped degrade)", st.DegradedModels)
 	}
 }
 

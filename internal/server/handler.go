@@ -1105,6 +1105,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 网络层抖动：只换号，不喂熔断计数（传输层错误对连续失败连坐熔断过于严苛）。
 			// 连败兜底（issue #114）：喂连败计数——连不上上游是「不知道原因的失败」，
 			// 连败 N 次临时出池，单次/偶发不罚（NoteFailures 内部达阈才动作）。
+			// 传输层失败是账号级信号，喂账号级连败（model=""），不按单模型降权。
 			// 上游 client 已打 transport error 日志。
 			recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, false, false, attemptStarted, 0)
 			st.status = http.StatusServiceUnavailable
@@ -1117,7 +1118,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 					logfmt.Label(acct.UID, acct.Nickname), terr)
 				break
 			}
-			h.cfg.Pool.NoteFailures(acct.UID, bareModel)
+			h.cfg.Pool.NoteFailures(acct.UID, "")
 			fail(acct.UID)
 			if !rotateBackoff(rotates, r.Context()) {
 				break // ctx 取消：终止轮转（传输层错误换号退避）
@@ -1424,7 +1425,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 					st.logf("info", "[server] client gone during stream acct=%s: %v (account not penalized)",
 						logfmt.Label(acct.UID, acct.Nickname), sErr)
 				} else {
-					h.cfg.Pool.NoteFailures(acct.UID, bareModel)
+					// 传输层失败是账号级信号，喂账号级连败（model=""），不按单模型降权。
+					h.cfg.Pool.NoteFailures(acct.UID, "")
 					st.logf("warn", "[server] stream acct=%s model=%s: upstream read error: %v",
 						logfmt.Label(acct.UID, acct.Nickname), bareModel, sErr)
 				}

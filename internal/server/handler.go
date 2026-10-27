@@ -1117,7 +1117,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 					logfmt.Label(acct.UID, acct.Nickname), terr)
 				break
 			}
-			h.cfg.Pool.NoteFailures(acct.UID)
+			h.cfg.Pool.NoteFailures(acct.UID, bareModel)
 			fail(acct.UID)
 			if !rotateBackoff(rotates, r.Context()) {
 				break // ctx 取消：终止轮转（传输层错误换号退避）
@@ -1220,6 +1220,23 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				st.outcome = reqlog.OutcomeHTTPError
 				return
 			}
+			// 11148「tool calls and tool results do not match」：会话历史里的工具调用
+			// 记录已损坏，上游明示「直接重试无效，请新建任务」。同一份坏历史换任何账号
+			// 都是同样的 400，轮转只会把坏历史重放给每个健康号并最终误报 503。
+			// 立即透传上游原文回 400（含 requestId），让客户端新建会话重试。
+			if kind == upstream.ErrToolSequence {
+				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
+				fail(acct.UID)
+				msg := string(respBody)
+				if strings.TrimSpace(msg) == "" {
+					msg = "tool calls and tool results do not match, please start a new conversation"
+				}
+				writeOpenAIErrorHint(w, http.StatusBadRequest, "tool_sequence_broken", msg,
+					h.hintOf(upstream.ErrToolSequence, string(respBody), bareModel, reqHasImage, uerr))
+				st.status = http.StatusBadRequest
+				st.outcome = reqlog.OutcomeHTTPError
+				return
+			}
 			// lastErr 携带完整 body（uerr.Msg 在 upstream 侧截断 200 字符，透传语义
 			// 要求原文全量）+ Kind/RetryAfter（末端映射与冷却时长共用）。
 			lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody), RetryAfter: uerr.RetryAfter}
@@ -1235,8 +1252,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			if !rotateBackoff(rotates, r.Context()) {
 				break // ctx 取消：终止轮转（分类错误换号退避）
 			}
-			// 限流且还有未冷却的号：不消耗 MaxRotate。其余失败照常计数。
-			if kind == upstream.ErrSoftRate {
+			// 限流族（429 及各类「账号/额度暂时不可用」的 429 形态）且还有未冷却的
+			// 号：不消耗 MaxRotate。其余失败照常计数。
+			if isRateLimitOutcome(kind, uerr) {
 				lastRateLimited = true
 				if h.poolHasRotatable(tried, bareModel, realm) {
 					continue
@@ -1315,10 +1333,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 					rotates++
 					continue
 				}
-				if kind == upstream.ErrSoftRate && h.poolHasRotatable(tried, bareModel, realm) {
+				if isRateLimitKind(kind) && h.poolHasRotatable(tried, bareModel, realm) {
 					lastRateLimited = true
-					st.logf("warn", "[server] stream acct=%s model=%s: rate-limit frame before content, rotating",
-						logfmt.Label(acct.UID, acct.Nickname), bareModel)
+					st.logf("warn", "[server] stream acct=%s model=%s: rate-limit frame before content kind=%s, rotating",
+						logfmt.Label(acct.UID, acct.Nickname), bareModel, kind)
 					if !rotateBackoff(rotates, r.Context()) {
 						lastErr = &upstream.Error{Kind: kind, Status: http.StatusTooManyRequests, Msg: held.Payload}
 						break
@@ -1406,7 +1424,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 					st.logf("info", "[server] client gone during stream acct=%s: %v (account not penalized)",
 						logfmt.Label(acct.UID, acct.Nickname), sErr)
 				} else {
-					h.cfg.Pool.NoteFailures(acct.UID)
+					h.cfg.Pool.NoteFailures(acct.UID, bareModel)
 					st.logf("warn", "[server] stream acct=%s model=%s: upstream read error: %v",
 						logfmt.Label(acct.UID, acct.Nickname), bareModel, sErr)
 				}
@@ -1421,6 +1439,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				// 真成功：这一跳读完且上游没有报错，才记成功并让粘性跟上。
 				st.outcome = reqlog.OutcomeSuccess
 				h.cfg.Pool.NoteSuccess(acct.UID)
+				h.cfg.Pool.ClearModelDegrade(acct.UID, bareModel)
 				// 11102 负缓存清命：该账号该模型实测成功，立即解除避让（不必等 TTL 到期）。
 				// BlockModelClear 按 "11102" reason 前缀识别，只清 11102 条目、不碰 6004 独立冷却。
 				h.cfg.Pool.BlockModelClear(acct.UID, bareModel)
@@ -1505,7 +1524,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				rotates++
 				continue
 			}
-			if kind == upstream.ErrSoftRate && h.poolHasRotatable(tried, bareModel, realm) {
+			if isRateLimitKind(kind) && h.poolHasRotatable(tried, bareModel, realm) {
 				lastRateLimited = true
 				st.logf("warn", "[server] non-stream acct=%s model=%s: error frame kind=%s before content, rotating",
 					logfmt.Label(acct.UID, acct.Nickname), bareModel, kind)
@@ -1565,6 +1584,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		st.toks = completionTokens(resp)
 		// 非流式同理：聚合成功（无 error 帧、非空流）才算这一跳成功，事后才记成功/绑粘性。
 		h.cfg.Pool.NoteSuccess(acct.UID)
+		h.cfg.Pool.ClearModelDegrade(acct.UID, bareModel)
 		h.cfg.Pool.BlockModelClear(acct.UID, bareModel)
 		if sessKey != "" && h.cfg.Session != nil {
 			h.cfg.Session.Bind(sessKey, acct.UID)
@@ -1604,6 +1624,14 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		st.upstreamStatus = ue.Status
 		st.errMsg = ue.Msg
 		hint = h.hintOf(ue.Kind, ue.Msg, bareModel, reqHasImage, ue)
+		// 上游给的是 429 时，无论分类到哪个 Kind（普通限流 / 积分耗尽 14018 /
+		// trial 未激活 14017 / 账号风控 11140 / 会话失效 12153），对下游都保持
+		// 可重试的 429 语义，绝不落回默认 503——「换不动号」只是本池没有可用号，
+		// 不代表服务端过载。
+		if ue.Status == http.StatusTooManyRequests {
+			status = http.StatusTooManyRequests
+			code = "rate_limit_exceeded"
+		}
 		switch ue.Kind {
 		case upstream.ErrSoftRate:
 			status = http.StatusTooManyRequests
@@ -1760,6 +1788,34 @@ func (h *Handler) poolHasRotatable(tried map[string]bool, model, realm string) b
 	return h.cfg.Pool.HasRotatable(tried, model, realm)
 }
 
+// isRateLimitOutcome 报告本次上游结果是否属于「限流族」：应以可重试的 429 语义
+// 换号继续，且换号不受 MaxRotate 上限约束。
+//
+// 只认两个权威信号，绝不把「限流族」扩大到非 429 状态码（402 余额耗尽 /
+// 401 会话失效 / 403 账号风控各有其不可自愈语义，仍受 MaxRotate 约束）：
+//   - ue.Status == 429：任何 429 都算（14018/14017/11140/12153 等被分到
+//     ErrHardCredit/ErrAccountFault/ErrSessionDead 的形态一并覆盖）；
+//   - kind == ErrSoftRate：保留既有语义——非 429 状态码（如 400）但 body 带
+//     "rate limit" 文案时，Classify 会归 ErrSoftRate，同样免扣 MaxRotate。
+func isRateLimitOutcome(kind upstream.ErrKind, ue *upstream.Error) bool {
+	if ue != nil && ue.Status == http.StatusTooManyRequests {
+		return true
+	}
+	return kind == upstream.ErrSoftRate
+}
+
+// isRateLimitKind 报告该分类是否属于「账号/额度暂时不可用」的限流族。用于
+// HTTP 200 首帧 error（无状态码）的流式/非流式帧路径：ErrHardCredit 覆盖
+// 14018 积分耗尽，ErrAccountFault 覆盖 14017/11140 request illegal，
+// ErrSessionDead 覆盖 12153——这些都该换号继续，而非中断后给下游 502/503。
+func isRateLimitKind(kind upstream.ErrKind) bool {
+	switch kind {
+	case upstream.ErrSoftRate, upstream.ErrHardCredit, upstream.ErrAccountFault, upstream.ErrSessionDead:
+		return true
+	}
+	return false
+}
+
 // heldStreamStatus maps a pre-content upstream error frame to the real HTTP
 // status/code returned when no other account can be rotated in. A model-level
 // rate limit stays retryable 429; request-level failures are 400; everything
@@ -1767,6 +1823,11 @@ func (h *Handler) poolHasRotatable(tried map[string]bool, model, realm string) b
 func heldStreamStatus(kind upstream.ErrKind) (int, string) {
 	switch kind {
 	case upstream.ErrSoftRate:
+		return http.StatusTooManyRequests, "rate_limit_exceeded"
+	case upstream.ErrHardCredit, upstream.ErrAccountFault, upstream.ErrSessionDead:
+		// 限流族：这些分类在「HTTP 200 首帧 error」形态下同样代表账号暂时不可用
+		//（积分耗尽 14018 / trial 未激活 14017 / 账号风控 11140 / 会话失效 12153），
+		// 下游应拿到可重试的 429，而不是 502 upstream_error。
 		return http.StatusTooManyRequests, "rate_limit_exceeded"
 	case upstream.ErrContentBlocked:
 		return http.StatusBadRequest, "content_blocked"
@@ -1778,6 +1839,8 @@ func heldStreamStatus(kind upstream.ErrKind) (int, string) {
 		return http.StatusBadRequest, "image_invalid"
 	case upstream.ErrBadParams:
 		return http.StatusBadRequest, "bad_params"
+	case upstream.ErrToolSequence:
+		return http.StatusBadRequest, "tool_sequence_broken"
 	}
 	return http.StatusBadGateway, "upstream_error"
 }
@@ -1961,6 +2024,10 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// 不罚账号（无冷却/熔断/NoteError，同 ErrContentBlocked 待遇）；chatCompletions
 		// 已 fail-fast 400 透传原文、终止轮转——「换号可能有不同模型权限」属 11102
 		// （ErrModelBlocked）的分类域，与本类无关。
+	case upstream.ErrToolSequence:
+		// 11148 工具调用记录不匹配：会话历史损坏，是请求（会话状态）的问题不是账号的
+		// 问题。零动作（不冷却/不熔断/不 NoteError），chatCompletions 已 fail-fast
+		// 400 透传原文、终止轮转——换任何账号重放同一份坏历史都必然同样 400。
 	case upstream.ErrModelBlocked:
 		// 11102「该后端无此模型」：(账号, 模型) 负缓存避让。复用 modelCooldowns 机制
 		// （与 6004 同域），选号侧 healthyForModel 对该账号自动避开该模型。
@@ -1972,7 +2039,7 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// 账号临时出池（NoteFailures 达阈降权），单次/偶发不罚（不误伤）。ErrNone
 		// 到这里属防御路径（status>=400 但分类成功），语义不明不喂。
 		if kind == upstream.ErrClient {
-			h.cfg.Pool.NoteFailures(uid)
+			h.cfg.Pool.NoteFailures(uid, model)
 		}
 	}
 }

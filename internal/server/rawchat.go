@@ -52,7 +52,7 @@ func (h *Handler) rawChatBody(w http.ResponseWriter, r *http.Request, body []byt
 	resp, err := h.cfg.Upstream.RawChat(r.Context(), acct, body, clientIP, upstream.ChatMeta{})
 	if err != nil {
 		// transport 层失败：与主链路同口径记一次账号失败，让池子尽快把坏号换走。
-		h.cfg.Pool.NoteFailures(acct.UID)
+		h.cfg.Pool.NoteFailures(acct.UID, bareModel)
 		logx.Warnf("[server] rawchat acct=%s model=%s: upstream transport error: %v",
 			logfmt.Label(acct.UID, acct.Nickname), bareModel, err)
 		writeOpenAIError(w, http.StatusBadGateway, "upstream_transport", err.Error())
@@ -64,6 +64,7 @@ func (h *Handler) rawChatBody(w http.ResponseWriter, r *http.Request, body []byt
 	// 且拿到响应」这一层健康）。4xx/5xx 是客户端/上游业务问题，不罚号。
 	if resp.StatusCode < 500 {
 		h.cfg.Pool.NoteSuccess(acct.UID)
+		h.cfg.Pool.ClearModelDegrade(acct.UID, bareModel)
 	}
 	logx.Infof("[server] rawchat acct=%s model=%s upstream_status=%d dur=%s body=%dB",
 		logfmt.Label(acct.UID, acct.Nickname), bareModel, resp.StatusCode,

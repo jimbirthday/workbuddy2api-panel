@@ -673,6 +673,7 @@ func (p *Pool) pruneExpiredIfDue(now time.Time) {
 	p.mu.Lock()
 	for _, e := range p.byUID {
 		e.pruneExpiredModelCooldowns(now)
+		e.pruneExpiredModelDegrades(now)
 		e.pruneExpiredModelCosts(now)
 	}
 	p.mu.Unlock()

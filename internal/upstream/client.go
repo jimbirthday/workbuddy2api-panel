@@ -41,6 +41,7 @@ const (
 	ErrWafBlock                      // 403 + 非业务信封体（APISIX WAF 拦截页/空体）→ 账号软冷却 + 抖动退避
 	ErrPromptTooLong                 // 11115「prompt is too long」→ 请求级错误（上下文超限是请求的问题非账号的问题）：不罚号、不轮转，末端透传原文
 	ErrImageInvalid                  // 图片请求格式/数据无效 → 请求级错误：不罚号、不轮转，末端透传原文
+	ErrToolSequence                  // 11148 工具调用/结果记录不匹配 → 请求历史损坏：不罚号、不轮转，末端 400 透传原文
 	ErrClient                        // 其他 4xx / 业务错误
 )
 
@@ -68,6 +69,8 @@ func (k ErrKind) String() string {
 		return "prompt_too_long"
 	case ErrImageInvalid:
 		return "image_invalid"
+	case ErrToolSequence:
+		return "tool_sequence_broken"
 	case ErrAccountFault:
 		return "account_fault"
 	case ErrClient:
@@ -206,6 +209,12 @@ var softRateResetLoc = time.FixedZone("UTC+8", 8*60*60)
 
 // SoftRateResetLoc 暴露重置时间的固定时区（供测试构造/断言同一时区口径）。
 func SoftRateResetLoc() *time.Location { return softRateResetLoc }
+
+// 11148 工具调用与结果记录不匹配（会话历史损坏，上游明示需新建会话）。
+const (
+	toolSequenceCode      = "11148"
+	toolSequenceMsgMarker = "tool calls and tool results do not match"
+)
 
 // modelRateLimitCode 明确指向「模型级 429 限流」的业务 code。
 // 上游用它表达"该模型的使用量超限"（code 6004，msg 带「将在 … 重置」），
@@ -371,6 +380,50 @@ func IsModelBlocked(status int, body string) bool {
 		return true
 	}
 	return strings.Contains(strings.ToLower(msg), modelBlockMsgMarker)
+}
+
+// IsToolSequenceBroken 报告 body 是否是 11148「工具调用与结果对不上」的确定性答复。
+// 与 IsModelBlocked 同哲学：只比结构化 code/msg，绝不做整段文本子串匹配（requestId
+// 可能撞上 "11148"）。判定 = code 字段精确等于 "11148"，或 msg/message 字段命中
+// 该错误的固定文案（"tool calls and tool results do not match"）。
+//
+// 这是「会话历史已损坏」的终态：上游明示重试无效、需新建会话。网关据此 fail-fast
+// 透传 400，而不是轮转换号（换号只会把同一份坏历史重放给每个健康号）。
+func IsToolSequenceBroken(body string) bool {
+	if body == "" {
+		return false
+	}
+	// 轻量预检：body 既无 "11148" 又无 marker 时直接短路（大多数 4xx 零分配返回）。
+	if !strings.Contains(body, toolSequenceCode) && !strings.Contains(strings.ToLower(body), toolSequenceMsgMarker) {
+		return false
+	}
+	var root map[string]any
+	if err := json.Unmarshal([]byte(body), &root); err != nil {
+		return false
+	}
+	nodes := []map[string]any{root}
+	for _, key := range []string{"error", "extError", "data"} {
+		if inner, ok := root[key].(map[string]any); ok {
+			nodes = append(nodes, inner)
+		}
+	}
+	code, msg := "", ""
+	for _, node := range nodes {
+		for _, key := range []string{"code", "errCode", "error_code"} {
+			if v, ok := node[key]; ok && v != nil && code == "" {
+				code = strings.TrimSpace(fmt.Sprint(v))
+			}
+		}
+		for _, key := range []string{"msg", "message"} {
+			if v, ok := node[key].(string); ok && v != "" && msg == "" {
+				msg = strings.TrimSpace(v)
+			}
+		}
+	}
+	if code == toolSequenceCode {
+		return true
+	}
+	return strings.Contains(strings.ToLower(msg), toolSequenceMsgMarker)
 }
 
 // hasBusinessCode reports whether a JSON error envelope contains an exact
@@ -662,6 +715,13 @@ func Classify(status int, body string) ErrKind {
 			if strings.Contains(lower, m) {
 				return ErrContentBlocked
 			}
+		}
+		// 11148「tool calls and tool results do not match」：会话历史里的工具调用记录
+		// 已损坏，上游明示「重试无效、请新建会话」。与 11101 同哲学——同一份坏历史换
+		// 任何账号都是同样的 400，轮转只会把坏历史重放给每个健康号。归 ErrToolSequence：
+		// 不罚号、不轮转，末端 400 透传上游原文（含 requestId，用户可拿去向上游反馈）。
+		if IsToolSequenceBroken(body) {
+			return ErrToolSequence
 		}
 		// 请求体解析失败（HTTP 400 + Unmarshal chat params failed / code 11101）：
 		// 这是"发给上游的 body 有问题"。网关侧截断已由 413 消灭（issue #41 commit A），

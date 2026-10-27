@@ -298,6 +298,44 @@ func TestChatBadParams400CarriesUpstreamBody(t *testing.T) {
 	}
 }
 
+// TestChatToolSequenceFailsFastWithoutPenalty 上游 400 + 11148（工具调用与结果
+// 记录不匹配）→ 请求历史损坏：不罚账号、不轮转，直接 400 透传上游原文。
+// 同一份坏历史换任何账号都必然同样 400，轮转只会把坏历史重放给健康号。
+func TestChatToolSequenceFailsFastWithoutPenalty(t *testing.T) {
+	calls := map[string]int{}
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		calls[authz]++
+		return 400, `{"code":11148,"msg":"tool calls and tool results do not match, please start a new conversation and retry","requestId":"req-11148"}`, false
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "bad", AccessToken: "at-bad", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "good", AccessToken: "at-good", ExpiresAt: 9999999999},
+	)
+	p.SetCredits("bad", 2000, 0)
+	p.SetCredits("good", 1000, 0)
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("code=%d body=%s (want 400: corrupted tool history must not be retried on other accounts)", rec.Code, rec.Body)
+	}
+	if calls["Bearer at-bad"] != 1 || calls["Bearer at-good"] != 0 {
+		t.Errorf("calls=%v want bad 1 次、good 0 次（零轮转）", calls)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "11148") || !strings.Contains(body, "tool calls and tool results do not match") {
+		t.Errorf("400 message should carry upstream 11148 info: %s", body)
+	}
+	if strings.Contains(body, "no_healthy_account") {
+		t.Errorf("request-level failure must not be reported as account exhaustion: %s", body)
+	}
+	// 账号完好：不罚号。
+	st, _ := p.Status("bad")
+	if st.Cooling || st.Disabled || st.ErrTotal != 0 || st.BreakerFails != 0 {
+		t.Errorf("ErrToolSequence must not penalize account: %+v", st)
+	}
+}
+
 func TestChatNonStreamAggregates(t *testing.T) {
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		if authz != "Bearer at1" {

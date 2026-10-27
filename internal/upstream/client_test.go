@@ -51,6 +51,15 @@ func TestClassify(t *testing.T) {
 		{400, `{"code":11101,"msg":"x"}`, ErrBadParams},
 		{400, `{"code": 11101, "msg":"bad stop"}`, ErrBadParams},
 		{400, `{"error":{"code": "11101"}}`, ErrBadParams},
+		// 11148 工具调用记录不匹配：会话历史损坏，上游明示重试无效。请求级错误，
+		// 不罚号、不轮转——归 ErrToolSequence 而非 ErrClient（否则会被误当成未知
+		// 4xx 换号重放坏历史）。
+		{400, `{"code":11148,"msg":"tool calls and tool results do not match, please start a new conversation and retry"}`, ErrToolSequence},
+		{400, `{"code": 11148, "msg":"tool calls and tool results do not match"}`, ErrToolSequence},
+		{400, `{"error":{"code":"11148","message":"tool calls and tool results do not match, please start a new conversation and retry"}}`, ErrToolSequence},
+		{400, `{"code":"11148","msg":"x"}`, ErrToolSequence},
+		// 只有 msg 文案命中（无 code）同样判定。
+		{400, `{"code":1,"msg":"tool calls and tool results do not match"}`, ErrToolSequence},
 		// 图片格式/数据错误是确定性请求错误，分类后不轮转、不罚号。
 		{400, `{"code":11101,"msg":"Parse message failed: invalid image_url content at index 2: json: cannot unmarshal string into Go value of type v2.ImageContent"}`, ErrImageInvalid},
 		{400, `{"code":11135,"msg":"invalid_image_data"}`, ErrImageInvalid},

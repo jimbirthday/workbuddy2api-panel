@@ -198,6 +198,14 @@ func normalizeReasoningEffort(obj map[string]any, efforts map[string][]string) {
 	reqStr = strings.TrimSpace(strings.ToLower(reqStr))
 	reqIdx, known := effortRank[reqStr]
 	if !known {
+		// 客户端显式发 none（旧客户端 / 前端默认值）：effort 档位表没有 none 档，
+		// 但模型支持 high 时按官方默认档 high 发出（DeepSeek 系官方默认档即 high）。
+		// 不支持 high 的模型不猜测，保持原样透传——避免把 none 硬改成一个不存在的档位。
+		if reqStr == "none" && supportsEffort(supported, "high") {
+			obj[key] = "high"
+			log.Printf("reasoning_effort defaulted model=%s %s -> high supported=%v", model, reqStr, supported)
+			return
+		}
 		log.Printf("reasoning_effort passthrough model=%s effort=%s supported=%v reason=unknown_value", model, reqStr, supported)
 		return
 	}
@@ -230,6 +238,16 @@ func normalizeReasoningEffort(obj map[string]any, efforts map[string][]string) {
 		return
 	}
 	log.Printf("reasoning_effort passthrough model=%s effort=%s supported=%v reason=no_ranked_support", model, reqStr, supported)
+}
+
+// supportsEffort 报告档位集合是否包含目标档位（大小写不敏感、容忍空白）。
+func supportsEffort(supported []string, want string) bool {
+	for _, s := range supported {
+		if strings.EqualFold(strings.TrimSpace(s), want) {
+			return true
+		}
+	}
+	return false
 }
 
 // effortFieldKey 返回请求体里的档位字段名（snake 优先，camel 兜底）；都没有则空串。

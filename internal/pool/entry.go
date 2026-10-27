@@ -88,6 +88,10 @@ type Status struct {
 	// 仅「带解析时间 6004」触发的模型级独立冷却（modelCooldowns 未到期条目）时非空，
 	// 每模型一行；运维据此看到"账号 A 的模型 X 还在限额中，预计 Z 时间恢复"。到期即消失（零回归）。
 	RateLimitedModels []RateLimitedModel `json:"rate_limited_models,omitempty"`
+	// DegradedModels 模型级连败降权台账（issue #114 的模型级扩展）。每模型一行，
+	// 包含连续失败计数与降权截止（未达阈时 Until 为零，仅展示进度）；运维据此看到
+	// 「账号 A 的模型 X 已连败 N 次，预计 Z 时间恢复」。空表 = 无模型级连败记录。
+	DegradedModels []ModelDegradeStatus `json:"degraded_models,omitempty"`
 	// Realm 账号域（cn/global，auth.Realm() 计算值；含 global.enabled 开关闸）。
 	// 供面板/状态接口按域分组展示。
 	Realm string `json:"realm,omitempty"`
@@ -126,6 +130,15 @@ type Status struct {
 	BreakerUntil time.Time `json:"breaker_until,omitempty"`
 }
 
+// ModelDegradeStatus 单个 (账号, 模型) 的模型级连败降权台账行（issue #114 模型级扩展）。
+type ModelDegradeStatus struct {
+	Model string `json:"model"`
+	// Fails 该模型当前的连续失败计数（未达阈时累计，达阈后清零）。
+	Fails int `json:"fails"`
+	// Until 该模型的降权截止；未达阈/已清除时为零值（omitempty 省略）。
+	Until time.Time `json:"until,omitempty"`
+}
+
 // ModelCostStatus 单个 (账号, 模型) 的成本台账行（P1-anti-monopoly 可观测性）。
 // tier 不单独落字段：cost_per_1k ≤ 0 即 tier 0（免费），> 0 即 tier 2（收费），
 // 无观测即 tier 1——由调用方/面板按值推出，避免双表示漂移。
@@ -152,6 +165,16 @@ type RateLimitedModel struct {
 	ResetAt time.Time `json:"reset_at,omitempty"`
 	// Reason 触发原因（运维可读文案）。
 	Reason string `json:"reason,omitempty"`
+}
+
+// modelDegrade 单个 (账号, 模型) 的模型级连败降权记录（issue #114 的模型级扩展）。
+// 语义与账号级 consecutiveFails/degradeUntil 完全同构，但作用域限定在单个模型：
+// 某模型连败达阈时只让该模型临时出池，账号对其他模型仍可选。
+type modelDegrade struct {
+	// Fails 该模型当前的连续失败计数（未达阈时累计，达阈后清零）。
+	Fails int
+	// Until 该模型连败降权截止（非零且未过期 = 该模型临时出池）。
+	Until time.Time
 }
 
 // modelCooldown 单个 (账号, 模型) 的模型级独立冷却记录。
@@ -242,6 +265,11 @@ type entry struct {
 	// 这是单 until 字段做不到的）。空 map = 无模型级限流（不豁免）。
 	// 运行态语义（不持久化）：重启清零，退化为仅账号级 until 冷却的现状。
 	modelCooldowns map[string]modelCooldown
+	// modelDegrades 模型级连败降权表：model → 该模型的连败计数与降权截止。
+	// 与 modelCooldowns 同哲学：单模型连败不冻结整个账号的调度（其他模型仍可选）。
+	// 运行态，不持久化（重启清零，与 modelCooldowns 同口径；持久化见 stateAccount 的
+	// 扩展点时再补，当前用户诉求是单模型隔离语义优先）。
+	modelDegrades map[string]modelDegrade
 	// sessionDeadFails 连续 12153（ErrSessionDead）计数。12153 在真实环境会被临时性触发
 	// （网络抖动/上游闪断/refresh 竞态），一次失败就永久禁用太粗暴——连续达到阈值才判死。
 	// 持久化（stateAccount.SessionDeadFails）：上游持续 session dead 时重启归零会导致
@@ -322,6 +350,19 @@ func (e *entry) modelExempt(now time.Time) bool {
 	return false
 }
 
+// modelDegraded 报告账号对指定 model 是否正处模型级连败降权（该模型的降权截止未过期）。
+// 空 reqModel / 未记录 → false（不因模型级维度限制账号）。
+func (e *entry) modelDegraded(now time.Time, reqModel string) bool {
+	if reqModel == "" || len(e.modelDegrades) == 0 {
+		return false
+	}
+	md, ok := e.modelDegrades[reqModel]
+	if !ok {
+		return false
+	}
+	return !md.Until.IsZero() && now.Before(md.Until)
+}
+
 // modelCooled 报告账号对指定 model 是否正处 6004 模型级冷却（该模型的独立冷却未过期）。
 // 空 reqModel / 未记录 → false（不因模型级维度限制账号）。
 func (e *entry) modelCooled(now time.Time, reqModel string) bool {
@@ -335,14 +376,16 @@ func (e *entry) modelCooled(now time.Time, reqModel string) bool {
 	return !mc.Until.IsZero() && now.Before(mc.Until)
 }
 
-// healthyForModel 报告账号对指定 model 是否可选（含 6004 模型级独立冷却判定）：
-//   - disabled → 永不可选（最高优先级）；
-//   - 该模型正处 6004 独立冷却（modelCooldowns[reqModel] 未过期）→ 不可选
-//     （多模型限流时各自独立，互不影响）；
-//   - 否则 → 回落到账号级 healthy（until/breakerUntil 维度）。
+// healthyForModel 报告账号对指定 model 是否可选（含 6004 模型级独立冷却 + 模型级
+// 连败降权判定）：
+//   - disabled/paused → 永不可选（最高优先级）；
+//   - 该模型正处 6004 独立冷却（modelCooldowns[reqModel] 未过期）→ 不可选；
+//   - 该模型正处模型级连败降权（modelDegrades[reqModel] 未过期）→ 不可选
+//     （多模型连败各自独立，互不影响）；
+//   - 否则 → 回落到账号级 healthy（until/breakerUntil/degradeUntil 维度）。
 //
 // 对比旧实现（softRateModel 单字段豁免"仅锁一个模型、其他豁免"），新语义天然支持
-// 任意多个模型同时限流：被 B 限流的账号对 A 请求仍可选（A 不在 modelCooldowns 拦截
+// 任意多个模型同时限流/降权：被 B 限流或降权的账号对 A 请求仍可选（A 不在拦截表
 // 且账号级 healthy 成立）。空 reqModel / 未记录模型 → 等价 healthy。
 func (e *entry) healthyForModel(now time.Time, reqModel string) bool {
 	if e.disabled || e.paused {
@@ -352,7 +395,11 @@ func (e *entry) healthyForModel(now time.Time, reqModel string) bool {
 		// 该模型在 6004 独立冷却中 → 不可选。
 		return false
 	}
-	// 账号级冷却/熔断先判；若未冷却则由账号级健康决定。
+	if e.modelDegraded(now, reqModel) {
+		// 该模型在模型级连败降权中 → 不可选（其他模型不受影响）。
+		return false
+	}
+	// 账号级冷却/熔断/连败降权先判；若未受限则由账号级健康决定。
 	return e.healthy(now)
 }
 
@@ -393,6 +440,30 @@ func (e *entry) pruneExpiredModelCooldowns(now time.Time) {
 		if mc.Until.IsZero() || !now.Before(mc.Until) {
 			delete(e.modelCooldowns, m)
 		}
+	}
+}
+
+// pruneExpiredModelDegrades 删除 modelDegrades 中已到期的条目（惰性清理，同
+// pruneExpiredModelCooldowns 口径）。连败计数（Fails>0 但 Until 为零）是运行态进度，
+// 成功会清、达阈会转 Until，到期后 Until 失效；为防模型名只增不减，与 modelCooldowns
+// 一并按节流回收。调用方必须已持有 p.mu 写锁。
+func (e *entry) pruneExpiredModelDegrades(now time.Time) {
+	if len(e.modelDegrades) == 0 {
+		return
+	}
+	for m, md := range e.modelDegrades {
+		if !md.Until.IsZero() && !now.Before(md.Until) {
+			// 到期且无在途计数 → 删除；仍有 Fails 计数保留进度（罕见：到期后又在途计数）。
+			if md.Fails <= 0 {
+				delete(e.modelDegrades, m)
+			} else {
+				md.Until = time.Time{}
+				e.modelDegrades[m] = md
+			}
+		}
+	}
+	if len(e.modelDegrades) == 0 {
+		e.modelDegrades = nil
 	}
 }
 

@@ -188,6 +188,7 @@ func (p *Panel) accountTest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p.cfg.Pool.NoteSuccess(uid)
+	p.cfg.Pool.ClearModelDegrade(uid, model)
 	p.cfg.Pool.BlockModelClear(uid, model)
 	p.invalidateOverview()
 	writeJSON(w, http.StatusOK, map[string]any{

@@ -37,6 +37,7 @@ func (e *entry) clearCoolingLocked() {
 	e.reason = ""
 	e.softStreak = 0
 	e.modelCooldowns = nil // 冷却域清零时一并清模型级独立冷却（模型豁免随之消失）
+	e.modelDegrades = nil  // 模型级连败降权同属模型级惩罚域，一并清除
 }
 
 // disableLocked 禁用迁移：置 disabled 并清冷却域（禁用是比冷却更强的不可用终态）。

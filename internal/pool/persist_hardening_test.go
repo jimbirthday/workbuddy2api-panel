@@ -89,7 +89,7 @@ func TestNoteFailuresKeepsLaterCooldownReason(t *testing.T) {
 		p.Add(&auth.Auth{UID: "u1"})
 		p.SetDegrade(1, time.Minute, time.Minute) // 降权 1 分钟
 		p.Cooldown("u1", CoolSoft, time.Hour, "429 rate limit")
-		p.NoteFailures("u1") // 达阈 → 降权截止（+1m）早于 until（+1h）
+		p.NoteFailures("u1", "") // 达阈 → 降权截止（+1m）早于 until（+1h）
 
 		p.mu.RLock()
 		e := p.byUID["u1"]
@@ -117,7 +117,7 @@ func TestNoteFailuresKeepsLaterCooldownReason(t *testing.T) {
 		p.SetDegrade(1, time.Minute, time.Minute)
 		p.Cooldown("u1", CoolSoft, time.Millisecond, "429 rate limit")
 		time.Sleep(5 * time.Millisecond) // 让账号级冷却自然过期
-		p.NoteFailures("u1")
+		p.NoteFailures("u1", "")
 
 		p.mu.RLock()
 		reason := p.byUID["u1"].reason
@@ -133,7 +133,7 @@ func TestNoteFailuresKeepsLaterCooldownReason(t *testing.T) {
 		p.Add(&auth.Auth{UID: "u1"})
 		p.SetDegrade(1, time.Hour, time.Hour)                     // 降权 1 小时
 		p.Cooldown("u1", CoolSoft, time.Minute, "429 rate limit") // 冷却 1 分钟（更早）
-		p.NoteFailures("u1")
+		p.NoteFailures("u1", "")
 
 		p.mu.RLock()
 		reason := p.byUID["u1"].reason
@@ -150,7 +150,7 @@ func TestStatusCoolingCoversDegradeUntil(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
 	p.SetDegrade(1, time.Hour, time.Hour)
-	p.NoteFailures("u1") // 达阈 → degradeUntil = now+1h
+	p.NoteFailures("u1", "") // 达阈 → degradeUntil = now+1h
 
 	st, ok := p.Status("u1")
 	if !ok {

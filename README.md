@@ -59,11 +59,11 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 |---|---|
 | 🔑 **OAuth 一键登录** | `login.sh` 设备授权流程，自动落盘凭证并重启容器加载新账号 |
 | 🔄 **多账号池** | 快过期积分加权 + 成本分层 + 加权随机选号，Top-5 候选 + 防惊群 |
-| 🛡️ **熔断与冷却** | 429 软冷却 600s 起指数退避（封顶 `soft_rate_max`）、404 固定 60s 短冷却、402 硬冷却至次日 04:00、连续失败熔断、在途租约限流 |
+| 🛡️ **熔断与冷却** | 429 软冷却 600s 起指数退避（封顶 `soft_rate_max`）、404 固定 60s 短冷却、402 硬冷却至次日 04:00、连续失败熔断、在途租约限流；**任意 429 不消耗换号上限**，轮换到无未冷却号才把 429 交回客户端 |
 | 🧲 **会话粘性** | 同一会话（`conversation_id`）尽量绑定同一账号，TTL 滚动续期，失败自动解绑，可镜像 Redis 防重启丢失 |
 | ⏰ **定时任务** | 签到（09/21 点，末尾自动跑**连登管家**：兑换已解锁档位 + 抽完抽奖次数）+ 活跃上报（10 点，点亮连登 / 解锁领养 + streak 自检）+ 猫猫旅行（09/21 点，独立排程）+ token 保活（22 点），四类独立开关 |
 | ⚡ **流式 + 非流式** | 出站强制 `stream:true`；SSE 帧按规范白名单重建；非流式由本地聚合为单响应 |
-| 🧠 **推理模型兼容** | DeepSeek 思维链注入（`thinking.type=enabled` + 默认档）、`reasoning_content` 多轮回填、effort 档位自动降级 |
+| 🧠 **推理模型兼容** | DeepSeek 思维链注入（`thinking.type=enabled` + 默认档）、`reasoning_content` 多轮回填、effort 档位自动降级（`none` 回落 `high`） |
 | 💬 **系统提示词体系** | 三种模式（`custom` 替换 / `append` 追加 / `passthrough` 透传，默认 `passthrough`），从源头消灭 system 来源的内容误报；`passthrough` 遇拦截自动降级重试 |
 | 🗑️ **指纹脱敏** | 出站请求体黑名单指纹字段清洗（可关闭），与提示词体系两层叠加 |
 | 📊 **可观测** | 每请求一行表格日志（TTFB / token 速率 / uid）；`/healthz` 带 `service` 身份标识可接负载均衡 / 宿主探活 |
@@ -507,11 +507,14 @@ WARN: [server] stream ...: saw M native tool call block(s) but repaired none (to
 | Session 失效 | body 含 `Offline user session not found` / `12153` | **连续 3 次**才永久禁用（一次 12153 多为临时抖动：网络 / 闪断 / refresh 竞态）；刷新成功 / 任意成功 / 手工复活清计数 | 人工重新登录（`login.sh`）或面板「解冻」（`Pool.Revive`，全清禁用/冷却/熔断） |
 | 上游 404 | HTTP 404 | 软冷却固定 60s（不随 `soft_rate`、不单独退避） | 到期自动恢复 |
 | 服务端错误 | HTTP ≥500 | 喂连续失败计数，达阈值熔断 | 熔断到期 / 成功清零 |
-| 请求体解析失败 | HTTP 400 + `Unmarshal chat params failed` / code `11101` | **不罚账号，但仍轮转**（客户端畸形 JSON，换号照样 400） | 即时 |
+| 请求体解析失败 | HTTP 400 + `Unmarshal chat params failed` / code `11101` | **不罚账号、不轮转**，立即 400 透传上游原文（客户端畸形 JSON，换号照样 400） | 即时 |
+| 工具调用记录损坏 | HTTP 400 + code `11148` / `tool calls and tool results do not match` | **不罚账号、不轮转**，立即 400 透传上游原文（会话历史损坏，重试无效，需新建会话） | 即时 |
 | 内容拦截 | HTTP 400 + 审核文案 | **不罚账号**，`passthrough` 模式走降级重试 | 即时 |
 | 客户端错误 | 其余 4xx / 业务 `code≠0` | 不处罚，换号重试 | 即时 |
 
-请求体解析失败（`11101`）与内容拦截一样**不罚账号**：问题在请求内容而非账号健康。网关不做请求体截断与预拦截，`11101` 均为客户端发来的畸形 JSON。
+请求体解析失败（`11101`）与工具调用记录损坏（`11148`）同属**请求级错误**：问题在请求（会话）而非账号健康，网关不罚号、不轮转，直接透传上游原文。网关不做请求体截断与预拦截，`11101` 均为客户端发来的畸形 JSON。
+
+**11148 的发送前自愈**：网关在出站前对工具消息做三步归一（背靠背 `assistant.tool_calls` 合并 → 结果块重排 → 孤儿 `tool_call`/`tool` 对称剔除），能修掉大部分已知损坏形态；只有归一后仍不匹配的坏历史才会走到上面的 `ErrToolSequence` fail-fast 分支。
 
 **熔断器**：所有冷却入口与 5xx 共用唯一连续失败计数器 `fails`；累计达 `breaker_threshold`（默认 3）触发熔断，退避 `breaker_cooldown × 2^retryCount`，封顶 `6h`；成功清零。
 
@@ -519,7 +522,7 @@ WARN: [server] stream ...: saw M native tool call block(s) but repaired none (to
 
 ### 选号策略
 
-1. 过滤：禁用 / 冷却 / 熔断 / 在途占满账号不参与
+1. 过滤：禁用 / 冷却 / 熔断 / 在途占满账号不参与；账号级连败降权让整号临时出池，**模型级连败降权只让触发模型临时出池**（其他模型仍可选，与模型级限流豁免同哲学）
 2. 按模型实测成本分层，只保留当前最优层
 3. 默认开启快过期积分加权（软偏好，不改排序）：
 
@@ -898,6 +901,14 @@ python3 scripts/probe_max_tokens.py   --base http://127.0.0.1:7863/v1 --key sk-x
 - **切模型立即可用**：冷却由 6004 触发时会记录触发模型；同一账号改用**其他模型**请求时视为可用。同模型或未记录模型的冷却回到现状
 - **退回指数退避**：6004 无「将在 … 重置」文案，或非 6004 的普通软限流 → 仍是 `soft_rate`（600s 起，连续触发指数退避，封顶 `soft_rate_max`）
 
+### 收到 400 code=11148（tool calls and tool results do not match）怎么办？
+
+11148 表示**这段会话历史里的工具调用记录已经对不上**（上游明示「重试无效，请新建任务」），不是账号问题：
+
+- 网关在出站前会先做工具配对归一（合并拆分的并行调用、重排结果块、剔除配不上的孤儿调用/结果），修掉大部分已知损坏形态；
+- 归一后仍 11148 时，网关**不换号、不罚号**，直接把上游原文透传回 `400 tool_sequence_broken`（含 `requestId`，可拿去向上游反馈）；
+- 客户端应**新建会话**重试，而不是在同一会话上继续重发——直接重试无效。
+
 ### 多图会话请求体超限怎么办？
 
 网关**不再设请求体上限**（`server.max_body_mb` 已移除，对齐上游）：任意大小的请求体都会完整读入并转发上游，超限类问题由上游自然返回错误——其响应信息量更大（能看到上游的真实策略），网关不再以 413 提前拦截。
@@ -950,7 +961,12 @@ sudo chown -R 10001:10001 ./auths ./data ./config.json
 | Degraded 中性提示词常量 | `internal/prompt/prompt.go:25` |
 | 降级触发与次日 00:00 CST 重置 | `internal/server/degrade.go:30`（Trigger）、`:46`（nextMidnightCST） |
 | 6004 模型级限流 code 与重置时间解析 | `internal/upstream/client.go:127`、`internal/upstream/client.go:147` |
-| `11101` / Unmarshal 失败不罚号 | `internal/upstream/client.go:114-115`；处理分支 `internal/server/handler.go:489` |
+| `11101` / Unmarshal 失败不罚号 | `internal/upstream/client.go`（`Classify` 的 `ErrBadParams`）；处理分支 `internal/server/handler.go`（`ErrBadParams` fail-fast） |
+| `11148` 工具记录损坏不罚号、不轮转、400 透传 | `internal/upstream/client.go`（`IsToolSequenceBroken` / `ErrToolSequence`）；处理分支 `internal/server/handler.go` |
+| 工具配对三步出站自愈（合并/重排/剔除孤儿） | `internal/upstream/tool_pairing.go`（`mergeAdjacentToolCalls` / `repackToolResultBlocks` / `cleanupOrphanToolCalls`） |
+| 连败降权模型级隔离（只锁触发模型，不冻整号） | `internal/pool/degrade.go`（`NoteFailures` / `noteModelFailuresLocked`）、`internal/pool/entry.go`（`healthyForModel`） |
+| `reasoning_effort=none` 回落 `high` | `internal/upstream/payload.go`（`normalizeReasoningEffort`） |
+| 任意 429 轮换不消耗 `MaxRotate` | `internal/server/handler.go`（`isRateLimitOutcome` / `isRateLimitKind`） |
 | 出站 UA 覆盖（空 = 现状 `CLI/2.63.2 CodeBuddy/2.63.2`） | `cmd/server/config.go:73`；接线 `cmd/server/main.go:96` |
 | session-dead 连续阈值 3 才禁用 | `internal/pool/entry.go`（`sessionDeadThreshold`） |
 | 复活入口：端点「解冻」走 `Revive`（清禁用 + 冷却 + 熔断） | `internal/pool/state.go`（`Revive`）、`internal/panel/panel.go` accountRevive |

@@ -93,6 +93,7 @@ func (p *Pool) ReviveAfterCredentialReplacement(uid string) bool {
 	e.reason = ""
 	e.softStreak = 0
 	e.modelCooldowns = nil
+	e.modelDegrades = nil
 	e.sessionDeadFails = 0
 	e.fails = 0
 	e.retryCount = 0
@@ -126,6 +127,7 @@ func (p *Pool) Revive(uid string) bool {
 	e.reason = ""
 	e.softStreak = 0
 	e.modelCooldowns = nil // 模型级限流豁免随冷却一并清（防泄漏到后续账号级限流）
+	e.modelDegrades = nil  // 模型级连败降权同属模型级惩罚域，一并清除
 	e.sessionDeadFails = 0
 	e.fails = 0
 	e.retryCount = 0
@@ -747,6 +749,7 @@ func (p *Pool) statusOf(uid string, e *entry, now time.Time) Status {
 		// 到期判据 = 该模型的独立冷却 until 未过；条件满足才输出，随到期自然消失，
 		// 普通软冷却（无模型级表）/硬冷却不产生台账（零回归）。
 		RateLimitedModels:        modelRows.rateLimited,
+		DegradedModels:           p.modelDegradeRowsLocked(e),
 		Realm:                    e.a.Realm(),
 		Enterprise:               e.a.IsEnterprise(),
 		Nickname:                 e.a.NicknameValue(),
@@ -806,6 +809,32 @@ func (p *Pool) statusOf(uid string, e *entry, now time.Time) Status {
 		}
 	}
 	return st
+}
+
+// modelDegradeRowsLocked 收集账号当前的模型级连败降权台账行（按模型名稳定排序）。
+// 与 modelCooldowns 不同，连败降权进度（Fails>0 但未达阈）也透出，便于运维看到
+// 「正在累计连败」。调用方必须已持有锁。
+func (p *Pool) modelDegradeRowsLocked(e *entry) []ModelDegradeStatus {
+	if len(e.modelDegrades) == 0 {
+		return nil
+	}
+	models := make([]string, 0, len(e.modelDegrades))
+	for m, md := range e.modelDegrades {
+		if md.Fails <= 0 && md.Until.IsZero() {
+			continue
+		}
+		models = append(models, m)
+	}
+	if len(models) == 0 {
+		return nil
+	}
+	sort.Strings(models)
+	rows := make([]ModelDegradeStatus, 0, len(models))
+	for _, m := range models {
+		md := e.modelDegrades[m]
+		rows = append(rows, ModelDegradeStatus{Model: m, Fails: md.Fails, Until: md.Until})
+	}
+	return rows
 }
 
 // activeModelRowSet 保存一次过滤得到的有效模型台账。限流行与成本行共享

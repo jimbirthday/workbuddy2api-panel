@@ -35,8 +35,8 @@ func TestChatHeadersCarryTenantForEnterprise(t *testing.T) {
 			if got := req.Header.Get("X-Tenant-Id"); got != tc.wantTenant {
 				t.Errorf("X-Tenant-Id=%q want %q", got, tc.wantTenant)
 			}
-			if tc.wantEnt == "" && req.Header.Get("X-No-Enterprise-Id") != "1" {
-				t.Errorf("personal chat must declare X-No-Enterprise-Id=1")
+			if tc.wantEnt == "" && req.Header.Get("X-No-Enterprise-Id") != "" {
+				t.Errorf("personal chat must NOT send X-No-Enterprise-Id (VLM standard omits it)")
 			}
 		})
 	}

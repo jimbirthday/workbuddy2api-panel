@@ -14,7 +14,8 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 )
 
-// TestDeviceTokenInjected_WhenSet auth.Auth.DeviceToken 非空时 chat/billing 请求均注入。
+// TestDeviceTokenInjected_WhenSet auth.Auth.DeviceToken 非空时 billing 请求注入；
+// chat 走 VLM 标准头族（与 WorkBuddy 桌面端一致），不注入 X-Device-Token。
 func TestDeviceTokenInjected_WhenSet(t *testing.T) {
 	a := &auth.Auth{AccessToken: "at", UID: "u1", DeviceToken: "tok-from-auth"}
 	// 用 server 端验证而非 RoundTripper 捕获：更贴近真实注入路径。
@@ -23,7 +24,6 @@ func TestDeviceTokenInjected_WhenSet(t *testing.T) {
 		apply    func(c *Client, req *http.Request)
 		wantPath string
 	}{
-		{"chat", func(c *Client, req *http.Request) { c.ChatHeaders(req, a, "", ChatMeta{}) }, "/v2/chat/completions"},
 		{"billing", func(c *Client, req *http.Request) { c.BillingHeaders(req, a) }, "/v2/report"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -123,8 +123,8 @@ func TestDeviceTokenFromConfigOrFile_Overrides(t *testing.T) {
 				DeviceToken:     tc.cfg,
 				DeviceTokenFile: fp,
 			}
-			req, _ := http.NewRequest(http.MethodPost, srv.URL+"/v2/chat/completions", nil)
-			c.ChatHeaders(req, a, "", ChatMeta{})
+			req, _ := http.NewRequest(http.MethodPost, srv.URL+"/v2/report", nil)
+			c.BillingHeaders(req, a)
 			resp, err := c.HTTP.Do(req)
 			if err != nil {
 				t.Fatalf("do: %v", err)
@@ -176,5 +176,29 @@ func resetDeviceTokenFileCache(path string) (restore func()) {
 			dtFileCache.lastErr = origErr
 			dtFileCache.mu.Unlock()
 		})
+	}
+}
+
+// TestDeviceTokenNotInjected_ChatVLMStandard chat 出站对齐 WorkBuddy VLM 标准：
+// 即使 auth 有 DeviceToken，也不注入 X-Device-Token（官方 /v2/chat/completions 不出此头）。
+func TestDeviceTokenNotInjected_ChatVLMStandard(t *testing.T) {
+	a := &auth.Auth{AccessToken: "at", UID: "u1", DeviceToken: "tok-from-auth"}
+	var got string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Get("X-Device-Token")
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{"code":0}`))
+	}))
+	defer srv.Close()
+	c := &Client{HTTP: srv.Client(), ChatHTTP: srv.Client(), ChatBaseCN: srv.URL}
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/v2/chat/completions", nil)
+	c.ChatHeaders(req, a, "", ChatMeta{})
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		t.Fatalf("do: %v", err)
+	}
+	resp.Body.Close()
+	if got != "" {
+		t.Errorf("chat X-Device-Token = %q want empty (VLM standard omits it)", got)
 	}
 }

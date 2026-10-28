@@ -204,7 +204,7 @@ func normalizeReasoningEffort(obj map[string]any, efforts map[string][]string) {
 		// 不支持 high 的模型不猜测，保持原样透传——避免把 none 硬改成一个不存在的档位。
 		if reqStr == "none" && supportsEffort(supported, "high") {
 			obj[key] = "high"
-			log.Printf("reasoning_effort defaulted model=%s %s -> high supported=%v", model, reqStr, supported)
+			// none → high 是官方默认档补齐，属于预期静默行为，不打日志。
 			return
 		}
 		log.Printf("reasoning_effort passthrough model=%s effort=%s supported=%v reason=unknown_value", model, reqStr, supported)

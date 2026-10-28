@@ -161,6 +161,11 @@ var contentBlockedMarkers = []string{
 // 与账号健康无关——不罚号，但仍轮转（commit B）。
 var badParamsMarkerMsg = "Unmarshal chat params failed"
 
+// badParamsContentTypeMarker 是 message content part 类型错误（HTTP 400）的文案
+// 形态，典型如 "Parse message failed: unsupported content type at index 0: reasoning"。
+// 这类错误由请求内容决定，换号无效，归 ErrBadParams。
+var badParamsContentTypeMarker = "unsupported content type"
+
 // invalidImageMarkers 图片请求格式/数据无效（HTTP 400）的**文案**形态。这类错误由
 // 请求内容决定，不是账号问题：换账号不会改变同一 body 的解析结果。上游常见形态包括
 // `Parse message failed: invalid image_url content`、invalid_image_data、
@@ -723,13 +728,19 @@ func Classify(status int, body string) ErrKind {
 		if IsToolSequenceBroken(body) {
 			return ErrToolSequence
 		}
-		// 请求体解析失败（HTTP 400 + Unmarshal chat params failed / code 11101）：
-		// 这是"发给上游的 body 有问题"。网关侧截断已由 413 消灭（issue #41 commit A），
-		// 剩余来源是客户端 JSON 本身畸形——换了账号照样 400，不该罚号（白白冷却好号）。
-		// 归 ErrBadParams：不冷却/不熔断/不计错，且**不轮转**——11101 发生在上游解析
-		// 请求体阶段，还没走到模型路由，所以"不同账号可能有不同模型权限"其实是
+		// 请求体/消息内容解析失败（HTTP 400）：
+		// 1) Unmarshal chat params failed / code 11101——"发给上游的 body 有问题"。
+		//    网关侧截断已由 413 消灭（issue #41 commit A），剩余来源是客户端 JSON
+		//    本身畸形——换了账号照样 400，不该罚号（白白冷却好号）。
+		// 2) "unsupported content type"——message content part 类型错误（典型如
+		//    "Parse message failed: unsupported content type at index 0: reasoning"），
+		//    是请求级确定性错误，换号无效。
+		// 归 ErrBadParams：不冷却/不熔断/不计错，且**不轮转**——这类错误发生在上游解析
+		// 请求体/消息内容阶段，还没走到模型路由，所以"不同账号可能有不同模型权限"其实是
 		// 11102（ErrModelBlocked）的理由，那里已有 (账号,模型) 负缓存避让。
-		if strings.Contains(body, badParamsMarkerMsg) || codeMarker(lower, "11101") {
+		if strings.Contains(body, badParamsMarkerMsg) ||
+			codeMarker(lower, "11101") ||
+			strings.Contains(lower, badParamsContentTypeMarker) {
 			return ErrBadParams
 		}
 		return ErrClient

@@ -64,6 +64,7 @@ func normalizeBodyObject(obj map[string]any, sanitize bool, efforts map[string][
 	normalizeStop(obj)
 	normalizeRoles(obj)
 	normalizeImageURL(obj)
+	normalizeContentParts(obj)
 	// tool 配对三步（见 tool_pairing.go）：先合并再重排再清理。所有模型一律执行（独立于
 	// deepseek-only 的 sanitize 开关）。这是「让请求通过」的安全网——不完整配对的
 	// tool_calls/tool 结果会让上游对之后每条消息都返 400，必须先行剔除；
@@ -400,6 +401,120 @@ func normalizeImageURL(obj map[string]any) {
 			part["image_url"] = map[string]any{"url": imageURL}
 		}
 	}
+}
+
+// normalizeContentParts 清理 messages[].content 数组里的 reasoning / thinking content part，
+// 避免透传给上游触发 400「Parse message failed: unsupported content type at index 0:
+// reasoning」。这些 part 不是上游认可的内容块，但其中携带的推理文本在满足条件时
+// 先回填到 msg["reasoning_content"]，随后该 part 一律从数组中移除。
+//
+// 只处理 msg["content"] 为 []any 的消息；字符串 content 零改动。其余合法 part
+// （text/image_url/input_text/output_text/summary_text/字符串等）原样保留。
+// 清理后数组为空时把 content 写成空字符串 ""（上游不接受空数组）。
+func normalizeContentParts(obj map[string]any) {
+	model, _ := obj["model"].(string)
+	msgs, ok := obj["messages"].([]any)
+	if !ok {
+		return
+	}
+	for _, rawMsg := range msgs {
+		msg, ok := rawMsg.(map[string]any)
+		if !ok {
+			continue
+		}
+		parts, ok := msg["content"].([]any)
+		if !ok {
+			continue
+		}
+		filtered := make([]any, 0, len(parts))
+		for _, rawPart := range parts {
+			part, ok := rawPart.(map[string]any)
+			if !ok {
+				filtered = append(filtered, rawPart)
+				continue
+			}
+			typ, _ := part["type"].(string)
+			typ = strings.ToLower(strings.TrimSpace(typ))
+			if typ != "reasoning" && typ != "thinking" {
+				filtered = append(filtered, rawPart)
+				continue
+			}
+			// reasoning / thinking part：能提取到文本且当前消息是 assistant，
+			// 并且（模型为 deepseek 或消息已带 reasoning_content 键）时，
+			// 只在 reasoning_content 为空时回填；已有非空值一律保留不覆盖。
+			if text := extractReasoningPartText(part); text != "" {
+				if role, _ := msg["role"].(string); strings.EqualFold(strings.TrimSpace(role), "assistant") {
+					if isDeepSeekModel(model) || hasReasoningContentKey(msg) {
+						if rc, _ := msg["reasoning_content"].(string); rc == "" {
+							msg["reasoning_content"] = text
+						}
+					}
+				}
+			}
+			// 无论是否提取到文本，该 part 都必须移除。
+		}
+		if len(filtered) == 0 {
+			msg["content"] = ""
+		} else {
+			msg["content"] = filtered
+		}
+	}
+}
+
+// hasReasoningContentKey 只判断键是否存在（值可为空），用于非 deepseek 模型
+// 复用“已有 reasoning_content 键则回填”的兼容口径。
+func hasReasoningContentKey(msg map[string]any) bool {
+	_, ok := msg["reasoning_content"]
+	return ok
+}
+
+// extractReasoningPartText 从 reasoning / thinking content part 中提取文本。
+// 优先级：text → thinking（Anthropic thinking block）→ summary；
+// summary 为 string 时直接取，为 []any 时遍历 item 的 text / summary_text，
+// 用 "\n" 连接。所有取值都要求非空 string。
+func extractReasoningPartText(part map[string]any) string {
+	if s, ok := nonEmptyString(part["text"]); ok {
+		return s
+	}
+	if s, ok := nonEmptyString(part["thinking"]); ok {
+		return s
+	}
+	switch v := part["summary"].(type) {
+	case string:
+		if s, ok := nonEmptyString(v); ok {
+			return s
+		}
+	case []any:
+		var items []string
+		for _, rawItem := range v {
+			item, ok := rawItem.(map[string]any)
+			if !ok {
+				continue
+			}
+			if s, ok := nonEmptyString(item["text"]); ok {
+				items = append(items, s)
+				continue
+			}
+			if s, ok := nonEmptyString(item["summary_text"]); ok {
+				items = append(items, s)
+			}
+		}
+		return strings.Join(items, "\n")
+	}
+	return ""
+}
+
+// nonEmptyString 取值必须是 string，且 trim 后非空（避免纯空白文本被当作有效内容）。
+func nonEmptyString(v any) (string, bool) {
+	s, ok := v.(string)
+	if !ok {
+		return "", false
+	}
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "", false
+	}
+	return s, true
 }
 
 // ensureConsoleSystem global realm 兜底 system 注入（吸收 PR #45，防 console 域上游 code 11-128）：

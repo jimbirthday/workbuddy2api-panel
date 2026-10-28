@@ -843,3 +843,159 @@ func TestChatStreamEnterpriseImageSessionCarriesTenant(t *testing.T) {
 		t.Fatalf("enterprise image prompt_cache_key=%q", got)
 	}
 }
+
+// TestPrepareBodyContentPartNormalize 覆盖出站 content 数组里的 reasoning/thinking
+// part 清理：这些 part 透传会让上游报 400「unsupported content type at index 0:
+// reasoning」，必须在出站前移除；可提取的推理文本按条件回填 reasoning_content。
+func TestPrepareBodyContentPartNormalize(t *testing.T) {
+	msgsOf := func(t *testing.T, body string) []any {
+		t.Helper()
+		out := PrepareBodyOptWithEfforts([]byte(body), false, nil)
+		obj, err := decodeBody(out)
+		if err != nil {
+			t.Fatalf("unmarshal out=%s: %v", out, err)
+		}
+		msgs, ok := obj["messages"].([]any)
+		if !ok {
+			t.Fatalf("messages not array: %v", obj["messages"])
+		}
+		return msgs
+	}
+	firstMsg := func(t *testing.T, msgs []any) map[string]any {
+		t.Helper()
+		if len(msgs) != 1 {
+			t.Fatalf("want 1 message, got %d: %v", len(msgs), msgs)
+		}
+		msg, ok := msgs[0].(map[string]any)
+		if !ok {
+			t.Fatalf("message not object: %T", msgs[0])
+		}
+		return msg
+	}
+	partsOf := func(t *testing.T, msg map[string]any) []any {
+		t.Helper()
+		parts, ok := msg["content"].([]any)
+		if !ok {
+			t.Fatalf("content not array: %#v", msg["content"])
+		}
+		return parts
+	}
+
+	t.Run("assistant deepseek reasoning summary extracted and part removed", func(t *testing.T) {
+		msg := firstMsg(t, msgsOf(t, `{"model":"deepseek-v4.1-flash","messages":[{"role":"assistant","content":[{"type":"reasoning","summary":[{"type":"summary_text","text":"hidden"}]},{"type":"text","text":"visible"}]}]}`))
+		parts := partsOf(t, msg)
+		if len(parts) != 1 {
+			t.Fatalf("content parts=%v want only text part", parts)
+		}
+		part, ok := parts[0].(map[string]any)
+		if !ok || part["type"] != "text" || part["text"] != "visible" {
+			t.Fatalf("text part mutated: %#v", parts[0])
+		}
+		if got, _ := msg["reasoning_content"].(string); got != "hidden" {
+			t.Fatalf("reasoning_content=%q want hidden (full msg=%v)", got, msg)
+		}
+	})
+
+	t.Run("assistant non deepseek no reasoning_content key stays absent", func(t *testing.T) {
+		msg := firstMsg(t, msgsOf(t, `{"model":"glm-5.2","messages":[{"role":"assistant","content":[{"type":"reasoning","summary":[{"type":"summary_text","text":"hidden"}]},{"type":"text","text":"visible"}]}]}`))
+		parts := partsOf(t, msg)
+		if len(parts) != 1 {
+			t.Fatalf("content parts=%v want only text part", parts)
+		}
+		part, ok := parts[0].(map[string]any)
+		if !ok || part["type"] != "text" || part["text"] != "visible" {
+			t.Fatalf("text part mutated: %#v", parts[0])
+		}
+		if _, exists := msg["reasoning_content"]; exists {
+			t.Fatalf("reasoning_content should not be added for non-deepseek: %#v", msg)
+		}
+	})
+
+	t.Run("only reasoning part leaves empty string content", func(t *testing.T) {
+		msg := firstMsg(t, msgsOf(t, `{"model":"glm-5.2","messages":[{"role":"assistant","content":[{"type":"reasoning","text":"solo"}]}]}`))
+		if got, ok := msg["content"].(string); !ok || got != "" {
+			t.Fatalf("content=%#v want empty string", msg["content"])
+		}
+	})
+
+	t.Run("thinking block text extracted on deepseek assistant", func(t *testing.T) {
+		msg := firstMsg(t, msgsOf(t, `{"model":"deepseek-v4.1-flash","messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"th"}]}]}`))
+		if got, _ := msg["reasoning_content"].(string); got != "th" {
+			t.Fatalf("reasoning_content=%q want th (full msg=%v)", got, msg)
+		}
+		if _, ok := msg["content"].(string); !ok {
+			t.Fatalf("content should be empty string after removal: %#v", msg["content"])
+		}
+	})
+
+	t.Run("string content and text plus image_url unchanged", func(t *testing.T) {
+		for _, tc := range []struct {
+			name string
+			body string
+			want any
+		}{
+			{"pure string", `{"model":"glm-5.2","messages":[{"role":"user","content":"hello"}]}`, "hello"},
+			{"text plus image_url object", `{"model":"glm-5.2","messages":[{"role":"user","content":[{"type":"text","text":"pic"},{"type":"image_url","image_url":{"url":"https://x/y.png"}}]}]}`,
+				[]any{
+					map[string]any{"type": "text", "text": "pic"},
+					map[string]any{"type": "image_url", "image_url": map[string]any{"url": "https://x/y.png"}},
+				}},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				msg := firstMsg(t, msgsOf(t, tc.body))
+				if !reflect.DeepEqual(msg["content"], tc.want) {
+					t.Fatalf("content=%#v want %#v", msg["content"], tc.want)
+				}
+			})
+		}
+	})
+
+	t.Run("legal content part types are preserved", func(t *testing.T) {
+		msg := firstMsg(t, msgsOf(t, `{"model":"glm-5.2","messages":[{"role":"user","content":[
+			{"type":"text","text":"a"},
+			{"type":"image_url","image_url":{"url":"https://x/y.png"}},
+			{"type":"input_text","text":"b"},
+			{"type":"output_text","text":"c"},
+			{"type":"summary_text","text":"d"},
+			"bare string"
+		]}]}`))
+		parts := partsOf(t, msg)
+		if len(parts) != 6 {
+			t.Fatalf("legal parts count=%d want 6: %#v", len(parts), parts)
+		}
+		wantTypes := []string{"text", "image_url", "input_text", "output_text", "summary_text", ""}
+		for i, want := range wantTypes {
+			part, ok := parts[i].(map[string]any)
+			if want == "" {
+				if ok {
+					t.Fatalf("part[%d] should be string: %#v", i, parts[i])
+				}
+				continue
+			}
+			if !ok || part["type"] != want {
+				t.Fatalf("part[%d]=%#v want type %q", i, parts[i], want)
+			}
+		}
+	})
+
+	t.Run("role Assistant case-insensitive merged", func(t *testing.T) {
+		msg := firstMsg(t, msgsOf(t, `{"model":"deepseek-v4.1-flash","messages":[{"role":"Assistant","content":[{"type":"reasoning","text":"thought"},{"type":"text","text":"visible"}]}]}`))
+		if got, _ := msg["reasoning_content"].(string); got != "thought" {
+			t.Fatalf("reasoning_content=%q want thought (full msg=%v)", got, msg)
+		}
+		parts := partsOf(t, msg)
+		if len(parts) != 1 {
+			t.Fatalf("content parts=%v want only text part", parts)
+		}
+	})
+
+	t.Run("whitespace-only reasoning text ignored", func(t *testing.T) {
+		msg := firstMsg(t, msgsOf(t, `{"model":"deepseek-v4.1-flash","messages":[{"role":"assistant","content":[{"type":"reasoning","text":"   "}]}]}`))
+		if rc, _ := msg["reasoning_content"].(string); rc != "" {
+			t.Fatalf("whitespace-only reasoning must not set non-empty reasoning_content: %#v", msg)
+		}
+		if got, ok := msg["content"].(string); !ok || got != "" {
+			t.Fatalf("content=%#v want empty string", msg["content"])
+		}
+	})
+}

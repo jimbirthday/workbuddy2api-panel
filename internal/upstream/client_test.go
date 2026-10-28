@@ -51,6 +51,10 @@ func TestClassify(t *testing.T) {
 		{400, `{"code":11101,"msg":"x"}`, ErrBadParams},
 		{400, `{"code": 11101, "msg":"bad stop"}`, ErrBadParams},
 		{400, `{"error":{"code": "11101"}}`, ErrBadParams},
+		// "unsupported content type"：message content part 类型错误，请求级确定性错误，
+		// 换号无效，归 ErrBadParams（不罚号、不轮转）。
+		{400, `Parse message failed: unsupported content type at index 0: reasoning`, ErrBadParams},
+		{400, `{"code":1,"msg":"Parse message failed: unsupported content type at index 0: reasoning"}`, ErrBadParams},
 		// 11148 工具调用记录不匹配：会话历史损坏，上游明示重试无效。请求级错误，
 		// 不罚号、不轮转——归 ErrToolSequence 而非 ErrClient（否则会被误当成未知
 		// 4xx 换号重放坏历史）。

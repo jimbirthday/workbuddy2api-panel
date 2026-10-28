@@ -999,3 +999,75 @@ func TestPrepareBodyContentPartNormalize(t *testing.T) {
 		}
 	})
 }
+
+// TestPrepareBodyDefaultEffortInjection 缺 reasoning_effort 时按模型能力补齐默认档：
+// 固定单档模型取唯一档位，多档模型取声明默认档；thinking.type=disabled 不补。
+func TestPrepareBodyDefaultEffortInjection(t *testing.T) {
+	cases := []struct {
+		name    string
+		body    string
+		efforts map[string][]string
+		defs    map[string]string
+		want    string // 期望 reasoning_effort；空=字段不应存在
+	}{
+		{
+			name:    "single fixed effort model gets its sole value",
+			body:    `{"model":"glm-5.1","messages":[{"role":"user","content":"hi"}]}`,
+			efforts: map[string][]string{"glm-5.1": {"medium"}},
+			want:    "medium",
+		},
+		{
+			name:    "multi effort model gets declared default",
+			body:    `{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`,
+			efforts: map[string][]string{"glm-5.2": {"low", "high", "max"}},
+			defs:    map[string]string{"glm-5.2": "high"},
+			want:    "high",
+		},
+		{
+			name:    "thinking disabled does not inject",
+			body:    `{"model":"glm-5.1","thinking":{"type":"disabled"},"messages":[{"role":"user","content":"hi"}]}`,
+			efforts: map[string][]string{"glm-5.1": {"medium"}},
+			want:    "",
+		},
+		{
+			name:    "unknown model no injection",
+			body:    `{"model":"unknown-model","messages":[{"role":"user","content":"hi"}]}`,
+			efforts: map[string][]string{"glm-5.1": {"medium"}},
+			want:    "",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			out := PrepareBodyOptWithEffortsAndDefault([]byte(c.body), false, c.efforts, c.defs)
+			var obj map[string]any
+			if err := json.Unmarshal(out, &obj); err != nil {
+				t.Fatalf("unmarshal: %v (body=%s)", err, out)
+			}
+			if c.want == "" {
+				if _, ok := obj["reasoning_effort"]; ok {
+					t.Fatalf("reasoning_effort should be absent, got %v body=%s", obj["reasoning_effort"], out)
+				}
+				return
+			}
+			got, ok := obj["reasoning_effort"].(string)
+			if !ok || got != c.want {
+				t.Fatalf("reasoning_effort=%v want %q body=%s", obj["reasoning_effort"], c.want, out)
+			}
+		})
+	}
+}
+
+// TestPrepareBodyCNStaticEffortInjection CN 域远端桶缺固定单档模型时，
+// effortFor 必须回落到 cnEffortFallback 并为缺档请求注入唯一档位（glm-5.1→medium）。
+func TestPrepareBodyCNStaticEffortInjection(t *testing.T) {
+	c := &Client{}
+	c.SanitizeFingerprints.Store(false)
+	got := c.prepareBody([]byte(`{"model":"glm-5.1","messages":[{"role":"user","content":"hi"}]}`), "cn", "uid", "conv", false)
+	var obj map[string]any
+	if err := json.Unmarshal(got, &obj); err != nil {
+		t.Fatal(err)
+	}
+	if v, _ := obj["reasoning_effort"].(string); v != "medium" {
+		t.Fatalf("cn static fallback should inject medium, got %v body=%s", obj["reasoning_effort"], got)
+	}
+}

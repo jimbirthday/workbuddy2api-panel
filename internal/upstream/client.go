@@ -1014,9 +1014,11 @@ func (c *Client) effortFor(realm, model string) (map[string][]string, map[string
 	if bucket := c.efforts[k]; len(bucket) > 0 && model != "" {
 		supported = bucket[model]
 	}
-	if k == "global" && len(supported) == 0 && model != "" {
-		// 远端未下发该模型档位时用产品静态表兜底（issue #84）。远端有值则权威优先。
-		if cap, ok := globalEffortFallback[model]; ok {
+	if len(supported) == 0 && model != "" {
+		// 远端未下发该模型档位时用产品静态表兜底（global issue #84；CN 同理：
+		// glm-5.1 等固定单档模型目录不返回 supportedEfforts，缺档上游会 11150）。
+		// 远端有值则权威优先。
+		if cap := staticEffortCap(k, model); len(cap.efforts) > 0 {
 			supported = cap.efforts
 		}
 	}
@@ -1030,10 +1032,8 @@ func (c *Client) effortFor(realm, model string) (map[string][]string, map[string
 		// 旧 globalEffortMap 只覆盖非空远端值，而「远端桶存在但该模型无 default」
 		// 恰恰是 issue #84 要求回落静态表的形态。两者需要区分，不能只看 def == ""。
 		def, remoteDefault := c.defaultEfforts[k][model]
-		if k == "global" {
-			if !remoteDefault || def == "" {
-				def = globalEffortFallback[model].defaultEffort
-			}
+		if !remoteDefault || def == "" {
+			def = staticEffortCap(k, model).defaultEffort
 		}
 		if def != "" {
 			defs = map[string]string{model: def}
@@ -1058,10 +1058,8 @@ func (c *Client) supportedEfforts(realm, model string) []string {
 			return supported
 		}
 	}
-	if realmKey(realm) == "global" {
-		if cap, ok := globalEffortFallback[model]; ok {
-			return cap.efforts
-		}
+	if cap := staticEffortCap(realmKey(realm), model); len(cap.efforts) > 0 {
+		return cap.efforts
 	}
 	return nil
 }

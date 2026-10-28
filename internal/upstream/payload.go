@@ -88,7 +88,7 @@ func normalizeBodyObject(obj map[string]any, sanitize bool, efforts map[string][
 	// 模型不支持默认档时自动落到 ≤ 默认档的最高支持档（不出站不合规档位）。
 	modelName, _ := obj["model"].(string)
 	injectThinking(obj, lookupDefaultEffort(defaultEfforts, modelName))
-	normalizeReasoningEffort(obj, efforts)
+	normalizeReasoningEffort(obj, efforts, defaultEfforts)
 	// DeepSeek 多轮一致性：assistant 消息带 reasoning 痕迹时回填 reasoning_content
 	// （requiresReasoningContentOnAssistantMessages，见 thinking.go）。
 	backfillReasoningContent(obj)
@@ -175,7 +175,7 @@ var effortRank = map[string]int{"off": 0, "minimal": 1, "low": 2, "medium": 3, "
 //     目录缺失不在热路径打日志（每个带档位的请求都会命中）；出站 4xx 那一行
 //     会带上实际发出的 reasoning_effort 和当时的 catalog。
 //     只有档位值本身无法识别时打一行：这种值降级表对不上，会原样打到上游。
-func normalizeReasoningEffort(obj map[string]any, efforts map[string][]string) {
+func normalizeReasoningEffort(obj map[string]any, efforts map[string][]string, defaultEfforts map[string]string) {
 	if len(efforts) == 0 {
 		return
 	}
@@ -189,6 +189,21 @@ func normalizeReasoningEffort(obj map[string]any, efforts map[string][]string) {
 	}
 	key := effortFieldKey(obj)
 	if key == "" {
+		// 请求未携带档位字段：官方客户端对「固定单档/已声明默认档」模型仍会显式发
+		// 档位，缺档上游 400 11150（实测 glm-5.1 固定 medium）。按模型能力补齐默认档：
+		// 先取声明默认档（须在支持集合内），否则单档模型取唯一档位。客户端显式
+		// thinking.type=disabled 时不补（关闭思考意味着不带任何 effort）。
+		if thinkingDisabled(obj) {
+			return
+		}
+		if def := defaultEfforts[model]; def != "" && supportsEffort(supported, def) {
+			obj["reasoning_effort"] = def
+			return
+		}
+		if len(supported) == 1 {
+			obj["reasoning_effort"] = strings.TrimSpace(supported[0])
+			return
+		}
 		return
 	}
 	reqStr, ok := obj[key].(string)
@@ -249,6 +264,17 @@ func supportsEffort(supported []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// thinkingDisabled 请求体是否显式关闭思考开关（thinking.type=disabled）。
+// 缺档补齐前需要先查它：关闭思考的请求不带任何 effort，补齐会把已关闭的开关重新打开。
+func thinkingDisabled(obj map[string]any) bool {
+	th, ok := obj["thinking"].(map[string]any)
+	if !ok {
+		return false
+	}
+	typ, _ := th["type"].(string)
+	return strings.EqualFold(strings.TrimSpace(typ), "disabled")
 }
 
 // effortFieldKey 返回请求体里的档位字段名（snake 优先，camel 兜底）；都没有则空串。

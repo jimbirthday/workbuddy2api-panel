@@ -1355,9 +1355,9 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 			if supported := c.supportedEfforts(a.Realm(), model); supported != nil {
 				catalog = fmt.Sprint(supported)
 			}
-			log.Printf("WARN: [upstream] chat_stream acct=%s model=%s reasoning_effort=%s thinking=%s catalog=%s: upstream %d %s body=%s",
+			log.Printf("WARN: [upstream] chat_stream acct=%s model=%s reasoning_effort=%s thinking=%s catalog=%s: upstream %d %s body=%s req=%s",
 				logfmt.Label(a.UID, a.Nickname), model, effort, thinking, catalog,
-				resp.StatusCode, kind, truncate(string(raw), 200))
+				resp.StatusCode, kind, truncate(string(raw), 8192), redactPreparedBody(prepared))
 			// ≥400 直接返回（#119 后 global 单路径 /v2，chat 层无 fallback 链）。
 			// 分类一次、随 Kind 信封返回（含 Retry-After 头解析）：
 			// ErrNone 是防御分支（≥400 不应产生 None），返回原文让 handler 兜底。
@@ -2552,6 +2552,56 @@ func IsAlreadyCheckin(err error) bool {
 
 func truncate(s string, n int) string {
 	return logfmt.Truncate(s, n)
+}
+
+// redactPreparedBody 4xx 排障用：序列化出站请求体供日志打印。data: 图片 base64
+// 仅保留长度占位（避免整图进日志），超长字符串截断；解析失败时退化为原文截断。
+func redactPreparedBody(prepared []byte) string {
+	if len(prepared) == 0 {
+		return ""
+	}
+	var obj any
+	if err := json.Unmarshal(prepared, &obj); err != nil {
+		return truncate(string(prepared), 8192)
+	}
+	redactLogValue(obj)
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return truncate(string(prepared), 8192)
+	}
+	return truncate(string(out), 16384)
+}
+
+// redactLogValue 深度遍历 map/slice，把字符串里的 data: base64 换成长度占位、超长串截断。
+func redactLogValue(v any) {
+	switch x := v.(type) {
+	case map[string]any:
+		for k, val := range x {
+			x[k] = redactLogString(val)
+		}
+	case []any:
+		for i, val := range x {
+			x[i] = redactLogString(val)
+		}
+	}
+}
+
+// redactLogString 返回日志安全的字符串值；非字符串值递归处理。
+func redactLogString(v any) any {
+	if s, ok := v.(string); ok {
+		if isDataURI(s) {
+			return "data:<redacted " + strconv.Itoa(len(s)) + " bytes>"
+		}
+		return truncate(s, 2048)
+	}
+	redactLogValue(v)
+	return v
+}
+
+// isDataURI 判断字符串是否为 data: base64 数据（图片等二进制内联形态）。
+func isDataURI(s string) bool {
+	lower := strings.ToLower(s)
+	return strings.HasPrefix(lower, "data:") && strings.Contains(lower, "base64")
 }
 
 // 以下是静态 marker 表的预转小写副本（含中文原文，ToLower 对中文无变化）。

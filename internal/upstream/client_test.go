@@ -800,3 +800,30 @@ func TestGatewayHintImageConversation(t *testing.T) {
 		t.Fatalf("generic image hint=%q", got)
 	}
 }
+
+// TestRedactPreparedBody 4xx 排障日志的出站 body 脱敏：data: base64 图片只留长度
+// 占位、普通短字符串保留、非法 JSON 退化为原文截断。
+func TestRedactPreparedBody(t *testing.T) {
+	img := "data:image/png;base64," + strings.Repeat("A", 3000)
+	in := []byte(`{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":[{"type":"text","text":"hi"},{"type":"image_url","image_url":{"url":"` + img + `"}}]}]}`)
+	got := redactPreparedBody(in)
+	if strings.Contains(got, "AAAA") {
+		t.Fatalf("redacted body still contains base64 payload: %s", got)
+	}
+	if !strings.Contains(got, "redacted 3022 bytes") {
+		t.Fatalf("redacted body missing base64 placeholder: %s", got)
+	}
+	if !strings.Contains(got, `"text":"hi"`) {
+		t.Fatalf("short text should be preserved: %s", got)
+	}
+
+	if got := redactPreparedBody([]byte("not-json")); got != "not-json" {
+		t.Fatalf("invalid json fallback=%q", got)
+	}
+
+	long := strings.Repeat("x", 3000)
+	got = redactPreparedBody([]byte(`{"model":"` + long + `"}`))
+	if len(got) > 2048+len(`{"model":""}`) {
+		t.Fatalf("long string not truncated: len=%d", len(got))
+	}
+}

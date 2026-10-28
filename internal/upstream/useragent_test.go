@@ -48,7 +48,7 @@ func TestUserAgentDefaultEmptyKeepsClientUA(t *testing.T) {
 			call: func(c *Client) error {
 				return c.ReportChatActivity(&auth.Auth{AccessToken: "at", UID: "u1"}, "cid", "")
 			},
-			wantUA: "WorkBuddy/5.9.3",
+			wantUA: defaultUAString,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -123,8 +123,8 @@ func TestUserAgentOverrideBilling(t *testing.T) {
 		BillingBaseCN: "https://billing.example",
 		UserAgent:     "CustomAgent/1",
 	}
-	if _, _, err := c.UserResource(a); err != nil {
-		t.Errorf("userResource: %v", err)
+	if _, err := c.TravelStatus(a); err != nil {
+		t.Errorf("travelStatus: %v", err)
 	}
 }
 
@@ -265,8 +265,8 @@ func TestBillingUA_WhenClientNameSet(t *testing.T) {
 		BillingBaseCN: "https://billing.example",
 		ClientName:    "WorkBuddy",
 	}
-	if _, _, err := c.UserResource(a); err != nil {
-		t.Errorf("userResource: %v", err)
+	if _, err := c.TravelStatus(a); err != nil {
+		t.Errorf("travelStatus: %v", err)
 	}
 	// 自定义 client_version → WorkBuddy/6.0.0
 	c2 := &Client{
@@ -281,8 +281,8 @@ func TestBillingUA_WhenClientNameSet(t *testing.T) {
 		ClientName:    "WorkBuddy",
 		ClientVersion: "6.0.0",
 	}
-	if _, _, err := c2.UserResource(a); err != nil {
-		t.Errorf("userResource v2: %v", err)
+	if _, err := c2.TravelStatus(a); err != nil {
+		t.Errorf("travelStatus v2: %v", err)
 	}
 	// 显式 user_agent 仍优先于 billingUA
 	c3 := &Client{
@@ -297,8 +297,8 @@ func TestBillingUA_WhenClientNameSet(t *testing.T) {
 		ClientName:    "WorkBuddy",
 		UserAgent:     billingUAAgentString,
 	}
-	if _, _, err := c3.UserResource(a); err != nil {
-		t.Errorf("userResource v3: %v", err)
+	if _, err := c3.TravelStatus(a); err != nil {
+		t.Errorf("travelStatus v3: %v", err)
 	}
 }
 
@@ -317,8 +317,8 @@ func TestBillingUA_WhenClientNameEmpty(t *testing.T) {
 		BillingBaseCN: "https://billing.example",
 		ClientVersion: "6.0.0",
 	}
-	if _, _, err := c.UserResource(a); err != nil {
-		t.Errorf("userResource: %v", err)
+	if _, err := c.TravelStatus(a); err != nil {
+		t.Errorf("travelStatus: %v", err)
 	}
 	if ua != "WorkBuddy/6.0.0" {
 		t.Errorf("billing UA = %q want WorkBuddy/6.0.0 (default desktop fingerprint)", ua)

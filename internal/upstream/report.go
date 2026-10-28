@@ -41,13 +41,32 @@ func (c *Client) billingJSON(a *auth.Auth, method, path string, body any) (json.
 	return c.doJSON(req)
 }
 
+// billingMeterJSONOnce 发单个 /billing/meter 族请求并解信封。头族用
+// BillingMeterHeaders（对齐本地 WorkBuddy 签到/资源包真实 axios 出站）。
+func (c *Client) billingMeterJSONOnce(a *auth.Auth, method, path string, body any) (json.RawMessage, error) {
+	var rdr io.Reader
+	if body != nil {
+		raw, err := json.Marshal(body)
+		if err != nil {
+			return nil, err
+		}
+		rdr = bytes.NewReader(raw)
+	}
+	req, err := http.NewRequest(method, c.billingBase(a)+path, rdr)
+	if err != nil {
+		return nil, err
+	}
+	c.BillingMeterHeaders(req, a)
+	return c.doJSON(req)
+}
+
 // billingMeterJSON 仅对 /billing/meter 族端点（get-user-resource / daily-checkin）
 // 按 realm 走双路径 fallback：global 先无 /v2 前缀，ErrNotFound 时二次换有 /v2 前缀
 // （上游新旧路径分叉）；cn 单路径（有 /v2）现状不变。仅 global realm 才有多路径。
 func (c *Client) billingMeterJSON(a *auth.Auth, paths []string, method string, body any) (json.RawMessage, error) {
 	var lastErr error
 	for i, path := range paths {
-		data, err := c.billingJSON(a, method, path, body)
+		data, err := c.billingMeterJSONOnce(a, method, path, body)
 		if err == nil {
 			return data, nil
 		}
@@ -201,6 +220,11 @@ func (c *Client) ReportChatActivityModel(a *auth.Auth, conversationID, requestID
 	if err != nil {
 		return err
 	}
-	_, err = c.billingJSON(a, http.MethodPost, reportPath, json.RawMessage(raw))
+	req, err := http.NewRequest(http.MethodPost, c.billingBase(a)+reportPath, bytes.NewReader(raw))
+	if err != nil {
+		return err
+	}
+	c.ReportHeaders(req, a)
+	_, err = c.doJSON(req)
 	return err
 }

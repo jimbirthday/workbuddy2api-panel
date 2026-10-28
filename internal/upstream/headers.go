@@ -412,14 +412,98 @@ func (c *Client) BillingHeaders(req *http.Request, a *auth.Auth) {
 	c.injectDeviceToken(req, a)
 }
 
-// RefreshHeaders refresh 端点专属头（X-Refresh-Token 只允许出现在这里）。
-func (c *Client) RefreshHeaders(req *http.Request, a *auth.Auth) {
-	c.CommonHeaders(req, a)
-	req.Header.Set("X-Refresh-Token", a.RefreshToken)
+// billingMeterUA billing/meter 族（签到/资源包/礼包）出站 UA。真实 WorkBuddy
+// 该族走 axios 客户端（UA=axios/1.16.1）；显式 config user_agent 仍可覆盖。
+func (c *Client) billingMeterUA() string {
+	if c != nil && c.UserAgent != "" {
+		return c.UserAgent
+	}
+	return "axios/1.16.1"
+}
+
+// BillingMeterHeaders billing/meter 族请求头，对齐本地 WorkBuddy 真实出站
+// （POST /v2/billing/meter/daily-checkin、/checkin-activity-status 抓包）：
+//   - Accept/Content-Type=application/json
+//   - Authorization / X-User-Id / X-Domain
+//   - X-Request-ID（32 hex）、User-Agent=axios/1.16.1（或显式覆盖）
+//   - X-Device-Token（有则发，签到/checkin 族真实携带）
+//
+// 不发送 X-Product / X-CodeBuddy-Request / Origin / Referer / Accept-Language。
+// 注意：不手动设置 Accept-Encoding——Go Transport 会自行加 gzip 并透明解压，
+// 手动设置会绕过自动解压导致响应解析失败。
+func (c *Client) BillingMeterHeaders(req *http.Request, a *auth.Auth) {
+	c.resetRequestHeaders(req)
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
+	if a.UID != "" {
+		req.Header.Set("X-User-Id", a.UID)
+	}
+	if d := a.DomainValue(); d != "" {
+		req.Header.Set("X-Domain", d)
+	}
 	if eid := a.EnterpriseIDValue(); eid != "" {
 		req.Header.Set("X-Enterprise-Id", eid)
 		req.Header.Set("X-Tenant-Id", eid)
 	}
-	// X-Auth-Refresh-Source 对齐官方客户端 refresh 渠道标识 "plugin"（D3）。
+	req.Header.Set("X-Request-ID", session.NewMessageID())
+	req.Header.Set("User-Agent", c.billingMeterUA())
+	c.injectDeviceToken(req, a)
+}
+
+// ReportHeaders /v2/report 请求头，对齐本地 WorkBuddy 真实出站：
+//   - Accept=application/json, text/plain, */*；Content-Type=application/json;charset=UTF-8
+//   - User-Agent=WorkBuddy/<ver> WorkBuddy/<ver> CLI/<cliVer>（或显式覆盖）
+//   - X-Request-ID、X-Product=SaaS、Authorization、X-User-Id、X-Domain
+//
+// 真实 /v2/report 不携带 X-Device-Token，也不携带 X-CodeBuddy-Request。
+func (c *Client) ReportHeaders(req *http.Request, a *auth.Auth) {
+	c.resetRequestHeaders(req)
+	req.Header.Set("Accept", "application/json, text/plain, */*")
+	req.Header.Set("Content-Type", "application/json;charset=UTF-8")
+	req.Header.Set("User-Agent", c.chatUserAgent())
+	req.Header.Set("X-Request-ID", session.NewMessageID())
+	req.Header.Set("X-Product", "SaaS")
+	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
+	if a.UID != "" {
+		req.Header.Set("X-User-Id", a.UID)
+	}
+	if d := a.DomainValue(); d != "" {
+		req.Header.Set("X-Domain", d)
+	}
+	if eid := a.EnterpriseIDValue(); eid != "" {
+		req.Header.Set("X-Enterprise-Id", eid)
+		req.Header.Set("X-Tenant-Id", eid)
+	}
+}
+
+// RefreshHeaders refresh 端点专属头（X-Refresh-Token 只允许出现在这里）。
+// 对齐本地 WorkBuddy 真实 POST /v2/plugin/auth/token/refresh 抓包：
+//   - Accept=application/json, text/plain, */*；Content-Type=application/json
+//   - X-Domain、X-Refresh-Token、X-Auth-Refresh-Source=plugin
+//   - User-Agent=WorkBuddy/<ver> WorkBuddy/<ver> CLI/<cliVer>（或显式覆盖）
+//   - X-Request-ID、X-Product=SaaS、Authorization、X-User-Id
+//
+// 不再走 CommonHeaders（真实 refresh 不带 Origin/Referer/X-Requested-With/
+// X-CodeBuddy-Request/Accept-Language/X-Machine-ID/X-Session-ID）。
+func (c *Client) RefreshHeaders(req *http.Request, a *auth.Auth) {
+	c.resetRequestHeaders(req)
+	req.Header.Set("Accept", "application/json, text/plain, */*")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Refresh-Token", a.RefreshToken)
 	req.Header.Set("X-Auth-Refresh-Source", "plugin")
+	req.Header.Set("User-Agent", c.chatUserAgent())
+	req.Header.Set("X-Request-ID", session.NewMessageID())
+	req.Header.Set("X-Product", "SaaS")
+	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
+	if a.UID != "" {
+		req.Header.Set("X-User-Id", a.UID)
+	}
+	if d := a.DomainValue(); d != "" {
+		req.Header.Set("X-Domain", d)
+	}
+	if eid := a.EnterpriseIDValue(); eid != "" {
+		req.Header.Set("X-Enterprise-Id", eid)
+		req.Header.Set("X-Tenant-Id", eid)
+	}
 }

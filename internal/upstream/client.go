@@ -254,31 +254,41 @@ func IsModelRateLimit(body string) bool {
 // 同一个模型会一起返回。
 //   - 6021 / queue.full.title：队列已满，请求被拒。
 //   - 6020 / queue.waiting.title：还在排队（body 带 queue_position、retry_after）。
+//   - 6022 / queue.userLimit.title：该用户在此模型队列中的并发/排队额度已满。
 const (
-	modelQueueFullCode = "6021"
-	modelQueueFullMsg  = "queue.full.title"
-	modelQueueWaitCode = "6020"
-	modelQueueWaitMsg  = "queue.waiting.title"
+	modelQueueFullCode      = "6021"
+	modelQueueFullMsg       = "queue.full.title"
+	modelQueueWaitCode      = "6020"
+	modelQueueWaitMsg       = "queue.waiting.title"
+	modelQueueUserLimitCode = "6022"
+	modelQueueUserLimitMsg  = "queue.userlimit.title"
 )
 
-// IsModelQueueFull 报告 body 是否是模型队列忙（6021 队列满，或 6020 仍在排队）。
+// IsModelQueueFull 报告 body 是否是模型队列忙（6021 队列满、6020 仍在排队，
+// 或 6022 达到用户队列额度）。
 // code 只认 JSON 的 code 字段精确相等，避免撞进 requestId；msg 是固定 i18n 键。
 func IsModelQueueFull(body string) bool {
 	if body == "" {
 		return false
 	}
-	if hasBusinessCode(body, modelQueueFullCode) || hasBusinessCode(body, modelQueueWaitCode) {
+	if hasBusinessCode(body, modelQueueFullCode) || hasBusinessCode(body, modelQueueWaitCode) ||
+		hasBusinessCode(body, modelQueueUserLimitCode) {
 		return true
 	}
 	lower := strings.ToLower(body)
-	return strings.Contains(lower, modelQueueFullMsg) || strings.Contains(lower, modelQueueWaitMsg)
+	return strings.Contains(lower, modelQueueFullMsg) || strings.Contains(lower, modelQueueWaitMsg) ||
+		strings.Contains(lower, modelQueueUserLimitMsg)
 }
 
-// ModelQueueReason 给模型队列冷却写一条可区分的原因。6020 与 6021 走同一条
-// 模型级路径，原因不同是为了在台账里看出是「还在排队」还是「队列已满」。
+// ModelQueueReason 给模型队列冷却写一条可区分的原因。6020/6021/6022 走同一条
+// 模型级路径，原因不同是为了在台账里看出是「还在排队」「队列已满」还是
+// 「用户排队额度已满」。
 func ModelQueueReason(body string) string {
 	if hasBusinessCode(body, modelQueueWaitCode) || strings.Contains(strings.ToLower(body), modelQueueWaitMsg) {
 		return "6020 queue waiting"
+	}
+	if hasBusinessCode(body, modelQueueUserLimitCode) || strings.Contains(strings.ToLower(body), modelQueueUserLimitMsg) {
+		return "6022 queue user limit"
 	}
 	return "6021 queue full"
 }

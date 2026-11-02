@@ -1494,7 +1494,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		resp, err := upstream.Aggregate(rc)
 		rc.Close()
 		// 上游以 error 帧报错（HTTP 200 已开流 + 首帧 error，真实形态）：
-		// 复用**流式**同一套分类（FrameKind 优先命中 6004 模型级限流 / 6020·6021
+		// 复用**流式**同一套分类（FrameKind 优先命中 6004 模型级限流 / 6020·6021·6022
 		// 模型队列忙）与冷却分支——模型级信号只锁该模型（CooldownSoftForModel /
 		// CooldownModelQueue），账号对其他模型仍可选，**绝不**停整号调度；池里还有
 		// 可换号则同样换号重试，与流式的 ErrStreamHeld 分支语义严格对齐。
@@ -1891,7 +1891,8 @@ func isUpstreamTimeout(err error, clientGone bool) bool {
 //
 // 十条路径，各司其职：
 //   - ErrHardCredit → CooldownUntilTomorrow4AM：即时硬冷却到次日 04:00（等签到恢复）。
-//   - ErrSoftRate → 6020（queue.waiting）/ 6021（queue.full）只锁触发模型，不冻整号。
+//   - ErrSoftRate → 6020（queue.waiting）/ 6021（queue.full）/ 6022（queue.userLimit）
+//     只锁触发模型，不冻整号。
 //     其余优先对齐上游重置墙钟（带「将在 … 重置」时 6004 走模型级豁免、非 6004 走
 //     账号级，均不指数堆加）；无重置时间才走有界退避。冷却时长优先采信 Retry-After 头
 //     （uerr.RetryAfter，body 文案墙钟之外的头形态来源）。
@@ -1925,7 +1926,8 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// 不需要异步核查（冗余）。立即换号。
 		h.cfg.Pool.CooldownUntilTomorrow4AM(uid, "余额不足")
 	case upstream.ErrSoftRate:
-		// 6020 queue.waiting / 6021 queue.full 都是这个模型的上游队列，不是账号配额。
+		// 6020 queue.waiting / 6021 queue.full / 6022 queue.userLimit 都是这个模型的
+		// 上游队列，不是账号配额。
 		// 多个号会在同一秒一起撞上。只写 modelCooldowns[model]，不写 until、不推进
 		// softStreak。时长优先用 body 里的 data.retry_after（秒）；没有再用 soft_rate
 		// 基数。不采用 estimated_wait——那是排位预计等待，队列很长时会到数小时。

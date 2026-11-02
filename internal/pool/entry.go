@@ -180,10 +180,10 @@ type modelDegrade struct {
 // modelCooldown 单个 (账号, 模型) 的模型级独立冷却记录。
 // 承载三种「该模型在此账号上不可用」语义：
 //   - 6004 模型级限流：Until 对齐上游重置墙钟；ResetAt 记录权威恢复时刻。
-//   - 6020/6021 模型队列忙：Until 优先用 body.retry_after，否则 soft_rate 基数，
+//   - 6020/6021/6022 模型队列忙：Until 优先用 body.retry_after，否则 soft_rate 基数，
 //     封顶 soft_rate_max；不写账号 until。已在冷却中不延长。
 //   - 11102 该后端无此模型：Until 为指数退避 TTL（6h 起、封顶 24h）；Hits 记录
-//     累计命中次数驱动退避（6004/6021 无 hits 概念，Hits 恒 0）。
+//     累计命中次数驱动退避（6004/6021/6022 无 hits 概念，Hits 恒 0）。
 type modelCooldown struct {
 	// Until 该模型的冷却截止（6004：now+min(resetAt-now, soft_rate_max)；11102：now+退避 TTL）。
 	Until time.Time
@@ -260,7 +260,7 @@ type entry struct {
 	// 持久化（stateAccount.SoftStreak）：重启后软限流仍在退避，不因重启回到基数。
 	softStreak int
 	// modelCooldowns 模型级独立冷却表：model → 该模型的冷却截止/重置。
-	// 与 until（全账号级）正交：6004 / 6020 / 6021 只写本表、不写 until，因此多个模型同时
+	// 与 until（全账号级）正交：6004 / 6020 / 6021 / 6022 只写本表、不写 until，因此多个模型同时
 	// 被限额时各自独立计时，互不覆盖（A 触发后 B 再触发，A 的冷却截止不被 B 覆盖——
 	// 这是单 until 字段做不到的）。空 map = 无模型级限流（不豁免）。
 	// 运行态语义（不持久化）：重启清零，退化为仅账号级 until 冷却的现状。

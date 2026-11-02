@@ -1,6 +1,6 @@
 // 冷却与熔断：Cooldown（固定时长账号级冷却）、CooldownSoftRate（账号级软冷却，对齐
 // 上游重置时间或有界退避）、CooldownSoftForModel（模型级软冷却，对齐重置墙钟）、
-// CooldownModelQueue（6020/6021 模型队列忙，只锁该模型）、
+// CooldownModelQueue（6020/6021/6022 模型队列忙，只锁该模型）、
 // BlockModelBackoff/Clear（11102 负缓存）、软冷却封顶、熔断失败累计、签到解冻。
 package pool
 
@@ -235,7 +235,8 @@ func (p *Pool) CooldownSoftForModel(uid string, base time.Duration, resetAt time
 	}
 }
 
-// CooldownModelQueue 把 6020（queue.waiting）/ 6021（queue.full）记成该模型的独立冷却。
+// CooldownModelQueue 把 6020（queue.waiting）/ 6021（queue.full）/ 6022
+// （queue.userLimit）记成该模型的独立冷却。
 //
 // 队列忙是模型容量信号：同一时刻经常全池一起返回，账号本身仍能服务其他模型。
 // 因此只写 modelCooldowns[model]，不写 until、不推进 softStreak、不清其他模型的条目。

@@ -1225,6 +1225,50 @@ func TestChat6020QueueWaitingDoesNotFreezeAccount(t *testing.T) {
 	}
 }
 
+// TestChat6022QueueUserLimitDoesNotFreezeAccount 429 + code 6022 只锁触发模型。
+// 单模型排队返回 queue.userLimit.title 时，不能把整号罚进 600s 账号级软冷却。
+func TestChat6022QueueUserLimitDoesNotFreezeAccount(t *testing.T) {
+	const body6022 = `{"code":6022,"msg":"queue.userLimit.title","requestId":"e08b3d4d-a716-4d39-8b0a-11a21bb4a36a"}`
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		if authz == "Bearer at-bad" {
+			return 429, body6022, false
+		}
+		return 200, sseOK, true
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "bad", AccessToken: "at-bad", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "good", AccessToken: "at-good", ExpiresAt: 9999999999},
+	)
+	p.SetCredits("bad", 2000, 0)
+	p.SetCredits("good", 1000, 0)
+	h := NewHandler(Config{Pool: p, Upstream: up, SoftCooldown: time.Minute})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.3","messages":[]}`)))
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s (want 200 after rotate to good)", rec.Code, rec.Body)
+	}
+	st, _ := p.Status("bad")
+	if st.Cooling || st.SoftStreak != 0 {
+		t.Fatalf("6022 must not freeze the account: %+v", st)
+	}
+	if len(st.RateLimitedModels) != 1 || st.RateLimitedModels[0].Model != "glm-5.3" {
+		t.Fatalf("want model row glm-5.3: %+v", st.RateLimitedModels)
+	}
+	if st.RateLimitedModels[0].Reason != "6022 queue user limit" {
+		t.Fatalf("reason=%q", st.RateLimitedModels[0].Reason)
+	}
+	p.SetRandomSource(func(n int64) int64 { return 0 })
+	same := p.PickExcludingForModel(nil, "glm-5.3")
+	if same == nil || same.UID != "good" {
+		t.Fatalf("same-model pick should skip bad, got %+v", same)
+	}
+	diff := p.PickExcludingForModel(nil, "deepseek-v4.1-flash")
+	if diff == nil || diff.UID != "bad" {
+		t.Fatalf("different-model pick should still select bad, got %+v", diff)
+	}
+}
+
 // TestChat6021OnlyAccountReturnsModelUnavailable 池里只剩这个号时，6021 回模型不可用，
 // 而不是把号冻进账号级软冷却。
 func TestChat6021OnlyAccountReturnsModelUnavailable(t *testing.T) {

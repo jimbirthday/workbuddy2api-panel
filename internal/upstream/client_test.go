@@ -157,7 +157,7 @@ func TestIsModelRateLimit(t *testing.T) {
 	}
 }
 
-// TestIsModelQueueFull 判断 429 body 是否是模型队列满（code 6021 / queue.full.title）。
+// TestIsModelQueueFull 判断 429 body 是否是模型队列忙（6020/6021/6022）。
 func TestIsModelQueueFull(t *testing.T) {
 	cases := []struct {
 		body string
@@ -169,6 +169,10 @@ func TestIsModelQueueFull(t *testing.T) {
 		{`{"msg":"queue.full.title"}`, true},
 		{`{"code":6020,"msg":"queue.waiting.title","data":{"queue_position":4714,"retry_after":40,"estimated_wait":23570}}`, true},
 		{`{"msg":"queue.waiting.title"}`, true},
+		{`{"code":6022,"msg":"queue.userLimit.title","requestId":"e08b3d4d-a716-4d39-8b0a-11a21bb4a36a"}`, true},
+		{`{"code": 6022, "msg": "queue.userLimit.title"}`, true},
+		{`{"error":{"code":"6022","message":"queue.userLimit.title"}}`, true},
+		{`{"msg":"queue.userLimit.title"}`, true},
 		{`{"code":6004,"msg":"将在 2026-09-11 18:33:27 UTC+8 重置"}`, false},
 		{`{"code":60210,"msg":"other"}`, false},
 		{`{"code":60200,"msg":"other"}`, false},
@@ -212,6 +216,9 @@ func TestModelQueueRetryAfterUsesRetryAfterNotEstimatedWait(t *testing.T) {
 	}
 	if ModelQueueReason(body) != "6020 queue waiting" {
 		t.Fatalf("reason=%q", ModelQueueReason(body))
+	}
+	if ModelQueueReason(`{"code":6022,"msg":"queue.userLimit.title"}`) != "6022 queue user limit" {
+		t.Fatalf("reason=%q", ModelQueueReason(`{"code":6022,"msg":"queue.userLimit.title"}`))
 	}
 	if _, ok := ModelQueueRetryAfter(`{"code":6021,"msg":"queue.full.title"}`); ok {
 		t.Fatal("6021 without retry_after should not invent a duration")

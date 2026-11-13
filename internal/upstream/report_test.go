@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"testing"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
@@ -49,6 +50,29 @@ func TestReportChatActivitySendsArrayWithUserID(t *testing.T) {
 	}
 	if ev["mode"] != "craft" {
 		t.Errorf("mode=%v want craft", ev["mode"])
+	}
+	if ev["agentName"] != "cli" || ev["agentType"] != "main" || ev["source"] != "work" {
+		t.Errorf("agent/source=%v/%v/%v want cli/main/work", ev["agentName"], ev["agentType"], ev["source"])
+	}
+	requestID, _ := ev["requestId"].(string)
+	if !regexp.MustCompile(`^[0-9a-f]{32}$`).MatchString(requestID) {
+		t.Errorf("requestId=%q want 32 lowercase hex", requestID)
+	}
+	traceID, _ := ev["traceId"].(string)
+	if !regexp.MustCompile(`^[0-9a-f]{32}$`).MatchString(traceID) {
+		t.Errorf("traceId=%q want 32 lowercase hex", traceID)
+	}
+	for _, removed := range []string{"maxToken", "maxSteps", "temperature", "maxRetries", "skillCount", "totalCount"} {
+		if _, ok := ev[removed]; ok {
+			t.Errorf("chat_request_send 不应带旧版虚构字段 %s", removed)
+		}
+	}
+	// 真实 5.9.3 payload 固定携带 VCS/Buddy 字段（空工作区为 unknown/空串）。
+	if ev["vcsType"] != "unknown" || ev["vcsRepo"] != "" || ev["vcsBranchName"] != "" || ev["vcsRevId"] != "" {
+		t.Errorf("vcs fields=%v/%v/%v/%v want unknown/empty", ev["vcsType"], ev["vcsRepo"], ev["vcsBranchName"], ev["vcsRevId"])
+	}
+	if ev["buddyId"] != "" || ev["buddyName"] != "" {
+		t.Errorf("buddy fields=%v/%v want empty", ev["buddyId"], ev["buddyName"])
 	}
 	// 出站 body 必须是数组（以 [ 开头），不是单个对象。
 }

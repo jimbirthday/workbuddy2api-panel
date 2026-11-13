@@ -234,7 +234,7 @@ func (p *Panel) mpPaceStep(a *auth.Auth, job *mpPaceJob) {
 		p.rescheduleMPJob(job, "")
 		return
 	}
-	conv := fmt.Sprintf("wb2api-mp-%d-%d", time.Now().UnixMilli(), job.Sent)
+	conv := upstream.NewDesktopConversationID()
 	var ev map[string]any
 	if job.WithActivityID {
 		ev = upstream.SchoolSeasonChatEvent(conv)

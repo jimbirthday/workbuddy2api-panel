@@ -1294,6 +1294,96 @@ process.stdout.write(JSON.stringify(out));`
 	}
 }
 
+// TestAppJSRenderAccountsKeepsScrollWhenRowHeightChanges 复现账号表滚动到底部时
+// 轮询数据新增冷却原因、行高从 57px 变成 60px 的场景。旧实现为了重新测行高先
+// 清空 tbody，浏览器立即把 scrollTop 夹到 0，随后的重渲染从顶部开始，表现为列表
+// 抖动且无法继续下拉。修复后不得清空 tbody，且滚动位置必须保留在原来的行附近。
+func TestAppJSRenderAccountsKeepsScrollWhenRowHeightChanges(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; renderAccounts row-height test skipped")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const inert = new Proxy(function () {}, {
+  get(t, k) { if (k === Symbol.toPrimitive) return () => ''; return inert; },
+  set() { return true; }, apply() { return inert; }, construct() { return inert; },
+});
+let cleared = false, html = '', rowH = 57, writes = 0, measureN = 0;
+const measures = [57, 66, 57, 66];
+const vp = { scrollTop: 0, scrollLeft: 0, clientHeight: 560, scrollHeight: 0, addEventListener() {}, querySelector() { return null; } };
+const tb = {
+  scrollTop: 0, scrollLeft: 0, childNodes: [{}], contains: () => false,
+  addEventListener() {}, closest: () => vp,
+  querySelector() { return { getBoundingClientRect: () => ({ height: measures[Math.min(measureN++, measures.length - 1)] }) }; },
+  get innerHTML() { return html; },
+  set innerHTML(v) {
+    writes++;
+    if (v === '') cleared = true;
+    html = v;
+    let pad = 0;
+    for (const m of String(v).matchAll(/class="virtual-pad"[\s\S]*?height:(\d+)px/g)) pad += Number(m[1]);
+    const rows = (String(v).match(/<tr title="uid:/g) || []).length;
+    vp.scrollHeight = 50 + pad + rows * rowH;
+    vp.scrollTop = Math.min(vp.scrollTop, Math.max(0, vp.scrollHeight - vp.clientHeight));
+  },
+};
+const sandbox = {
+  location: { hash: '#accounts' }, history: { replaceState() {} },
+  localStorage: { getItem: () => null, setItem() {} },
+  navigator: { clipboard: { writeText: () => Promise.resolve() } },
+  document: { activeElement: null, querySelectorAll: () => [], querySelector: () => inert,
+    getElementById: id => id === 'accBody' ? tb : (id === 'accViewport' ? vp : inert),
+    addEventListener() {}, documentElement: inert, head: inert, body: inert, createElement: () => inert, cookie: '' },
+  fetch: () => new Promise(() => {}), addEventListener() {}, removeEventListener() {},
+  matchMedia: () => ({ matches: false, addEventListener() {} }),
+  setInterval: () => 0, clearInterval() {}, setTimeout: () => 0, clearTimeout() {},
+  console, JSON, Math, Date, Number, String, Boolean, Object, Array, Promise, Map, Set, RegExp, Error, TypeError, isNaN, parseInt, parseFloat, encodeURIComponent, decodeURIComponent, URL, Symbol, Proxy, Reflect,
+};
+sandbox.window = sandbox; sandbox.globalThis = sandbox;
+vm.createContext(sandbox);
+vm.runInContext(src, sandbox, { filename: 'app.js' });
+const rows = Array.from({length: 100}, (_, i) => ({uid: 'u' + String(i).padStart(3, '0'), nickname: 'n' + i, credits: 1, credits_total: 1}));
+sandbox.renderAccounts(rows);
+vp.scrollTop = Math.max(0, vp.scrollHeight - vp.clientHeight);
+const before = vp.scrollTop;
+rowH = 66;
+sandbox.renderAccounts(rows.map(r => ({...r, cooling: true, cool_remaining_sec: 30, reason: '429 rate limit'})));
+process.stdout.write(JSON.stringify({cleared, writes, before, after: vp.scrollTop, scrollHeight: vp.scrollHeight}));`
+	f, err := os.CreateTemp(t.TempDir(), "accrowheight-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("renderAccounts row-height test failed: %v\n%s", err, out)
+	}
+	var got struct {
+		Cleared      bool `json:"cleared"`
+		Writes       int  `json:"writes"`
+		Before       int  `json:"before"`
+		After        int  `json:"after"`
+		ScrollHeight int  `json:"scrollHeight"`
+	}
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("decode row-height state: %v (%s)", err, out)
+	}
+	if got.Cleared {
+		t.Fatalf("行高变化时不得清空 tbody（会触发 scrollTop=0）: %+v", got)
+	}
+	if got.Writes > 4 {
+		t.Fatalf("57/66px 行高不应触发反复校准重排: %+v", got)
+	}
+	if got.Before <= 0 || got.After != got.Before {
+		t.Fatalf("轮询重绘后滚动位置丢失: %+v", got)
+	}
+}
+
 // TestAppJSQueueRunButtonRecovers 队列执行期间按钮保持禁用，轮询终态/异常必须恢复。
 //
 // 复用真实 app.js 与真实 DOM 桩；定时器换成手动 tick，避免等待 3 秒。

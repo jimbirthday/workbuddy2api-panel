@@ -132,10 +132,8 @@ type chatRequestEvent struct {
 	IsAutoExecuteTerminal bool   `json:"isAutoExecuteTerminal"`
 	IsAutoModify          bool   `json:"isAutoModify"`
 	CodebaseEnable        bool   `json:"codebaseEnable"`
-	MaxToken              int    `json:"maxToken"`
-	MaxSteps              int    `json:"maxSteps"`
-	Temperature           int    `json:"temperature"`
-	MaxRetries            int    `json:"maxRetries"`
+	IsMaxMode             bool   `json:"isMaxMode"`
+	Source                string `json:"source"`
 	MentionContexts       []any  `json:"mentionContexts"`
 	KnowledgeID           []any  `json:"knowledgeId"`
 	KnowledgeName         []any  `json:"knowledgeName"`
@@ -145,8 +143,12 @@ type chatRequestEvent struct {
 	ExpertID              string `json:"expertId"`
 	RecommendID           string `json:"recommendId"`
 	SkillID               string `json:"skillId"`
-	SkillCount            int    `json:"skillCount"`
-	TotalCount            int    `json:"totalCount"`
+	VCSType               string `json:"vcsType"`
+	VCSRepo               string `json:"vcsRepo"`
+	VCSBranchName         string `json:"vcsBranchName"`
+	VCSRevID              string `json:"vcsRevId"`
+	BuddyID               string `json:"buddyId"`
+	BuddyName             string `json:"buddyName"`
 	FileURI               string `json:"fileUri"`
 	PresentAt             int64  `json:"presentAt"`
 	TraceID               string `json:"traceId"`
@@ -158,8 +160,8 @@ type chatRequestEvent struct {
 }
 
 // ReportChatActivity 向上游发送一条对话活跃上报（chat_request_send）。
-// conversationID 由调用方生成（如 wb2api-<ms>），无需真实会话——服务端不校验一致性。
-// requestID 为本轮请求独立标识（多轮同会话上报时各条不同）；空时回落 conversationID。
+// conversationID 由调用方生成（真实客户端为 UUID），无需真实会话——服务端不校验一致性。
+// requestID 为本轮请求独立标识（多轮同会话上报时各条不同）；空时生成 32 位 hex。
 // 错误语义与 doJSON 一致：HTTP 非 2xx / 业务 code != 0 → *Error。
 func (c *Client) ReportChatActivity(a *auth.Auth, conversationID, requestID string) error {
 	return c.ReportChatActivityModel(a, conversationID, requestID, "deepseek-v4-flash", "DeepSeek V4 Flash")
@@ -169,7 +171,7 @@ func (c *Client) ReportChatActivity(a *auth.Auth, conversationID, requestID stri
 // 对齐实际模型（如 Model_chat_GLM5.2 需 requestModelId=glm-5.2 与独立 requestID）。
 func (c *Client) ReportChatActivityModel(a *auth.Auth, conversationID, requestID, modelID, modelName string) error {
 	if requestID == "" {
-		requestID = conversationID
+		requestID = NewDesktopRequestID()
 	}
 	if modelID == "" {
 		modelID = "deepseek-v4-flash"
@@ -192,10 +194,8 @@ func (c *Client) ReportChatActivityModel(a *auth.Auth, conversationID, requestID
 		IsAutoExecuteTerminal: false,
 		IsAutoModify:          false,
 		CodebaseEnable:        false,
-		MaxToken:              0,
-		MaxSteps:              0,
-		Temperature:           0,
-		MaxRetries:            0,
+		IsMaxMode:             false,
+		Source:                "work",
 		MentionContexts:       []any{},
 		KnowledgeID:           []any{},
 		KnowledgeName:         []any{},
@@ -205,15 +205,19 @@ func (c *Client) ReportChatActivityModel(a *auth.Auth, conversationID, requestID
 		ExpertID:              "",
 		RecommendID:           "",
 		SkillID:               "",
-		SkillCount:            0,
-		TotalCount:            0,
+		VCSType:               "unknown",
+		VCSRepo:               "",
+		VCSBranchName:         "",
+		VCSRevID:              "",
+		BuddyID:               "",
+		BuddyName:             "",
 		FileURI:               "",
 		PresentAt:             now,
-		TraceID:               "",
+		TraceID:               NewDesktopRequestID(),
 		RootRequestID:         requestID,
 		ParentConversationID:  conversationID,
-		AgentName:             "default",
-		AgentType:             "conversation",
+		AgentName:             "cli",
+		AgentType:             "main",
 		UserID:                a.UID,
 	}
 	raw, err := json.Marshal([]chatRequestEvent{ev})

@@ -1,12 +1,12 @@
-// desktop.go 桌面客户端（WorkBuddy Desktop 5.5.6）行为指纹上报。
+// desktop.go 桌面客户端（WorkBuddy Desktop 5.9.3）行为指纹上报。
 //
 // 来源：2026-09-12 Sunny 抓包实测（data/desktop-task-protocol.md）。桌面端点亮
 // 「需电脑端」类任务的关键不是独立端点，而是同一 POST /v2/report 通道上
 // **不同的客户端指纹**：
 //
 //	POST https://copilot.tencent.com/v2/report        ← chatBase（CLI 上报走 billingBase）
-//	User-Agent: WorkBuddy/5.5.6 WorkBuddy/5.5.6 CLI/2.137.1
-//	X-Domain: copilot.tencent.com, X-Product: SaaS, X-User-Id: <uid>
+//	User-Agent: WorkBuddy/5.9.3 WorkBuddy/5.9.3 CLI/2.165.0
+//	X-Domain: www.workbuddy.cn, X-Product: SaaS, X-User-Id: <uid>
 //	Body: [ {...event...} ]                           ← 数组
 //
 // 每个事件除业务字段外必带桌面指纹（ideName/ideType=WorkBuddy、
@@ -31,7 +31,10 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"strings"
+	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 )
@@ -39,50 +42,107 @@ import (
 const (
 	desktopReportPath    = "/v2/report"
 	desktopAppearanceSet = "/v2/user-asset/appearance/set"
-	// desktopUA 实测桌面客户端 UA（5.5.6 内嵌 CLI 2.137.1）。
-	desktopUA = "WorkBuddy/5.5.6 WorkBuddy/5.5.6 CLI/2.137.1"
+	// 本地 WorkBuddy 5.9.3 分发包 product.json 的 commit；releaseDate 取真实
+	// 5.9.3 客户端遥测里生效的远程 product 配置值（比分发包 date 晚约 2.4s）。
+	// 两者必须与 UA、ideVersion 同属一个版本，否则上游会看到不可能组合。
+	desktopReleaseDate  = int64(1793093026080)
+	desktopCommit       = "d46924219e79332f49c37ccebf27292f87001b19"
+	desktopExpertPrompt = "1+1等于几？直接回答。"
 )
 
 // desktopBase 桌面端 /v2/report 与 user-asset 走 chatBase（copilot.tencent.com）。
 func (c *Client) desktopBase(a *auth.Auth) string { return c.chatBase(a) }
 
-// deriveID 由 uid 稳定派生一个 36 位 hex 设备标识（machineId/qimei36 复用），
+// deriveID 由 uid 稳定派生一个 36 位 hex 匿名设备标识（qimei36 使用），
 // 幂等：同一账号每次生成相同值，模拟固定设备。
 func deriveID(a *auth.Auth, salt string) string {
 	sum := sha256.Sum256([]byte(salt + ":" + a.UID))
 	return hex.EncodeToString(sum[:18]) // 36 hex chars
 }
 
+// deriveUUID 由 uid 稳定派生大写 UUID（machineId 在真实遥测中即此形态）。
+func deriveUUID(a *auth.Auth, salt string) string {
+	sum := sha256.Sum256([]byte(salt + ":" + a.UID))
+	b := sum[:16]
+	b[6] = (b[6] & 0x0f) | 0x50 // UUID v5
+	b[8] = (b[8] & 0x3f) | 0x80 // RFC 4122 variant
+	return fmt.Sprintf("%X-%X-%X-%X-%X", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
+
+// NewDesktopConversationID 生成真实客户端形态的对话 ID（UUID）。
+func NewDesktopConversationID() string { return newRequestUUID() }
+
+// NewDesktopRequestID 生成真实客户端形态的请求 ID（32 hex）。
+func NewDesktopRequestID() string { return randomHex(16) }
+
+// desktopSessionIDs 保存进程内每个账号的桌面会话 ID。真实客户端的 sessionId
+// 在一个客户端进程生命周期内稳定、重启后才变化；此前每个上报批次现生成一个，
+// 会让同一任务的多段事件链出现互不相干的 session。按 uid 缓存到进程退出即可。
+var desktopSessionIDs sync.Map // uid -> lowercase UUID
+
+func desktopSessionID(a *auth.Auth) string {
+	if v, ok := desktopSessionIDs.Load(a.UID); ok {
+		return v.(string)
+	}
+	v, _ := desktopSessionIDs.LoadOrStore(a.UID, newRequestUUID())
+	return v.(string)
+}
+
+// desktopReportDomain 返回桌面 /v2/report 的 X-Domain 值。真实客户端发送的是
+// 裸域名（www.workbuddy.cn / www.workbuddy.ai），不是带 scheme 的 base URL；
+// 账号未落盘 domain 时按 realm 回落到官方域。
+func desktopReportDomain(a *auth.Auth) string {
+	d := ""
+	if a != nil {
+		d = strings.TrimSpace(a.DomainValue())
+	}
+	d = strings.TrimPrefix(strings.TrimPrefix(d, "https://"), "http://")
+	if d != "" {
+		return d
+	}
+	if a != nil && a.IsGlobal() {
+		return "www.workbuddy.ai"
+	}
+	return "www.workbuddy.cn"
+}
+
 // DesktopEvent 桌面端事件：业务字段任意（map），公共指纹由 ReportDesktopEvent 注入。
 type DesktopEvent map[string]any
 
 // desktopFingerprint 公共桌面指纹字段（注入每个事件，覆盖同名业务键）。
-func desktopFingerprint(a *auth.Auth) map[string]any {
+func (c *Client) desktopFingerprint(a *auth.Auth) map[string]any {
 	now := time.Now().UnixMilli()
-	return map[string]any{
+	fp := map[string]any{
 		"timezone":     "Asia/Shanghai",
-		"reportDelay":  2000,
+		"reportDelay":  0,
 		"userId":       a.UID,
 		"username":     a.Nickname,
 		"userNickname": a.Nickname,
 		"product":      "SaaS",
-		"releaseDate":  int64(1789036585355),
-		"commit":       "5f9692923c93033111c51ad7b003eb80204a9b75",
 		"ideName":      "WorkBuddy",
 		"ideType":      "WorkBuddy",
-		"ideVersion":   "5.5.6",
-		"machineId":    deriveID(a, "machine"),
-		"sessionId":    deriveID(a, "session"),
+		"ideVersion":   c.clientVersion(),
+		"machineId":    deriveUUID(a, "machine"),
+		"sessionId":    desktopSessionID(a),
+		"qimei36":      deriveID(a, "qimei"),
 		"extName":      "workbuddy-desktop",
-		"extVersion":   "5.5.6",
+		"extVersion":   c.clientVersion(),
 		"os":           "win32",
 		"arch":         "x64",
 		"osVersion":    "10.0.26220",
+		"cpuModel":     "12th Gen Intel(R) Core(TM) i7-12700K",
 		"cpuCores":     20,
 		"memorySize":   24,
 		"timestamp":    now,
 		"presentAt":    now,
 	}
+	// releaseDate/commit 只对内置的 5.9.3 发布元数据有真实值。自定义 client_version
+	// 时宁可省略，也不能继续上报与版本不相符的旧发布信息。
+	if c.clientVersion() == defaultClientVersion {
+		fp["releaseDate"] = desktopReleaseDate
+		fp["commit"] = desktopCommit
+	}
+	return fp
 }
 
 // ReportDesktopEvent 以桌面客户端指纹向 copilot.tencent.com/v2/report 批量上报事件。
@@ -92,7 +152,7 @@ func (c *Client) ReportDesktopEvent(a *auth.Auth, events ...DesktopEvent) error 
 	if len(events) == 0 {
 		return fmt.Errorf("desktop report: no events")
 	}
-	fp := desktopFingerprint(a)
+	fp := c.desktopFingerprint(a)
 	arr := make([]map[string]any, 0, len(events))
 	for _, ev := range events {
 		m := map[string]any{}
@@ -112,19 +172,12 @@ func (c *Client) ReportDesktopEvent(a *auth.Auth, events ...DesktopEvent) error 
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
-	req.Header.Set("Accept", "application/json, text/plain, */*")
-	req.Header.Set("Content-Type", "application/json;charset=UTF-8")
-	req.Header.Set("User-Agent", desktopUA)
-	req.Header.Set("X-Domain", c.desktopBase(a))
-	req.Header.Set("X-Product", "SaaS")
-	req.Header.Set("X-Request-ID", deriveID(a, "req")+fmt.Sprintf("%d", time.Now().UnixNano()%1e6))
-	if a.UID != "" {
-		req.Header.Set("X-User-Id", a.UID)
-	}
-	if eid := a.EnterpriseIDValue(); eid != "" {
-		req.Header.Set("X-Enterprise-Id", eid)
-		req.Header.Set("X-Tenant-Id", eid)
+	// 与真实客户端 /v2/report 出站一致：X-Domain 是裸域名，X-Request-ID 是
+	// 32 位 hex（不是带横线的 UUID）。ReportHeaders 已覆盖 UA / 鉴权 / 产品头，
+	// 这里只补账号没有 domain 时的 realm 默认值。
+	c.ReportHeaders(req, a)
+	if req.Header.Get("X-Domain") == "" {
+		req.Header.Set("X-Domain", desktopReportDomain(a))
 	}
 	_, err = c.doJSON(req)
 	return err
@@ -135,7 +188,8 @@ func (c *Client) ReportDesktopEvent(a *auth.Auth, events ...DesktopEvent) error 
 // chat_message_response(isSuccessful) → chat_message_status → chat_request_response）。
 // 实测该链点亮 RichMeow_Chat。conversationID/requestID/messageID 由调用方生成。
 func DesktopChatSequence(conversationID, requestID, messageID, modelID, modelName string) []DesktopEvent {
-	uuid := func() string { return requestID }
+	traceSum := sha256.Sum256([]byte(requestID + ":trace"))
+	traceID := hex.EncodeToString(traceSum[:16])
 	mk := func(code string, extra map[string]any) DesktopEvent {
 		ev := DesktopEvent{"eventCode": code}
 		for k, v := range extra {
@@ -159,18 +213,21 @@ func DesktopChatSequence(conversationID, requestID, messageID, modelID, modelNam
 		mk("chat_message_send", map[string]any{
 			"messageId": messageID + "-assistant", "historyCount": 0,
 			"isContextTruncated": false, "currentStepCount": 1,
-			"traceId": uuid(), "rootRequestId": requestID,
+			"totalStepCount": 1, "requestModelId": modelID, "requestModelName": modelName,
+			"isStream": true, "traceId": traceID, "rootRequestId": requestID,
 			"parentConversationId": conversationID,
 			"agentName":            "cli", "agentType": "main",
 		}),
 		mk("chat_request_send", map[string]any{
 			"inputLength": 24, "isPlan": false, "isAutoExecuteTerminal": false,
-			"isAutoModify": false, "codebaseEnable": false, "maxToken": 0,
-			"maxSteps": 500, "temperature": 0, "maxRetries": 0,
+			"isAutoModify": false, "codebaseEnable": false, "isMaxMode": false,
+			"source":          "work",
 			"mentionContexts": []any{}, "knowledgeId": []any{}, "knowledgeName": []any{},
 			"codebaseId": "", "mentionContextCount": 0, "command": "",
-			"recommendId": "", "skillId": "", "skillCount": 0, "totalCount": 0,
-			"traceId": uuid(), "rootRequestId": requestID,
+			"recommendId": "", "skillId": "",
+			"vcsType": "unknown", "vcsRepo": "", "vcsBranchName": "", "vcsRevId": "",
+			"buddyId": "", "buddyName": "",
+			"traceId": traceID, "rootRequestId": requestID,
 			"parentConversationId": conversationID,
 			"agentName":            "cli", "agentType": "main",
 			"codebuddy.session_id":              conversationID,
@@ -181,7 +238,7 @@ func DesktopChatSequence(conversationID, requestID, messageID, modelID, modelNam
 			"inputToken": 120, "outputToken": 80, "totalToken": 200,
 			"cachedTokens": 0, "cachedWriteTokens": 0, "cachedMissTokens": 0,
 			"isSuccessful": true, "messageErrorCode": "", "finishReason": "stop",
-			"firstTokenAt": time.Now().UnixMilli(), "traceId": uuid(),
+			"firstTokenAt": time.Now().UnixMilli(), "traceId": traceID,
 			"conversationId": conversationID,
 			"rootRequestId":  requestID, "parentConversationId": conversationID,
 			"agentName": "cli", "agentType": "main",
@@ -190,15 +247,17 @@ func DesktopChatSequence(conversationID, requestID, messageID, modelID, modelNam
 		}),
 		mk("chat_message_status", map[string]any{
 			"messageId": messageID + "-assistant", "messageErrorCode": "0",
-			"traceId": uuid(), "rootRequestId": requestID,
+			"traceId": traceID, "rootRequestId": requestID,
 			"parentConversationId": conversationID,
 			"agentName":            "cli", "agentType": "main",
 		}),
 		mk("chat_request_response", map[string]any{
-			"mode": "craft", "toolCallCount": 0,
-			"inputToken": 120, "outputToken": 80, "totalToken": 200,
+			"mode": "craft", "conversationId": conversationID, "requestId": requestID,
+			"toolCallCount": 0,
+			"inputToken":    120, "outputToken": 80, "totalToken": 200,
 			"cachedTokens": 0, "cachedWriteTokens": 0, "cachedMissTokens": 0,
 			"isSuccessful": true, "messageErrorCode": "", "finishReason": "stop",
+			"traceId":       traceID,
 			"rootRequestId": requestID, "parentConversationId": conversationID,
 		}),
 	}
@@ -217,17 +276,9 @@ func (c *Client) SetAppearanceTheme(a *auth.Auth, resourceKey string) error {
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
-	req.Header.Set("Accept", "application/json, text/plain, */*")
-	req.Header.Set("Content-Type", "application/json;charset=UTF-8")
-	req.Header.Set("User-Agent", desktopUA)
-	req.Header.Set("X-Product", "SaaS")
-	if a.UID != "" {
-		req.Header.Set("X-User-Id", a.UID)
-	}
-	if eid := a.EnterpriseIDValue(); eid != "" {
-		req.Header.Set("X-Enterprise-Id", eid)
-		req.Header.Set("X-Tenant-Id", eid)
+	c.ReportHeaders(req, a)
+	if req.Header.Get("X-Domain") == "" {
+		req.Header.Set("X-Domain", desktopReportDomain(a))
 	}
 	_, err = c.doJSON(req)
 	return err
@@ -435,7 +486,7 @@ func (c *Client) marketExpertList(a *auth.Auth, expertType, keyword string, page
 	}
 	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", desktopUA)
+	req.Header.Set("User-Agent", c.chatUserAgent())
 	req.Header.Set("X-Domain", c.chatBase(a))
 	req.Header.Set("X-Product", "SaaS")
 	if a.UID != "" {
@@ -459,12 +510,12 @@ func (c *Client) marketExpertList(a *auth.Auth, expertType, keyword string, page
 // expert_actual_use 等 JOIN 事件的 requestId 必须是该服务端 id——自造 UUID 不计数
 // （客户端 resolveRealRequestId 同款语义，Sunny row 2113 实证）。
 func (c *Client) DesktopChatWithExpert(a *auth.Auth, expertID string) (conversationID, requestID string, err error) {
-	conversationID = fmt.Sprintf("wb2api-conv-%d", time.Now().UnixNano())
+	conversationID = NewDesktopConversationID()
 	body := map[string]any{
 		"model": "fast-model",
 		"messages": []any{
 			map[string]any{"role": "system", "content": "You are a helpful assistant. 当前处于中文环境，使用简体中文回答。"},
-			map[string]any{"role": "user", "content": "1+1等于几？直接回答。"},
+			map[string]any{"role": "user", "content": desktopExpertPrompt},
 		},
 		"agent":          "cli",
 		"temperature":    1,
@@ -483,17 +534,17 @@ func (c *Client) DesktopChatWithExpert(a *auth.Auth, expertID string) (conversat
 	h.Set("Authorization", "Bearer "+a.AccessTokenValue())
 	h.Set("Content-Type", "application/json")
 	h.Set("Accept", "text/event-stream")
-	h.Set("User-Agent", desktopUA)
+	h.Set("User-Agent", c.chatUserAgent())
 	h.Set("X-Domain", c.chatBase(a))
 	h.Set("X-Product", "SaaS")
 	h.Set("X-User-Id", a.UID)
 	h.Set("X-Conversation-ID", conversationID)
-	h.Set("X-Request-ID", fmt.Sprintf("%d", time.Now().UnixNano()))
+	h.Set("X-Request-ID", newRequestUUID())
 	h.Set("X-Agent-Intent", "craft")
 	h.Set("X-Agent-Type", "main")
 	h.Set("X-IDE-Name", "WorkBuddy")
 	h.Set("X-IDE-Type", "WorkBuddy")
-	h.Set("X-IDE-Version", "5.5.6")
+	h.Set("X-IDE-Version", c.clientVersion())
 	h.Set("x-codebuddy-request", "1")
 	if expertID != "" {
 		h.Set("X-Expert-Id", expertID)
@@ -634,7 +685,7 @@ func desktopExpertActualUse(e MarketExpert, conversationID, requestID string) De
 		"eventCode": "expert_actual_use",
 		"id":        e.ExpertID, "name": e.DisplayNameZH, "expertTitle": e.ProfessionZH,
 		"type": cat, "expertType": e.ExpertType, "source": "builtin", "version": ver,
-		"cost": 9000, "characterCount": 14,
+		"cost": 9000, "characterCount": utf8.RuneCountInString(desktopExpertPrompt),
 		"conversationId": conversationID, "requestId": requestID, "messageId": "msg-" + requestID[len(requestID)-8:],
 		"requestModelId": "fast-model", "requestModelName": "fast-model",
 	}

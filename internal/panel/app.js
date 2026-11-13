@@ -101,6 +101,7 @@ let accPageSize = 100;
 // 只影响 DOM 中保留多少行，不改变筛选、排序和分页语义。
 let accVirtualRows = [];
 let accVirtualRowH = 44;
+let accVirtualCalibrated = false;
 let accVirtualStart = 0;
 let accVirtualEnd = 0;
 let accVirtualSignature = '';
@@ -928,6 +929,8 @@ function bindAccVirtualScroll() {
   if (typeof window !== 'undefined' && window.addEventListener) {
     window.addEventListener('resize', () => {
       if (!accAll || !accAll.length) return;
+      // 视口宽度变化可能改变「冷却原因」的换行与行高；允许重新校准一次。
+      accVirtualCalibrated = false;
       accRenderSig = '';
       renderAccounts(accAll, true);
     }, { passive: true });
@@ -982,6 +985,7 @@ function renderAccounts(list, forceRender) {
     tb.innerHTML = '<tr><td colspan="10"><div class="empty"><div class="big">账号池是空的</div>点击右上角「添加账号」，用浏览器登录一个 WorkBuddy 账号</div></td></tr>';
     accVirtualRows = [];
     accVirtualSignature = '';
+    accVirtualCalibrated = false;
     accRenderSig = '';
     restoreScroll();
     return;
@@ -991,6 +995,7 @@ function renderAccounts(list, forceRender) {
       '<div style="margin-top:10px"><button type="button" class="xs" data-a="clear-filter">清除筛选</button></div></div></td></tr>';
     accVirtualRows = [];
     accVirtualSignature = '';
+    accVirtualCalibrated = false;
     accRenderSig = '';
     restoreScroll();
     return;
@@ -1024,13 +1029,29 @@ function renderAccounts(list, forceRender) {
     const firstRow = tb.querySelector('tr[title^="uid:"]');
     const measured = firstRow && firstRow.getBoundingClientRect
       ? Math.round(firstRow.getBoundingClientRect().height || 0) : 0;
-    if (measured > 20 && measured < 400 && Math.abs(measured - accVirtualRowH) > 1) {
-      accVirtualRowH = measured;
-      accVirtualSignature = '';
-      accRenderSig = '';
-      tb.innerHTML = '';
-      renderAccounts(accAll);
-      return;
+    // 行高会随「冷却原因 / 限流模型」多一行而变化，滚动时可见首行高度可能不断
+    // 在 57/66px 间切换。若每次重绘都按当前首行重新校准，会递归重排直至栈溢出，
+    // 同时 topPad/scrollHeight 反复变化导致列表抖动。固定行高虚拟化只需一个近似
+    // 值：首次渲染校准一次，只有窗口 resize 才允许重新校准。
+    if (measured > 20 && measured < 400) {
+      if (!accVirtualCalibrated && Math.abs(measured - accVirtualRowH) > 1) {
+        accVirtualRowH = measured;
+        accVirtualCalibrated = true;
+        accVirtualSignature = '';
+        accRenderSig = '';
+        // 不能先清空 tbody：清空会把内容高度降到 0，浏览器立即把 scrollTop
+        // 夹回 0，随后的重渲染就从顶部开始。轮询更新冷却原因/限流行时行高会变，
+        // 这正是账号列表在滚动中「抖动、拉不下去」的来源。保留现有 DOM 直接按
+        // 新行高重算窗口，restoreScroll 仍按本轮进入时的滚动位置恢复。
+        restoreScroll();
+        renderAccounts(accAll, true);
+        // 递归重算期间浏览器可能因旧行高对应的内容高度不足而短暂夹住
+        // scrollTop；重算完成后再按本轮原位置恢复一次，避免停在中间某个偏移。
+        restoreScroll();
+        return;
+      }
+      // 测量无效（未布局/隐藏）时保持 false，等下一次有效布局再校准。
+      accVirtualCalibrated = true;
     }
   }
   bindAccVirtualScroll();
